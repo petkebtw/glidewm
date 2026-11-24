@@ -121,6 +121,15 @@ mwm is built on dwm 6.8 from `git.suckless.org/dwm`, with the systray patch appl
 The suckless history is kept in this repository; `git remote add upstream https://git.suckless.org/dwm`
 to follow it.
 
+## References and credits
+
+- [dwm](https://dwm.suckless.org) by suckless.org: the base. Source at [git.suckless.org/dwm](https://git.suckless.org/dwm).
+- [systray patch](https://dwm.suckless.org/patches/systray/) for dwm: the tray, applied by hand and extended to mirror on every bar.
+- [DarkShadow's Shell](https://github.com/shadowww-dev/DarkShadowShell): the QML widget, dock and launcher shell that the mwm setup runs through Quickshell on X11.
+- [Quickshell](https://quickshell.org): the QML shell runtime.
+- [picom](https://github.com/yshui/picom): compositor for blur, shadows and rounded corners.
+- [cairo](https://www.cairographics.org): bar drawing.
+
 ## License
 
 MIT/X Consortium, same as dwm. See [LICENSE](LICENSE). Copyright of the original dwm authors is kept.
