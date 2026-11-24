@@ -1,0 +1,11 @@
+*.o
+dwm
+mwm
+config.h
+*.pre-*
+*.orig
+*.rej
+*.diff
+.wrangler/
+backups/
+refs/
