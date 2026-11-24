@@ -2,134 +2,274 @@
 
 # mwm
 
-### muxy window manager
+**muxy window manager**
 
-A fast, floating-bar, animated fork of [suckless dwm](https://dwm.suckless.org) 6.8 for X11.
+A dynamic tiling window manager for X11, forked from [suckless dwm](https://dwm.suckless.org) 6.8.<br>
+Floating glass bar, eased animations, an infinite canvas mode, and a small IPC. About one C file.
 
-![language](https://img.shields.io/badge/language-C99-blue) ![license](https://img.shields.io/badge/license-MIT%2FX-green) ![base](https://img.shields.io/badge/based%20on-dwm%206.8-orange)
+<br>
+
+[![License](https://img.shields.io/badge/license-MIT%2FX-8ad7eb?style=for-the-badge&labelColor=1e202b)](LICENSE)
+[![Language](https://img.shields.io/badge/C99-single%20file-86dbd7?style=for-the-badge&logo=c&logoColor=white&labelColor=1e202b)](dwm.c)
+[![Base](https://img.shields.io/badge/based%20on-dwm%206.8-f2b8a0?style=for-the-badge&labelColor=1e202b)](https://git.suckless.org/dwm)
+[![Last commit](https://img.shields.io/github/last-commit/petkebtw/mwm?style=for-the-badge&color=c6b6f2&labelColor=1e202b)](https://github.com/petkebtw/mwm/commits/main)
+[![Stars](https://img.shields.io/github/stars/petkebtw/mwm?style=for-the-badge&color=f2e0a0&labelColor=1e202b)](https://github.com/petkebtw/mwm/stargazers)
+
+<br>
+
+[**Features**](#features) · [**Install**](#install) · [**Keys**](#keys) · [**Session setup**](#session-setup) · [**IPC**](#ipc) · [**FAQ**](#faq) · [**Credits**](#credits)
+
+<br>
+
+<img src="screenshots/desktop.png" alt="mwm desktop: floating bar, clock and visualizer widgets" width="49%"> <img src="screenshots/windows.png" alt="mwm tiled windows: fastfetch, cava, btop" width="49%">
 
 </div>
 
-mwm keeps dwm's tiny, fast core and adds the things you usually patch in by hand:
-a rounded floating bar, eased animations, a system tray on every monitor, an infinite
-canvas mode and a small IPC. It is not an official suckless project.
+<br>
 
-<p align="center">
-  <img src="screenshots/desktop.png" alt="mwm desktop: floating bar, clock and visualizer widgets" width="49%">
-  <img src="screenshots/windows.png" alt="mwm tiled windows: fastfetch, cava, btop" width="49%">
-</p>
+> [!NOTE]
+> mwm is an independent fork of dwm. It is not an official suckless project.
+
+## Why mwm
+
+dwm is small and fast, and most of what makes it pleasant comes from patches you apply and
+merge by hand. mwm ships that work done: a good-looking bar, smooth motion, and sensible
+multi-monitor behaviour, still one readable C file, configured by editing `config.h`.
+
+- **Still dwm.** Same model, same `config.h`, same compile-to-configure. If you know dwm you know mwm.
+- **Looks first-class.** Rounded floating bar, dot and pill tags, eased window motion.
+- **Made for rices.** Colours come from X resources, binds can be swapped at runtime, and an IPC lets a shell drive the WM.
 
 ## Features
 
-- **Floating bar** with padding and gaps. It drops its padding when a tag has one window.
-- **Dot and pill tags** drawn with cairo, eased between states.
-- **Window animation** (cubic bezier, 0.22 s). New windows are not animated, so terminals see their final size.
-- **Focused-only borders** with a crossfade between windows.
-- **Layouts:** tile, bento, dock, mosaic, monocle, floating. `Mod+space` cycles.
-- **Canvas mode:** an infinite plane. Drag to pan, `Mod+scroll` to zoom.
-- **Systray on every bar.** The real tray lives on one monitor, the others mirror it.
-- **Multi-monitor aware:** popups and spawns follow the pointer.
-- **Colours from X resources** (`dwm.normbgcolor`, `dwm.selbgcolor` ...). Reload with `Mod+F5`.
-- **Runtime key binds** from `~/.config/rice/binds.conf` replace the compiled `keys[]` when that file exists.
-- **IPC** over a root window property: `xprop -root -f _RICE_CMD 32c -set _RICE_CMD "N, ..."`.
-- **Shell-window support** so a Quickshell panel set is not tiled.
+<details open>
+<summary><b>Look and motion</b></summary>
 
-Full list and key reference: [docs/dwm-features.md](docs/dwm-features.md).
+- Floating bar with padding and gaps. It drops the padding when a tag holds a single window.
+- Tags drawn with cairo as dots that ease into a pill.
+- Window animation on a cubic bezier (0.22 s). New windows are not animated, so a terminal always sees its final size.
+- Border on the focused window only, with a crossfade between windows.
+- Colours from X resources (`dwm.normbgcolor`, `dwm.selbgcolor` ...). Reload with `Mod+F5`.
 
-## Build
+</details>
 
-Needs Xlib, Xft, fontconfig, Xinerama, Xext, XTest and cairo (with xlib).
+<details open>
+<summary><b>Layouts</b></summary>
 
-```sh
-# Gentoo
-emerge x11-libs/libX11 x11-libs/libXft x11-libs/libXinerama x11-libs/libXtst x11-libs/cairo
-# Debian / Ubuntu
-apt install build-essential libx11-dev libxft-dev libxinerama-dev libxtst-dev libxext-dev libcairo2-dev
+| Symbol | Layout | What it does |
+| :---: | --- | --- |
+| `[]=` | tile | classic master and stack |
+| `[B]` | bento | one hero window left, an uneven grid right |
+| `[D]` | dock | sidebar, main area, widget column |
+| `[#]` | mosaic | staggered brick rows |
 
-git clone https://github.com/petkebtw/mwm.git
-cd mwm
-cp config.def.h config.h    # edit to taste
-make
-sudo make install           # installs the dwm binary to /usr/local/bin
-```
+`Mod+space` cycles through them. `Mod+Ctrl+space` goes back to tile. `Mod+Shift+space` floats one window.
 
-`Mod` is `Alt`. Default terminal is `konsole`, launcher `Mod+p`. Change both in `config.h`.
+</details>
 
-Add `exec dwm` to `~/.xinitrc`, or a session entry for your display manager.
+<details open>
+<summary><b>Canvas mode</b></summary>
 
-## Dependencies
+`Mod+Shift+g` turns a tag into an infinite plane. Drag the background (or `Mod+Shift` and drag) to pan,
+`Mod+scroll` to zoom. Press `Mod+Ctrl+0` to reset the zoom.
+
+</details>
+
+<details open>
+<summary><b>Multi-monitor</b></summary>
+
+- Systray on every bar. The real tray lives on one monitor and the other bars mirror it, clicks included.
+- Spawns, popups and screenshots follow the pointer.
+- Per-monitor tag state is published so an external shell can show it.
+
+</details>
+
+<details>
+<summary><b>Window control without a mouse</b></summary>
+
+`Mod+Arrows` snaps a window to half or quarter of the screen, `Mod+Shift+Arrows` nudges it 48 px, `Mod+Ctrl+Arrows` resizes it.
+`Mod+Shift+j/k` moves a window up or down the stack. `Mod+Ctrl+Shift+q` restarts mwm and keeps your windows and tags.
+
+</details>
+
+<details>
+<summary><b>Rice hooks</b></summary>
+
+- `~/.config/rice/binds.conf` replaces the compiled `keys[]` when it exists. `dwm --dump-binds` prints the compiled set.
+- Shell windows (Quickshell panels of dock and menu type) are mapped but never tiled.
+- Root-property IPC, see [IPC](#ipc).
+
+</details>
+
+Full reference: [docs/dwm-features.md](docs/dwm-features.md).
+
+## Install
+
+### Dependencies
 
 **Build:** a C99 compiler, `make`, `pkg-config`, and the dev headers for Xlib, Xft, fontconfig, Xinerama, Xext, XTest and cairo (xlib backend).
 
-| Distro | Packages |
+| Distro | Command |
 | --- | --- |
-| Gentoo | `x11-libs/libX11 x11-libs/libXft x11-libs/libXinerama x11-libs/libXtst x11-libs/libXext x11-libs/cairo media-libs/fontconfig` |
-| Debian / Ubuntu | `build-essential pkg-config libx11-dev libxft-dev libxinerama-dev libxtst-dev libxext-dev libcairo2-dev libfontconfig1-dev` |
-| Arch | `base-devel libx11 libxft libxinerama libxtst libxext cairo fontconfig` |
+| Gentoo | `emerge x11-libs/libX11 x11-libs/libXft x11-libs/libXinerama x11-libs/libXtst x11-libs/libXext x11-libs/cairo media-libs/fontconfig` |
+| Debian / Ubuntu | `apt install build-essential pkg-config libx11-dev libxft-dev libxinerama-dev libxtst-dev libxext-dev libcairo2-dev libfontconfig1-dev` |
+| Arch | `pacman -S base-devel libx11 libxft libxinerama libxtst libxext cairo fontconfig` |
 
-**Runtime, required:** `xrdb` (colours are read from X resources) and a terminal. The default is `konsole`; edit `termcmd` in `config.h`.
+**Runtime, required:** `xrdb` (colours) and a terminal. The default is `konsole`, change `termcmd` in `config.h`.
 
-**Runtime, optional.** mwm itself does not start these, your `~/.xprofile` does:
+<details>
+<summary><b>Runtime, optional</b></summary>
+
+mwm does not start these. Your `~/.xprofile` does.
 
 | Tool | Used for |
 | --- | --- |
-| `picom` | compositing: blur, shadows, rounded corners. The bar is ARGB and wants a compositor. |
+| [`picom`](https://github.com/yshui/picom) | blur, shadows, rounded corners. The bar is ARGB and wants a compositor. |
 | `feh` | wallpaper |
 | `pipewire`, `pipewire-pulse`, `wireplumber` | audio (`wpctl`, `pactl`) |
-| `quickshell` (X11 build) | the widget, dock and launcher shell |
-| `xrandr`, `setxkbmap`, `xset` | monitor layout, keyboard, screen blanking |
+| [`quickshell`](https://quickshell.org) (X11 build) | widgets, dock, launcher |
+| `xrandr`, `setxkbmap`, `xset` | monitors, keyboard, screen blanking |
 | `xdotool`, `maim`, `xclip` | scripting, screenshots, clipboard |
 | a polkit agent | auth prompts |
-| JetBrains Mono and Symbols Nerd Font | bar font |
+| JetBrains Mono, Symbols Nerd Font | bar font |
 
-The key binds in the default `config.h` call helper scripts that are **not** in this repo: `rice-search`, `rice-center`, `rice-map`, `rice-lock`, `rice-power`, `rice-media`, `rice-record`, `rice-settings`, `rice-gamebar` and `dwm-volume`. Without them those keys do nothing. Point them at your own commands in `config.h`, or in `~/.config/rice/binds.conf`.
+</details>
 
-## Session setup (`~/.xprofile`)
+### Build
 
-mwm is started by your login manager or `~/.xinitrc`. Put session setup in `~/.xprofile` (SDDM, GDM and LightDM source it) or at the top of `~/.xinitrc`. A minimal one:
+```sh
+git clone https://github.com/petkebtw/mwm.git
+cd mwm
+cp config.def.h config.h     # edit to taste
+make
+sudo make install            # installs the binary to /usr/local/bin/dwm
+```
+
+Then add `exec dwm` to the end of `~/.xinitrc`, or pick the session in your display manager.
+
+> [!IMPORTANT]
+> The default binds call helper scripts that are **not in this repo**: `rice-search`, `rice-center`, `rice-map`, `rice-lock`,
+> `rice-power`, `rice-media`, `rice-record`, `rice-settings`, `rice-gamebar` and `dwm-volume`.
+> Without them those keys do nothing. Point them at your own commands in `config.h` or in `~/.config/rice/binds.conf`.
+
+## Keys
+
+`Mod` is `Alt`.
+
+| Keys | Action |
+| --- | --- |
+| `Mod+Shift+Return` | terminal |
+| `Mod+p` | launcher |
+| `Mod+s` | search |
+| `Mod+n` | control centre |
+| `Mod+o` | settings |
+| `Mod+v` | clipboard history |
+| `Mod+z` | zoomable overview of every monitor |
+| `Mod+j` / `k` | focus next / previous |
+| `Mod+h` / `l` | shrink / grow the master area |
+| `Mod+i` / `d` | more / fewer master windows |
+| `Mod+Return` | promote window to master |
+| `Mod+space` | cycle layout |
+| `Mod+Shift+space` | toggle floating |
+| `Mod+1..9` | view tag |
+| `Mod+Shift+1..9` | send window to tag |
+| `Mod+0` | view all tags |
+| `Mod+,` / `.` | focus previous / next monitor |
+| `Mod+Shift+,` / `.` | send window to previous / next monitor |
+| `Mod+b` | toggle bar |
+| `Mod+-` / `=` | gaps smaller / bigger |
+| `Mod+Shift+c` | close window |
+| `Mod+Shift+g` | canvas mode |
+| `Mod+Shift+s` / `Print` | screenshot |
+| `Mod+Shift+l` | lock |
+| `Mod+F5` | reload colours from X resources |
+| `Mod+Shift+q` | quit |
+| `Mod+Ctrl+Shift+q` | restart, keep windows and tags |
+
+## Session setup
+
+Put session setup in `~/.xprofile` (SDDM, GDM and LightDM source it) or at the top of `~/.xinitrc`.
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
 
-# monitors (check names with `xrandr`)
+# monitors (names from `xrandr`)
 xrandr --output DP-1 --primary --mode 1920x1080 --pos 0x1080 \
        --output HDMI-1 --mode 1920x1080 --pos 0x0
 
-xrdb -merge ~/.Xresources            # colours: dwm.normbgcolor, dwm.selbgcolor ...
+xrdb -merge ~/.Xresources            # dwm.normbgcolor, dwm.selbgcolor ...
 feh --bg-fill ~/Pictures/wall.jpg &
 picom --config ~/.config/picom/picom.conf &
 
-setxkbmap us                         # your layout
+setxkbmap us
 xset s off; xset s noblank; xset -dpms
 
 export XCURSOR_THEME=Adwaita XCURSOR_SIZE=24
 export NO_AT_BRIDGE=1
 
-# audio: start once, after the session bus is up
-(sleep 2; pipewire-pulse) &
+(sleep 2; pipewire-pulse) &          # audio, after the session bus is up
 ```
 
-Notes:
-- `xrdb -merge` must run before mwm starts, or after it followed by `Mod+F5`. mwm reloads colours on `RESOURCE_MANAGER` changes.
-- Start `picom` before `quickshell`, so the panels get blur.
-- On NVIDIA with two monitors of different refresh rates, `__GL_SYNC_DISPLAY_DEVICE=<fast output> picom ...` keeps the fast one smooth.
-- `exec mwm` or `exec dwm` goes last in `~/.xinitrc`. Display managers start it from the session entry instead.
+- Run `xrdb -merge` before mwm starts. mwm also reloads colours when `RESOURCE_MANAGER` changes, or press `Mod+F5`.
+- Start `picom` before `quickshell`, so panels get blur.
+- Two NVIDIA monitors with different refresh rates: `__GL_SYNC_DISPLAY_DEVICE=<fast output> picom ...` keeps the fast one smooth.
 
-## Upstream
+## IPC
 
-mwm is built on dwm 6.8 from `git.suckless.org/dwm`, with the systray patch applied by hand.
-The suckless history is kept in this repository; `git remote add upstream https://git.suckless.org/dwm`
-to follow it.
+mwm listens on a root window property. Send commands with `xprop`:
 
-## References and credits
+```sh
+xprop -root -f _RICE_CMD 32c -set _RICE_CMD "2, 12"    # set the gap to 12 px
+```
+
+Leave about 40 ms between two writes, or the second one is swallowed. The command set (view a tag, gaps,
+canvas, monitor moves) is in [docs/dwm-features.md](docs/dwm-features.md). mwm publishes tag and monitor state
+on `_RICE_TAGS` and `_RICE_MONS` for shells to read.
+
+## FAQ
+
+<details>
+<summary><b>Is this an official suckless project?</b></summary>
+
+No. It is a personal fork, built on the dwm 6.8 source. The suckless history is kept in the git log.
+
+</details>
+
+<details>
+<summary><b>Do I need the rice scripts or Quickshell?</b></summary>
+
+No. mwm runs without them. They only provide the launcher, widgets and menus shown in the screenshots.
+
+</details>
+
+<details>
+<summary><b>How do I follow upstream dwm?</b></summary>
+
+```sh
+git remote add upstream https://git.suckless.org/dwm
+git fetch upstream
+```
+
+Expect conflicts. `dwm.c` has diverged a lot.
+
+</details>
+
+<details>
+<summary><b>Why is the binary called <code>dwm</code>?</b></summary>
+
+The build still produces `dwm`, so existing session files and scripts keep working.
+
+</details>
+
+## Credits
 
 - [dwm](https://dwm.suckless.org) by suckless.org: the base. Source at [git.suckless.org/dwm](https://git.suckless.org/dwm).
-- [systray patch](https://dwm.suckless.org/patches/systray/) for dwm: the tray, applied by hand and extended to mirror on every bar.
+- [systray patch](https://dwm.suckless.org/patches/systray/): the tray, applied by hand and extended to mirror on every bar.
 - [DarkShadow's Shell](https://github.com/shadowww-dev/DarkShadowShell): the QML widget, dock and launcher shell that the mwm setup runs through Quickshell on X11.
 - [Quickshell](https://quickshell.org): the QML shell runtime.
-- [picom](https://github.com/yshui/picom): compositor for blur, shadows and rounded corners.
+- [picom](https://github.com/yshui/picom): compositor.
 - [cairo](https://www.cairographics.org): bar drawing.
 
 ## License
 
-MIT/X Consortium, same as dwm. See [LICENSE](LICENSE). Copyright of the original dwm authors is kept.
+MIT/X Consortium, the same as dwm. See [LICENSE](LICENSE). The original dwm copyright notices are kept.
