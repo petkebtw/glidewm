@@ -14,6 +14,11 @@ mwm keeps dwm's tiny, fast core and adds the things you usually patch in by hand
 a rounded floating bar, eased animations, a system tray on every monitor, an infinite
 canvas mode and a small IPC. It is not an official suckless project.
 
+<p align="center">
+  <img src="screenshots/desktop.png" alt="mwm desktop: floating bar, clock and visualizer widgets" width="49%">
+  <img src="screenshots/windows.png" alt="mwm tiled windows: fastfetch, cava, btop" width="49%">
+</p>
+
 ## Features
 
 - **Floating bar** with padding and gaps. It drops its padding when a tag has one window.
