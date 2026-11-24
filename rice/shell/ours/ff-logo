@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""ff-logo: the fastfetch logo gallery (Settings > Look & Feel > Logo gallery).
+  ff-logo list            JSON: current logo, mode, every logo with absolute paths
+  ff-logo set ID          pick a logo (and rewrite the fastfetch config)
+  ff-logo mode image|ascii
+  ff-logo layout own|classic   (classic: user@host, bold "OS: value" lines, no icons)
+  ff-logo reset           back to the config template's own logo
+  ff-logo show            run fastfetch once"""
+import json, os, subprocess, sys
+HOME = os.path.expanduser("~")
+G = f"{HOME}/.local/share/rice/fflogos"
+ST = f"{HOME}/.config/rice/fflogo.json"
+
+
+def state():
+    try:
+        return json.load(open(ST))
+    except Exception:
+        return {}
+
+
+def save(st):
+    os.makedirs(os.path.dirname(ST), exist_ok=True)
+    tmp = ST + ".tmp"
+    json.dump(st, open(tmp, "w")); os.replace(tmp, ST)
+
+
+def regen():
+    sys.path.insert(0, f"{HOME}/.local/lib/rice")
+    import hooks
+    c = json.load(open(f"{HOME}/.cache/theme/colors.json"))
+    hooks.fastfetch(c)
+
+
+def main():
+    a = sys.argv[1:] or ["list"]
+    cat = json.load(open(f"{G}/catalog.json"))
+    st = state()
+    if a[0] == "list":
+        items = []
+        for i in cat:
+            items.append(dict(i, image=f"{G}/{i['image']}" if i.get("image") else "", ascii=f"{G}/{i['ascii']}" if i.get("ascii") else "",
+                              art=open(f"{G}/{i['ascii']}").read().replace("$$", "$").replace("$1", "") if i.get("ascii") else ""))
+        print(json.dumps(dict(logo=st.get("logo", ""), mode=st.get("mode", "image"), layout=st.get("layout", "own"), items=items)))
+    elif a[0] == "set" and len(a) > 1:
+        if a[1] not in [i["id"] for i in cat]:
+            sys.exit("unknown logo " + a[1])
+        st["logo"] = a[1]; st.setdefault("mode", "image"); save(st); regen(); print("ok")
+    elif a[0] == "mode" and len(a) > 1 and a[1] in ("image", "ascii"):
+        st["mode"] = a[1]; save(st)
+        if st.get("logo"):
+            regen()
+        print("ok")
+    elif a[0] == "layout" and len(a) > 1 and a[1] in ("own", "classic"):
+        st["layout"] = a[1]; save(st); regen(); print("ok")
+    elif a[0] == "reset":
+        if os.path.exists(ST):
+            os.remove(ST)
+        regen(); print("ok")
+    elif a[0] == "show":
+        subprocess.run(["fastfetch"])
+    else:
+        sys.exit(__doc__)
+
+
+main()

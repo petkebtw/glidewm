@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Mod+e: widgets live under windows (X11), so edit mode first goes to the first empty tag of the widget monitor, then toggles.
+mon=$(cat "$HOME/.config/rice/screens.json" 2>/dev/null | sed -n 's/.*"widgets": *"\([^"]*\)".*/\1/p')
+read -r x y < <(xrandr --listmonitors | awk -v n="${mon:-DP-4}" '$NF==n { split($3,a,"+"); print a[2], a[3] }')
+st=$(sed -n 's/.*"editing": *\(true\|false\).*/\1/p' "$HOME/.config/rice/desktop.json" | head -1)
+if [ "$st" != "true" ]; then
+  xprop -root -f _RICE_CMD 32c -set _RICE_CMD "1,${x:-0},${y:-1080}"
+  sleep 0.45
+fi
+exec "$HOME/.local/share/dss/bin/desktop-set" edit toggle

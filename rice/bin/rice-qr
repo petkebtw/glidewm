@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""QR code of the clipboard text (or argv) in a card."""
+import os, sys, subprocess, tempfile, signal
+# single instance (spam-safe): decided before the heavy imports
+import fcntl as _fc, signal as _sg
+_cd = os.path.expanduser("~/.cache/rice"); os.makedirs(_cd, exist_ok=True)
+_lk = open(os.path.join(_cd, "once-rice-qr.lock"), "w")
+try:
+    _fc.flock(_lk, _fc.LOCK_EX | _fc.LOCK_NB)
+except OSError:
+    if False:
+        try: os.kill(int(open(os.path.join(_cd, "once-rice-qr.pid")).read()), _sg.SIGTERM)
+        except Exception: pass
+    sys.exit(0)
+open(os.path.join(_cd, "once-rice-qr.pid"), "w").write(str(os.getpid()))
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import rice, widgets as w
+from rice import Gtk, Gdk, GLib
+
+txt = " ".join(sys.argv[1:]) or subprocess.run(["timeout", "1", "xclip", "-o", "-selection", "clipboard"], capture_output=True, text=True).stdout.strip()
+if not txt:
+    sys.exit(0)
+out = subprocess.run(["qrencode", "-t", "ASCII", "-m", "0", "-o", "-", txt], capture_output=True, text=True).stdout.splitlines()
+mat = [[ch == "#" for ch in ln[::2]] for ln in out if ln.strip() or True][:]
+mat = [r for r in mat if r]
+N = len(mat)
+S = 300
+card = rice.Card(S + 56, S + 110, radius=26)
+b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+for m in ("start", "end"): getattr(b, f"set_margin_{m}")(28)
+b.set_margin_top(26); b.set_margin_bottom(20)
+da = Gtk.DrawingArea(); da.set_size_request(S, S)
+
+
+def draw(wd, cr):
+    c = w.col("fg"); u = S / (N + 2)
+    rice.rounded(cr, 0, 0, S, S, 16); cr.set_source_rgba(*c[:3], 1); cr.fill()      # light plate, dark modules: scans on every theme
+    cr.set_source_rgba(*w.col("bg")[:3], 1)
+    for y, row in enumerate(mat):
+        for x, on in enumerate(row):
+            if on:
+                cr.rectangle((x + 1) * u, (y + 1) * u, u + 0.4, u + 0.4)
+    cr.fill()
+    return False
+
+
+da.connect("draw", draw)
+img = da
+l = Gtk.Label(); l.set_ellipsize(3); l.set_max_width_chars(30)
+l.set_markup(f'<span size="10000" alpha="60%">{GLib.markup_escape_text(txt)}</span>')
+b.pack_start(img, True, True, 0); b.pack_start(l, False, False, 0)
+card.add(b); card.show_all()
+x, y, _ = w.mon_center(S + 56, S + 110); card.move(x, y)
+w.close_on_outside(card); w.grab_keys(card)
+signal.signal(signal.SIGTERM, lambda *a: GLib.idle_add(card.quit_anim))
+Gtk.main()

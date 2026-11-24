@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""File converter.  rice-convert [FILES...]   Drop files on the card, browse, or pass paths.
+   Images, video, audio and archives. Output lands next to the source file, or in the folder chosen with the Save to button."""
+import os, sys, threading, subprocess, signal, urllib.parse
+# single instance (spam-safe): decided before the heavy imports
+import fcntl as _fc, signal as _sg
+_cd = os.path.expanduser("~/.cache/rice"); os.makedirs(_cd, exist_ok=True)
+_lk = open(os.path.join(_cd, "once-rice-convert.lock"), "w")
+try:
+    _fc.flock(_lk, _fc.LOCK_EX | _fc.LOCK_NB)
+except OSError:
+    if False:
+        try: os.kill(int(open(os.path.join(_cd, "once-rice-convert.pid")).read()), _sg.SIGTERM)
+        except Exception: pass
+    sys.exit(0)
+open(os.path.join(_cd, "once-rice-convert.pid"), "w").write(str(os.getpid()))
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import rice, widgets as w, convert, outdir
+from rice import Gtk, Gdk, GLib
+import cairo
+
+HOME = os.path.expanduser("~")
+W_, H_ = 600, 550
+card = rice.Card(W_, H_, radius=26)
+stack = Gtk.Stack(); stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT); stack.set_transition_duration(220)
+card.add(stack)
+files, state = [], dict(fmt=None, busy=False)
+
+
+def pad(box):
+    for m in ("start", "end"):
+        getattr(box, f"set_margin_{m}")(24)
+    box.set_margin_top(22); box.set_margin_bottom(20)
+    return box
+
+
+# ------------------------------------------------------------------ main page
+main = pad(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12))
+stack.add_named(main, "main")
+t = Gtk.Label(xalign=0); t.set_markup('<span size="15000" weight="bold">Convert</span>  <span size="9500" alpha="55%">anything to anything*</span>')
+main.pack_start(t, False, False, 0)
+
+
+class Drop(w.Anim):
+    def __init__(self):
+        super().__init__(0.0, 0.3)
+        self.set_size_request(-1, 118)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.connect("draw", self.paint)
+        self.connect("button-press-event", lambda *_: (open_browser(), True)[1])
+        self.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)], Gdk.DragAction.COPY)
+        self.connect("drag-data-received", self.dropped)
+        self.connect("drag-motion", lambda *a: (self.go(1.0), True)[1])
+        self.connect("drag-leave", lambda *a: self.go(0.0))
+
+    def dropped(self, wd, ctx, x, y, data, info, time):
+        add([urllib.parse.unquote(u[7:]) for u in data.get_uris() if u.startswith("file://")])
+        self.go(0.0)
+
+    def paint(self, wd, cr):
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        rice.rounded(cr, 2, 2, W - 4, H - 4, 20)
+        cr.set_source_rgba(*w.col("accent")[:3], 0.05 + 0.15 * self.v); cr.fill_preserve()
+        cr.set_source_rgba(*w.col("accent")[:3], 0.55); cr.set_line_width(1.5); cr.set_dash([7, 6]); cr.stroke(); cr.set_dash([])
+        if not files:
+            w.icon(cr, "", W / 2, H / 2 - 8, 28, "accent")
+            w.text(cr, "drop files here, or click to browse", W / 2, H / 2 + 28, 12, False, "dim", 1, "c")
+        else:
+            for i, f in enumerate(files[:3]):
+                n = os.path.basename(f)
+                w.text(cr, (n if len(n) < 52 else n[:49] + "…"), 22, 34 + i * 24, 12, i == 0, "fg", 1)
+            if len(files) > 3:
+                w.text(cr, f"+ {len(files) - 3} more", 22, 34 + 3 * 24, 11, False, "dim")
+            w.text(cr, "click to change", W - 18, H - 14, 9.5, False, "dim", 0.7, "r")
+        return False
+
+
+drop = Drop()
+main.pack_start(drop, False, False, 0)
+lab = Gtk.Label(xalign=0); lab.set_markup('<span size="9500" weight="bold" letter_spacing="1500" alpha="60%">CONVERT TO</span>')
+main.pack_start(lab, False, False, 4)
+chips = Gtk.Grid(column_spacing=6, row_spacing=6, column_homogeneous=True)
+main.pack_start(chips, False, False, 0)
+fbtn = w.Btn("", lambda: pickdir(), False, 300, 32)
+main.pack_start(w.row("Save to", fbtn), False, False, 0)
+bar = w.Bar()
+status = Gtk.Label(xalign=0); status.set_ellipsize(3)
+main.pack_start(bar, False, False, 6)
+main.pack_start(status, False, False, 0)
+brow = Gtk.Box(spacing=8)
+cbtn = w.Btn("Convert", lambda: run(), True, 140)
+brow.pack_end(cbtn, False, False, 0)
+brow.pack_end(w.Btn("Close", lambda: card.quit_anim(), False, 90), False, False, 0)
+brow.pack_end(w.Btn("Open folder", lambda: opendir(), False, 130), False, False, 0)
+main.pack_end(brow, False, False, 0)
+
+
+def say(s, err=False):
+    status.set_markup(f'<span size="10500" foreground="{"#ff7a85" if err else rice.CUR["dim"]}">{GLib.markup_escape_text(s)}</span>')
+
+
+def showdir():
+    fbtn.label = outdir.show(outdir.get("convert")); fbtn.queue_draw()
+
+
+def pickdir():
+    def cb(r):
+        if r is not False:
+            showdir()
+    outdir.choose("convert", None, cb, none="Next to source", title="Save converted files to",
+                  before=lambda: Gdk.Display.get_default().get_default_seat().ungrab(),
+                  after=lambda: w.grab_keys(card))
+
+
+def opendir():
+    d = outdir.get("convert") or (os.path.dirname(files[0]) if files else None)
+    if d:
+        subprocess.Popen(["xdg-open", d], start_new_session=True)
+
+
+def rebuild_chips():
+    for c in chips.get_children():
+        chips.remove(c)
+    if not files:
+        return
+    k = convert.kind(files[0])
+    fm = convert.targets(k, convert.ext(files[0])) if k else sorted({"mp4", "png", "mp3", "wav", "gif", "jpg", "pdf", "webp"})
+    if state["fmt"] not in fm:
+        state["fmt"] = fm[0] if fm else None
+    for i, f in enumerate(fm):
+        b = w.Btn(f, (lambda f=f: pick(f)), f == state["fmt"], 60, 32)
+        b.fmt = f
+        chips.attach(b, i % 6, i // 6, 1, 1)
+    chips.show_all()
+
+
+def pick(f):
+    state["fmt"] = f
+    for b in chips.get_children():
+        b.primary = (b.fmt == f); b.queue_draw()
+
+
+def add(paths):
+    for p in paths:
+        if os.path.isfile(p) and p not in files:
+            files.append(p)
+    rebuild_chips(); drop.queue_draw()
+    say(f"{len(files)} file(s) ready" if files else "")
+
+
+def run():
+    if state["busy"] or not files or not state["fmt"]:
+        say("pick a file and a format first", True); return
+    state["busy"] = True; cbtn.enabled = False; cbtn.queue_draw()
+    bar.val = None
+    threading.Thread(target=work, args=(list(files), state["fmt"]), daemon=True).start()
+
+
+def work(fs, fmt):
+    ok = bad = 0
+    last_err = ""
+    for i, f in enumerate(fs):
+        GLib.idle_add(say, f"converting {i + 1}/{len(fs)}  {os.path.basename(f)}")
+        def prog(p, i=i):
+            GLib.idle_add(setp, (i + p) / len(fs))
+        r, o = convert.convert(f, fmt, prog, outdir.get("convert"))
+        if r: ok += 1
+        else: bad += 1; last_err = f"{os.path.basename(f)}: {o}"
+        GLib.idle_add(setp, (i + 1) / len(fs))
+    GLib.idle_add(done, ok, bad, last_err)
+
+
+def setp(v):
+    bar.val = v; return False
+
+
+def done(ok, bad, err):
+    state["busy"] = False; cbtn.enabled = True; cbtn.queue_draw()
+    bar.val = 1.0
+    say(f"done: {ok} converted" + (f", {bad} failed  ({err})" if bad else ""), bool(bad and not ok))
+    if ok:
+        subprocess.Popen(["notify-send", "-a", "rice-convert", "Conversion finished", f"{ok} file(s)"])
+    return False
+
+
+# ------------------------------------------------------------------ browser page
+br = pad(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8))
+stack.add_named(br, "browse")
+bt = Gtk.Label(xalign=0); bt.set_ellipsize(1)
+br.pack_start(bt, False, False, 0)
+sc = Gtk.ScrolledWindow(); sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+lst = Gtk.ListBox(); lst.set_selection_mode(Gtk.SelectionMode.NONE)
+sc.add(lst)
+br.pack_start(sc, True, True, 0)
+bb = Gtk.Box(spacing=8)
+bb.pack_end(w.Btn("Done", lambda: stack.set_visible_child_name("main") or (add(list(chosen)), None)[1], True, 110), False, False, 0)
+bb.pack_end(w.Btn("Up", lambda: go(os.path.dirname(cwd[0])), False, 80), False, False, 0)
+br.pack_end(bb, False, False, 0)
+cwd, chosen = [HOME], set()
+
+
+def go(d):
+    if not os.path.isdir(d):
+        return
+    cwd[0] = d
+    for r in lst.get_children():
+        lst.remove(r)
+    bt.set_markup(f'<span size="11000" weight="bold">{GLib.markup_escape_text(d.replace(HOME, "~"))}</span>')
+    try:
+        es = sorted(os.scandir(d), key=lambda e: (not e.is_dir(), e.name.lower()))
+    except OSError:
+        es = []
+    for e in es:
+        if e.name.startswith("."):
+            continue
+        row = Gtk.ListBoxRow(); eb = Gtk.EventBox(); l = Gtk.Label(xalign=0)
+        isd = e.is_dir()
+        sel = e.path in chosen
+        l.set_markup(f'<span size="11500" {"weight=\"bold\"" if isd else ""}>{"  " if isd else ("✓  " if sel else "     ")}{GLib.markup_escape_text(e.name)}</span>')
+        l.set_margin_top(5); l.set_margin_bottom(5); l.set_margin_start(8)
+        eb.add(l); row.add(eb)
+        eb.connect("button-press-event", lambda wd, ev, p=e.path, d=isd, lb=l, nm=e.name: pressed(p, d, lb, nm))
+        lst.add(row)
+    lst.show_all()
+    sc.get_vadjustment().set_value(0)
+
+
+def pressed(p, isd, lb, nm):
+    if isd:
+        go(p)
+    else:
+        if p in chosen: chosen.discard(p)
+        else: chosen.add(p)
+        lb.set_markup(f'<span size="11500">{"✓  " if p in chosen else "     "}{GLib.markup_escape_text(nm)}</span>')
+    return True
+
+
+def open_browser():
+    chosen.clear(); chosen.update(files)
+    go(os.path.dirname(files[0]) if files else cwd[0])
+    stack.set_visible_child_name("browse")
+
+
+# ------------------------------------------------------------------ show
+card.show_all()
+showdir()
+x, y, _g = w.mon_center(W_, H_)
+card.move(x, y - 40)
+w.close_on_outside(card)
+w.grab_keys(card)
+add([os.path.abspath(a) for a in sys.argv[1:]])
+if not files:
+    say("*images, video, audio, archives. pdf from images. mp3 via lame.")
+signal.signal(signal.SIGTERM, lambda *a: GLib.idle_add(card.quit_anim))
+Gtk.main()

@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Apply the system settings the user changed in rice-settings (keyboard, mouse, display, night light, gaps, picom effects).
+   Only keys present in settings.json are touched, so ~/.xprofile defaults stay in charge otherwise.  Run at login (after dwm is up)."""
+import os, sys, re, subprocess, math
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import settings
+
+S = (settings.load().get("sys") or {})
+
+
+def run(*a):
+    try:
+        return subprocess.run(["timeout", "5", *a], capture_output=True, text=True).stdout
+    except Exception:
+        return ""
+
+
+# ---- keyboard
+if "kbd_layout" in S or "caps" in S:
+    cmd = ["setxkbmap"] + ([S["kbd_layout"]] if "kbd_layout" in S else [])
+    run(*cmd, "-option", "")
+    if S.get("caps") in ("caps:escape", "ctrl:nocaps", "caps:swapescape"):
+        run("setxkbmap", "-option", S["caps"])
+if "kbd_delay" in S or "kbd_rate" in S:
+    run("xset", "r", "rate", str(int(S.get("kbd_delay", 300))), str(int(S.get("kbd_rate", 40))))
+
+# ---- mouse (libinput properties on every pointer that has them)
+if "mouse_profile" in S or "mouse_speed" in S:
+    for line in run("xinput", "list", "--short").splitlines():
+        m = re.search(r"id=(\d+)\s+\[slave\s+pointer", line)
+        if not m:
+            continue
+        i = m.group(1)
+        props = run("xinput", "list-props", i)
+        if "libinput Accel Profile Enabled" in props and "mouse_profile" in S:
+            run("xinput", "set-prop", i, "libinput Accel Profile Enabled", *(("0", "1", "0") if S["mouse_profile"] == "flat" else ("1", "0", "0")))
+        if "libinput Accel Speed" in props and "mouse_speed" in S:
+            run("xinput", "set-prop", i, "libinput Accel Speed", str(float(S["mouse_speed"])))
+
+# ---- screen off timeout (minutes, 0 = never)
+if "dpms_min" in S:
+    mn = int(S["dpms_min"])
+    if mn:
+        run("xset", "s", str(mn * 60), str(mn * 60)); run("xset", "+dpms"); run("xset", "dpms", str(mn * 60), str(mn * 60), str(mn * 60))
+    else:
+        run("xset", "s", "off"); run("xset", "-dpms")
+
+
+# ---- brightness + night light (xrandr gamma/brightness on every connected output)
+def kelvin(t):
+    t = t / 100.0
+    r = 255 if t <= 66 else 329.698727446 * ((t - 60) ** -0.1332047592)
+    g = 99.4708025861 * math.log(t) - 161.1195681661 if t <= 66 else 288.1221695283 * ((t - 60) ** -0.0755148492)
+    b = 255 if t >= 66 else (0 if t <= 19 else 138.5177312231 * math.log(t - 10) - 305.0447927307)
+    return [max(0.0, min(255.0, v)) / 255.0 for v in (r, g, b)]
+
+
+if "night" in S or "brightness" in S:
+    rgb = kelvin(float(S.get("night_k", 4000))) if S.get("night") else [1.0, 1.0, 1.0]
+    gam = ":".join("%.3f" % max(0.3, c) for c in rgb)
+    br = "%.2f" % max(0.3, min(1.0, float(S.get("brightness", 1.0))))
+    for line in run("xrandr", "--listmonitors").splitlines()[1:]:
+        name = line.split()[-1]
+        run("xrandr", "--output", name, "--gamma", gam, "--brightness", br)
+
+# ---- dwm (needs the rebuilt dwm; ignored by the old one)
+for n, k in ((2, "gap"), (3, "vpad"), (4, "spad")):
+    if k in S:
+        run("xprop", "-root", "-f", "_RICE_CMD", "32c", "-set", "_RICE_CMD", f"{n}, {int(S[k])}")
+
+import time as _t
+for k, key in (("bar_tags", 1), ("bar_title", 2), ("bar_layout", 3)):   # dwm bar options (IPC 11)
+    if k in S:
+        _t.sleep(0.06)
+        run("xprop", "-root", "-f", "_RICE_CMD", "32c", "-set", "_RICE_CMD", f"11, {key}, {int(S[k])}")
+
+# ---- picom effects
+conf = os.path.expanduser("~/.config/picom/rice.conf")
+if os.path.exists(conf) and ("shadows" in S or "fading" in S):
+    t = open(conf).read(); n = t
+    for key, sk in (("shadow", "shadows"), ("fading", "fading")):
+        if sk in S:
+            n = re.sub(rf"^{key} = (true|false);", f"{key} = {'true' if S[sk] else 'false'};", n, count=1, flags=re.M)
+    if n != t:
+        open(conf, "w").write(n)
+        run("pkill", "-USR1", "-x", "picom")

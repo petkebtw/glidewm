@@ -1,0 +1,858 @@
+#!/usr/bin/env python3
+"""rice-shot: frozen multi-monitor screenshot, drag a region, annotate, copy/save.
+   rice-shot          select a region
+   rice-shot full     whole desktop (all monitors), straight to editing
+Keys: p pen  h highlighter  a arrow  l line  r rect  o oval  t text  n number  b blur(pixelate)
+      1-6 color   [ ] size   ctrl+z undo   ctrl+shift+z redo   Enter save+copy   ctrl+c copy
+      ctrl+s save   backspace reselect   esc quit
+      x read text (OCR) in the selection and copy it   f whole desktop   m monitor under pointer   drag the 8 handles to resize the selection"""
+import os, sys, math, time, subprocess, io, re
+# single instance (spam-safe): decided before the heavy imports
+import fcntl as _fc, signal as _sg
+_cd = os.path.expanduser("~/.cache/rice"); os.makedirs(_cd, exist_ok=True)
+_lk = open(os.path.join(_cd, "once-rice-shot.lock"), "w")
+try:
+    _fc.flock(_lk, _fc.LOCK_EX | _fc.LOCK_NB)
+except OSError:
+    if False:
+        try: os.kill(int(open(os.path.join(_cd, "once-rice-shot.pid")).read()), _sg.SIGTERM)
+        except Exception: pass
+    sys.exit(0)
+open(os.path.join(_cd, "once-rice-shot.pid"), "w").write(str(os.getpid()))
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import rice, cairo
+from rice import Gtk, Gdk, GLib
+from gi.repository import GdkPixbuf
+
+import outdir
+HOME = os.path.expanduser("~")
+TMP = f"{HOME}/.cache/rice/shot.png"
+os.makedirs(os.path.dirname(TMP), exist_ok=True)
+FULL = len(sys.argv) > 1 and sys.argv[1] == "full"
+
+# ---------- capture (whole X root = every monitor), straight from the X server: no PNG round trip ----------
+_root = Gdk.get_default_root_window()
+W, H = _root.get_width(), _root.get_height()
+_pb = Gdk.pixbuf_get_from_window(_root, 0, 0, W, H)
+if _pb is None:
+    sys.exit("capture failed")
+SRC = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
+_c = cairo.Context(SRC); _c.set_operator(cairo.OPERATOR_SOURCE)
+Gdk.cairo_set_source_pixbuf(_c, _pb, 0, 0); _c.paint()
+del _c, _pb
+
+# glass behind the toolbar: a 1/10 size copy drawn scaled up (bilinear = blur), no per-pixel work
+BLK = 10
+BLUR = cairo.ImageSurface(cairo.FORMAT_ARGB32, max(W // BLK, 1), max(H // BLK, 1))
+_c = cairo.Context(BLUR); _c.scale(BLUR.get_width() / W, BLUR.get_height() / H)
+_c.set_source_surface(SRC, 0, 0); _c.get_source().set_filter(cairo.FILTER_BILINEAR); _c.paint()
+del _c
+
+
+def _pointer_monitor():
+    d = Gdk.Display.get_default()
+    _, px, py = d.get_default_seat().get_pointer().get_position()
+    g = (d.get_monitor_at_point(px, py) or d.get_primary_monitor()).get_geometry()
+    return (g.x, g.y, g.width, g.height)
+
+
+C = rice.colors()
+PALETTE = ["#ff4d4d", "#ffd23f", "#3ddc84", "#4da3ff", "#ffffff", C["accent"]]
+SIZES = [3, 5, 9]
+TOOLS = [("pen", ""), ("hl", ""), ("arrow", ""), ("line", ""), ("rect", ""),
+         ("oval", ""), ("text", ""), ("num", ""), ("blur", "")]
+KEYTOOL = dict(p="pen", h="hl", a="arrow", l="line", r="rect", o="oval", t="text", n="num", b="blur")
+
+S = dict(mode="edit" if FULL else "select", region=_pointer_monitor() if FULL else None, drag=None, tool="pen",
+         color=0, size=1, items=[], redo=[], cur=None, text=None, mouse=(0, 0), hover=None, tb=[], tbrect=None)
+
+
+# ---------- drawing helpers ----------
+def rgb(h, a=1.0):
+    return rice.rgb(h, a)
+
+
+def norm(x0, y0, x1, y1):
+    return (min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+
+
+def pixelate(cr, r, block):
+    x, y, w, h = [int(v) for v in r]
+    if w < 2 or h < 2:
+        return
+    sw, sh = max(1, w // block), max(1, h // block)
+    small = cairo.ImageSurface(cairo.FORMAT_ARGB32, sw, sh)
+    sc = cairo.Context(small)
+    sc.scale(sw / w, sh / h)
+    sc.set_source_surface(SRC, -x, -y)
+    sc.paint()
+    cr.save()
+    cr.rectangle(x, y, w, h)
+    cr.clip()
+    cr.translate(x, y)
+    cr.scale(w / sw, h / sh)
+    cr.set_source_surface(small, 0, 0)
+    cr.get_source().set_filter(cairo.FILTER_NEAREST)
+    cr.paint()
+    cr.restore()
+
+
+def draw_item(cr, it, editing_text=False):
+    k, col, w = it["k"], PALETTE[it["c"]], it["w"]
+    cr.save()
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    if k == "pen":
+        cr.set_source_rgba(*rgb(col)); cr.set_line_width(w)
+        pts = it["pts"]
+        cr.move_to(*pts[0])
+        for p in pts[1:]:
+            cr.line_to(*p)
+        if len(pts) == 1:
+            cr.line_to(pts[0][0] + .01, pts[0][1])
+        cr.stroke()
+    elif k == "hl":
+        cr.set_source_rgba(*rgb(col, 0.38)); cr.set_line_width(w * 4); cr.set_line_cap(cairo.LINE_CAP_SQUARE)
+        pts = it["pts"]
+        cr.move_to(*pts[0])
+        for p in pts[1:]:
+            cr.line_to(*p)
+        cr.stroke()
+    elif k in ("line", "arrow"):
+        (x0, y0), (x1, y1) = it["a"], it["b"]
+        cr.set_source_rgba(*rgb(col)); cr.set_line_width(w)
+        cr.move_to(x0, y0); cr.line_to(x1, y1); cr.stroke()
+        if k == "arrow" and (x0, y0) != (x1, y1):
+            ang = math.atan2(y1 - y0, x1 - x0)
+            hl = 12 + w * 2.6
+            cr.move_to(x1, y1)
+            cr.line_to(x1 - hl * math.cos(ang - 0.45), y1 - hl * math.sin(ang - 0.45))
+            cr.line_to(x1 - hl * math.cos(ang + 0.45), y1 - hl * math.sin(ang + 0.45))
+            cr.close_path(); cr.fill()
+    elif k == "rect":
+        x, y, ww, hh = norm(*it["a"], *it["b"])
+        cr.set_source_rgba(*rgb(col)); cr.set_line_width(w)
+        rice.rounded(cr, x, y, ww, hh, min(8, ww / 2, hh / 2)); cr.stroke()
+    elif k == "oval":
+        x, y, ww, hh = norm(*it["a"], *it["b"])
+        if ww > 1 and hh > 1:
+            cr.save()
+            cr.translate(x + ww / 2, y + hh / 2); cr.scale(ww / 2, hh / 2)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.set_source_rgba(*rgb(col)); cr.set_line_width(w); cr.stroke()
+    elif k == "text":
+        sz = 14 + w * 3
+        cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(sz)
+        s = it["s"] + ("▏" if editing_text else "")
+        x, y = it["a"]
+        # soft outline so text reads on any background
+        cr.set_source_rgba(0, 0, 0, 0.55); cr.set_line_width(4)
+        cr.move_to(x, y + sz); cr.text_path(s); cr.stroke()
+        cr.set_source_rgba(*rgb(col)); cr.move_to(x, y + sz); cr.show_text(s)
+    elif k == "num":
+        x, y = it["a"]; r = 11 + w * 1.6
+        cr.arc(x, y, r, 0, 2 * math.pi); cr.set_source_rgba(*rgb(col)); cr.fill()
+        cr.set_source_rgba(0, 0, 0, 0.85) if col in ("#ffd23f", "#ffffff", "#3ddc84") else cr.set_source_rgba(1, 1, 1, 1)
+        cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(r * 1.1)
+        t = str(it["n"]); e = cr.text_extents(t)
+        cr.move_to(x - e.width / 2 - e.x_bearing, y - e.height / 2 - e.y_bearing); cr.show_text(t)
+    elif k == "blur":
+        x, y, ww, hh = norm(*it["a"], *it["b"])
+        pixelate(cr, (x, y, ww, hh), 10 + w)
+    cr.restore()
+
+
+def all_items():
+    return S["items"] + ([S["cur"]] if S["cur"] else []) + ([S["text"]] if S["text"] else [])
+
+
+# ---------- view: scroll zooms the frozen screenshot while annotating (screen = image * z + (x, y)) ----------
+V = dict(z=1.0, x=0.0, y=0.0, pan=None)
+
+
+def v2i(x, y):
+    return (x - V["x"]) / V["z"], (y - V["y"]) / V["z"]
+
+
+def region_view():
+    rx, ry, rw, rh = S["region"]
+    z = V["z"]
+    return (rx * z + V["x"], ry * z + V["y"], rw * z, rh * z)
+
+
+class _Ev:
+    def __init__(self, x, y): self.x, self.y = x, y
+
+
+def autopan_tick():
+    """While drawing or resizing, a pointer outside the selection (or at the screen edge) scrolls the view toward it."""
+    if not (S["cur"] or S.get("rs")) or S["mode"] != "edit":
+        V["ap"] = None
+        return False
+    if V["z"] == 1.0 and not V["x"] and not V["y"]:
+        return True
+    mx, my = S["mouse"]
+    rx, ry, rw, rh = region_view()
+    EDGE = 48
+
+    def push(m, lo, hi, size):
+        d = 0.0
+        if m < lo: d = m - lo
+        elif m > hi: d = m - hi
+        if m < EDGE: d = min(d, m - EDGE)
+        elif m > size - EDGE: d = max(d, m - (size - EDGE))
+        return d
+    dx, dy = push(mx, rx, rx + rw, W), push(my, ry, ry + rh, H)
+    if not dx and not dy:
+        return True
+    k = 0.016 * 14
+    V["x"] -= max(-60, min(60, dx * k)); V["y"] -= max(-60, min(60, dy * k))
+    on_motion(win, _Ev(mx, my))      # the drawing follows the pointer through the moving view
+    layout_toolbar(); win.queue_draw()
+    return True
+
+
+def start_autopan():
+    if not V.get("ap"):
+        V["ap"] = GLib.timeout_add(16, autopan_tick)
+
+
+def zoom_view(f, cx, cy):
+    z0 = V["z"]
+    z1 = max(0.25, min(24.0, z0 * f))
+    if abs(z1 - 1.0) < 0.04:
+        z1 = 1.0
+    V["x"] = cx - (cx - V["x"]) * z1 / z0
+    V["y"] = cy - (cy - V["y"]) * z1 / z0
+    V["z"] = z1
+    if z1 == 1.0 and abs(V["x"]) + abs(V["y"]) < 40:
+        V["x"] = V["y"] = 0.0
+    layout_toolbar(); win.queue_draw()
+
+
+# ---------- export ----------
+def render_png():
+    rx, ry, rw, rh = [int(v) for v in S["region"]]
+    out = cairo.ImageSurface(cairo.FORMAT_ARGB32, rw, rh)
+    cr = cairo.Context(out)
+    cr.translate(-rx, -ry)
+    cr.set_source_surface(SRC, 0, 0); cr.paint()
+    for it in S["items"]:
+        draw_item(cr, it)
+    pb = Gdk.pixbuf_get_from_surface(out, 0, 0, rw, rh)
+    return pb.save_to_bufferv("png", ["compression"], ["1"])[1], pb     # level 1: ~10x faster than the default
+
+
+def do_copy(png):
+    p = subprocess.Popen(["xclip", "-selection", "clipboard", "-t", "image/png"], stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    p.stdin.write(png); p.stdin.close()
+
+
+def do_save(png):
+    d = outdir.get("shot", f"{HOME}/Pictures")
+    os.makedirs(d, exist_ok=True)
+    path = f"{d}/screenshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    open(path, "wb").write(png)
+    return path
+
+
+def finish(copy=True, save=False):
+    if S["text"]:
+        commit_text()
+    release()
+    win.hide()                      # the overlay disappears at once; encoding happens after
+    Gdk.Display.get_default().flush()
+    png, pb = render_png()
+    msg = []
+    if copy:
+        do_copy(png); msg.append("Copied to clipboard")
+    if save:
+        do_save(png); msg.append("saved")
+    toast(pb, " · ".join(msg).capitalize() if copy else "Saved to " + outdir.show(outdir.get("shot", f"{HOME}/Pictures")))
+
+
+def release():
+    Gdk.Display.get_default().get_default_seat().ungrab()
+
+
+def toast(pb, text, ok=True):
+    sc = min(64 / pb.get_width(), 44 / pb.get_height())
+    pb = pb.scale_simple(max(1, int(pb.get_width() * sc)), max(1, int(pb.get_height() * sc)), GdkPixbuf.InterpType.BILINEAR)
+    t = rice.Card(330 if ok else 460, 68, radius=24, alpha=0.72)
+    box = Gtk.Box(spacing=12)
+    for m in ("start", "end"): getattr(box, f"set_margin_{m}")(14)
+    t.add(box)
+    img = Gtk.Image.new_from_pixbuf(pb); box.pack_start(img, False, False, 0)
+    ck = Gtk.Label(); ck.set_markup(f"<span font='Symbols Nerd Font 14' foreground='{C['accent'] if ok else '#e5736b'}'>{chr(0xf00c) if ok else chr(0xf071)}</span>")
+    box.pack_start(ck, False, False, 0)
+    lab = Gtk.Label(label=text); lab.set_line_wrap(True); lab.set_max_width_chars(34); box.pack_start(lab, True, True, 0)
+    t.top_center(64); t.show_all()
+    GLib.timeout_add(1900 if ok else 4500, Gtk.main_quit)
+
+
+
+# ---------- OCR: read the text in the selection (clean screen, no annotations) and copy it ----------
+TESSDATA = os.path.expanduser("~/.local/share/rice/tessdata")    # eng + deu fra spa hun rus (user-level, no root)
+TENV = dict(os.environ, **({"TESSDATA_PREFIX": TESSDATA} if os.path.isdir(TESSDATA) else {}))
+
+
+def ocr_langs():
+    try:
+        have = subprocess.run(["tesseract", "--list-langs"], capture_output=True, text=True, timeout=5, env=TENV).stdout.split()
+    except Exception:
+        return None
+    have = [l for l in have if re.fullmatch(r"[A-Za-z_]{3,}", l) and l not in ("osd", "List", "available", "languages")]
+    order = [l for l in ("eng", "deu", "fra", "spa", "hun", "rus", "swe") if l in have]
+    return "+".join(order + [l for l in have if l not in order]) or None
+
+
+def ocr_text(pb):
+    """pb: Gdk pixbuf of the region. Returns (text, error)."""
+    if not any(os.access(os.path.join(d, "tesseract"), os.X_OK) for d in os.environ.get("PATH", "").split(":")):
+        return "", "tesseract missing: sudo emerge app-text/tesseract app-text/tessdata_fast"
+    langs = ocr_langs()
+    if not langs:
+        return "", "no tesseract language data: emerge app-text/tessdata_fast"
+    # This leptonica has no PNG/TIFF/JPEG support, so tesseract only reads PGM/PPM/BMP: hand it a PGM.
+    # Light text on a dark background (terminals) is inverted, contrast stretched, small text enlarged.
+    try:
+        from PIL import Image, ImageOps, ImageStat
+        mode = "RGBA" if pb.get_has_alpha() else "RGB"
+        im = Image.frombytes(mode, (pb.get_width(), pb.get_height()), pb.get_pixels(), "raw", mode, pb.get_rowstride()).convert("L")
+        if ImageStat.Stat(im).mean[0] < 128:
+            im = ImageOps.invert(im)
+        im = ImageOps.autocontrast(im, cutoff=1)
+        # enlarge so text lines end up ~30 px tall: measure the typical line height from the row profile
+        prof = list(im.point(lambda v: 255 if v < 140 else 0).resize((1, im.height), Image.BOX).getdata())
+        runs, n = [], 0
+        for v in prof + [0]:
+            if v > 2: n += 1
+            elif n: runs.append(n); n = 0
+        runs = [r for r in runs if r >= 4]
+        med = sorted(runs)[len(runs) // 2] if runs else 12
+        f = max(1, min(4, round(30 / max(med, 1))))
+        if f > 1:
+            im = im.resize((im.width * f, im.height * f), Image.LANCZOS)
+        im = ImageOps.expand(im, border=24, fill=255)
+        buf = io.BytesIO(); im.save(buf, "PPM"); data = buf.getvalue()
+    except Exception as ex:
+        return "", f"image prep failed: {ex}"
+    txt = ""
+    for psm in ("6", "11"):        # block of text first, then sparse text if that found nothing
+        try:
+            out = subprocess.run(["tesseract", "stdin", "stdout", "-l", langs, "--psm", psm], input=data,
+                                 capture_output=True, timeout=30, env=TENV)
+        except Exception as ex:
+            return "", f"ocr failed: {ex}"
+        txt = "\n".join(l.rstrip() for l in out.stdout.decode("utf-8", "replace").splitlines()).strip()
+        if len(txt) >= 2:
+            break
+    return txt, ("" if txt else "no text found")
+
+
+def finish_ocr():
+    if S["text"]:
+        commit_text()
+    release()
+    win.hide()
+    Gdk.Display.get_default().flush()
+    rx, ry, rw, rh = [int(v) for v in S["region"]]
+    out = cairo.ImageSurface(cairo.FORMAT_ARGB32, rw, rh)
+    cr = cairo.Context(out); cr.translate(-rx, -ry); cr.set_source_surface(SRC, 0, 0); cr.paint()
+    pb = Gdk.pixbuf_get_from_surface(out, 0, 0, rw, rh)
+    res = {}
+
+    def work():
+        res["t"], res["e"] = ocr_text(pb)
+        GLib.idle_add(done)
+
+    def done():
+        t, e = res["t"], res["e"]
+        if t:
+            p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            p.stdin.write(t.encode()); p.stdin.close()
+            n = len(t.split())
+            first = " ".join(t.split())[:34]
+            toast(pb, f"Copied {n} word{'' if n == 1 else 's'}: {first}{'…' if len(' '.join(t.split())) > 34 else ''}", ok=True)
+        else:
+            toast(pb, e, ok=False)
+        return False
+    import threading
+    threading.Thread(target=work, daemon=True).start()
+    S["ocr_wait"] = True
+    GLib.timeout_add(45000, Gtk.main_quit)      # safety: never hang if tesseract stalls
+
+# ---------- toolbar ----------
+BTN, GAP, PAD = 36, 4, 10
+OCRW = 126
+
+
+def layout_toolbar():
+    items = []  # (kind, arg, glyph, width)
+    for k, g in TOOLS:
+        items.append(("tool", k, g))
+    items.append(("sep",))
+    for i, c in enumerate(PALETTE):
+        items.append(("color", i, c))
+    items.append(("size", 0, ""))
+    items.append(("full", 0, "󰊓"))
+    items.append(("sep",))
+    items += [("undo", 0, ""), ("redo", 0, ""), ("sep",), ("ocr", 0, chr(0xf15c)), ("sep",),
+              ("copy", 0, ""), ("save", 0, ""), ("folder", 0, "\uf07b"), ("done", 0, ""), ("close", 0, "")]
+    w = PAD * 2
+    for it in items:
+        w += (10 if it[0] == "sep" else (26 if it[0] == "color" else (OCRW if it[0] == "ocr" else BTN))) + GAP
+    h = BTN + PAD * 2
+    rx, ry, rw, rh = region_view()
+    x = max(8, min(rx + rw / 2 - w / 2, W - w - 8))
+    y = ry + rh + 14
+    if y + h > H - 8:
+        y = ry - h - 14
+    if y < 8:
+        y = max(8, min(ry + rh - h - 14, H - h - 8))
+    S["tbrect"] = (x, y, w, h)
+    cx = x + PAD
+    rects = []
+    for it in items:
+        if it[0] == "sep":
+            rects.append((it, (cx + 4, y + 12, 2, h - 24))); cx += 10 + GAP; continue
+        ww = 26 if it[0] == "color" else BTN
+        if it[0] == "ocr":
+            rects.append((it, (cx, y + PAD, OCRW, BTN))); cx += OCRW + GAP; continue
+        rects.append((it, (cx, y + PAD + (BTN - ww) / 2, ww, ww)))
+        cx += ww + GAP
+    S["tb"] = rects
+
+
+def draw_toolbar(cr):
+    x, y, w, h = S["tbrect"]
+    # shadow
+    for i in range(7, 0, -1):
+        rice.rounded(cr, x - i, y - i + 4, w + 2 * i, h + 2 * i, h / 2 + i)
+        cr.set_source_rgba(0, 0, 0, 0.035); cr.fill()
+    cr.save()
+    rice.rounded(cr, x, y, w, h, h / 2); cr.clip_preserve()
+    cr.save(); cr.scale(W / BLUR.get_width(), H / BLUR.get_height())
+    cr.set_source_surface(BLUR, 0, 0); cr.get_source().set_filter(cairo.FILTER_BILINEAR); cr.paint(); cr.restore()
+    cr.set_source_rgba(*rgb(C["bg"], 0.62)); cr.paint()
+    cr.restore()
+    rice.rounded(cr, x + .5, y + .5, w - 1, h - 1, h / 2)
+    cr.set_source_rgba(*rgb(C["accent"], 0.6)); cr.set_line_width(1.3); cr.stroke()
+    for it, (bx, by, bw, bh) in S["tb"]:
+        kind = it[0]
+        if kind == "sep":
+            cr.set_source_rgba(*rgb(C["fg"], 0.18)); cr.rectangle(bx, by, bw, bh); cr.fill(); continue
+        hov = S["hover"] is it
+        active = (kind == "tool" and S["tool"] == it[1])
+        cx, cy = bx + bw / 2, by + bh / 2
+        if kind == "color":
+            cr.arc(cx, cy, 9, 0, 2 * math.pi); cr.set_source_rgba(*rgb(PALETTE[it[1]])); cr.fill()
+            if S["color"] == it[1]:
+                cr.arc(cx, cy, 12, 0, 2 * math.pi); cr.set_source_rgba(*rgb(C["fg"], 0.95)); cr.set_line_width(2); cr.stroke()
+            continue
+        if kind == "ocr":      # labelled pill so it reads as a button
+            rice.rounded(cr, bx, by + 2, bw, bh - 4, (bh - 4) / 2)
+            cr.set_source_rgba(*rgb(C["accent"], 0.5 if hov else 0.26)); cr.fill_preserve()
+            cr.set_source_rgba(*rgb(C["accent"], 0.95)); cr.set_line_width(1.5); cr.stroke()
+            cr.select_font_face(rice.ICON_FONT); cr.set_font_size(15)
+            gl = it[2]; ge = cr.text_extents(gl)
+            cr.set_source_rgba(*rgb(C["fg"], 0.98))
+            cr.move_to(bx + 14 - ge.x_bearing, cy - ge.height / 2 - ge.y_bearing); cr.show_text(gl)
+            cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(13)
+            cr.move_to(bx + 38, cy + 4.5); cr.show_text("Copy text")
+            continue
+        if kind == "size":
+            cr.arc(cx, cy, 15, 0, 2 * math.pi)
+            cr.set_source_rgba(*rgb(C["accent"], 0.28 if hov else 0.12)); cr.fill()
+            cr.arc(cx, cy, 1.5 + SIZES[S["size"]] * 0.9, 0, 2 * math.pi)
+            cr.set_source_rgba(*rgb(C["fg"])); cr.fill(); continue
+        if active or (kind == "done"):
+            cr.arc(cx, cy, 16, 0, 2 * math.pi); cr.set_source_rgba(*rgb(C["accent"])); cr.fill()
+        elif hov:
+            cr.arc(cx, cy, 16, 0, 2 * math.pi); cr.set_source_rgba(*rgb(C["accent"], 0.28)); cr.fill()
+        dim = (kind == "undo" and not S["items"]) or (kind == "redo" and not S["redo"])
+        glyph = it[2]
+        cr.select_font_face(rice.ICON_FONT); cr.set_font_size(15)
+        e = cr.text_extents(glyph)
+        col = rgb(C["bg"]) if (active or kind == "done") else rgb(C["fg"], 0.35 if dim else 0.95)
+        cr.set_source_rgba(*col)
+        cr.move_to(cx - e.width / 2 - e.x_bearing, cy - e.height / 2 - e.y_bearing); cr.show_text(glyph)
+
+
+def hit(x, y):
+    for it, (bx, by, bw, bh) in S["tb"]:
+        if it[0] != "sep" and bx - 1 <= x <= bx + bw + 1 and by - 1 <= y <= by + bh + 1:
+            return it
+    return None
+
+
+def toolbar_click(it):
+    k = it[0]
+    if k == "tool": S["tool"] = it[1]
+    elif k == "color": S["color"] = it[1]
+    elif k == "size": S["size"] = (S["size"] + 1) % len(SIZES)
+    elif k == "full": set_region(region_monitor())
+    elif k == "undo": undo()
+    elif k == "redo": redo()
+    elif k == "ocr": finish_ocr()
+    elif k == "copy": finish(True, False)
+    elif k == "save": finish(False, True)
+    elif k == "folder": pick_folder()
+    elif k == "done": finish(True, True)
+    elif k == "close": quit_()
+
+
+def region_monitor():
+    """The monitor the current selection is on (by its centre): the fullscreen button fills only that one."""
+    rx, ry, rw, rh = S["region"]
+    d = Gdk.Display.get_default()
+    m = d.get_monitor_at_point(int(rx + rw / 2), int(ry + rh / 2)) or d.get_primary_monitor()
+    g = m.get_geometry()
+    return (g.x, g.y, g.width, g.height)
+
+
+def set_region(r):
+    S["region"] = tuple(r)
+    layout_toolbar()
+    win.queue_draw()
+
+
+def handles():
+    x, y, w, h = region_view()
+    xs = (x, x + w / 2, x + w); ys = (y, y + h / 2, y + h)
+    return [(i, j, xs[i], ys[j]) for i in range(3) for j in range(3) if not (i == 1 and j == 1)]
+
+
+def handle_at(px, py):
+    if not S["region"]:
+        return None
+    for i, j, hx, hy in handles():
+        if abs(px - hx) <= 10 and abs(py - hy) <= 10:
+            return (i, j)
+    return None
+
+
+def undo():
+    if S["text"]: S["text"] = None; return
+    if S["items"]: S["redo"].append(S["items"].pop())
+
+
+def redo():
+    if S["redo"]: S["items"].append(S["redo"].pop())
+
+
+def pick_folder():
+    release(); win.hide()
+    Gdk.Display.get_default().flush()
+
+    def back():
+        win.show_all(); setup.n = 0
+        GLib.timeout_add(30, setup)
+    outdir.choose("shot", f"{HOME}/Pictures", lambda r: None, title="Save screenshots to", after=back)
+
+
+def quit_():
+    release(); Gtk.main_quit()
+
+
+def commit_text():
+    t = S["text"]; S["text"] = None
+    if t and t["s"].strip():
+        S["items"].append(t); S["redo"].clear()
+
+
+# ---------- dirty-rect repaint (full-window redraws are far too slow) ----------
+def inval(x, y, w, h, pad=0, view=False):
+    if not view and (V["z"] != 1.0 or V["x"] or V["y"]):
+        z = V["z"]
+        x, y, w, h, pad = x * z + V["x"], y * z + V["y"], w * z, h * z, pad * max(1.0, z)
+    win.queue_draw_area(max(0, int(x - pad)), max(0, int(y - pad)), int(w + 2 * pad) + 1, int(h + 2 * pad) + 1)
+
+
+def region_inval():
+    rx, ry, rw, rh = S["region"]
+    inval(rx, ry - 34, rw, rh + 34, pad=8)
+
+
+def tb_inval():
+    if S["tbrect"]:
+        inval(*S["tbrect"], pad=16, view=True)
+
+
+def refresh():
+    if S["mode"] == "edit":
+        region_inval(); tb_inval()
+    else:
+        win.queue_draw()
+
+
+# ---------- window ----------
+win = Gtk.Window(type=Gtk.WindowType.POPUP)
+win.set_wmclass("rice-shot", "RiceShot")
+win.set_app_paintable(True)
+win.set_default_size(W, H)
+win.set_size_request(W, H)
+win.move(0, 0)
+
+
+def on_draw(w, cr):
+    zoomed = V["z"] != 1.0 or V["x"] or V["y"]
+    if zoomed:
+        cr.set_source_rgb(0.04, 0.04, 0.05); cr.paint()
+    cr.save()
+    cr.translate(V["x"], V["y"]); cr.scale(V["z"], V["z"])
+    cr.set_source_surface(SRC, 0, 0)
+    if V["z"] >= 3:
+        cr.get_source().set_filter(cairo.FILTER_NEAREST)     # see the pixels when zoomed far in
+    cr.paint()
+    cr.restore()
+    reg = S["region"]
+    if S["mode"] == "select":
+        reg = S["drag"] and norm(*S["drag"][:2], *S["mouse"]) or None
+    rv = region_view() if (reg and S["mode"] == "edit") else reg
+    cr.set_source_rgba(0, 0, 0, 0.52)
+    cr.rectangle(0, 0, W, H)
+    if rv and rv[2] > 0 and rv[3] > 0:
+        cr.rectangle(*rv)
+        cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+    cr.fill()
+    cr.set_fill_rule(cairo.FILL_RULE_WINDING)
+    if reg and reg[2] > 0 and reg[3] > 0:
+        cr.save()
+        cr.rectangle(*rv); cr.clip()
+        cr.translate(V["x"], V["y"]); cr.scale(V["z"], V["z"])
+        for it in all_items():
+            draw_item(cr, it, editing_text=(it is S["text"]))
+        cr.restore()
+        x, y, ww, hh = rv
+        cr.set_source_rgba(*rgb(C["accent"])); cr.set_line_width(2)
+        cr.rectangle(x - 1, y - 1, ww + 2, hh + 2); cr.stroke()
+        for hx, hy in ((x, y), (x + ww, y), (x, y + hh), (x + ww, y + hh),
+                       (x + ww / 2, y), (x + ww / 2, y + hh), (x, y + hh / 2), (x + ww, y + hh / 2)):
+            cr.arc(hx, hy, 5, 0, 2 * math.pi); cr.set_source_rgba(*rgb(C["bg"])); cr.fill()
+            cr.arc(hx, hy, 4, 0, 2 * math.pi); cr.set_source_rgba(*rgb(C["accent"])); cr.fill()
+        # size pill
+        label = f"{int(reg[2])} × {int(reg[3])}"
+        cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(12)
+        e = cr.text_extents(label)
+        px, py = x, max(4, y - 28)
+        rice.rounded(cr, px, py, e.width + 20, 22, 11); cr.set_source_rgba(*rgb(C["bg"], 0.85)); cr.fill()
+        cr.set_source_rgba(*rgb(C["fg"])); cr.move_to(px + 10 - e.x_bearing, py + 15); cr.show_text(label)
+    if S["mode"] == "edit":
+        if zoomed:
+            lab = f"{round(V['z'] * 100)}%   scroll zoom · middle drag pan · 0 reset"
+            cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(12)
+            e = cr.text_extents(lab)
+            rice.rounded(cr, W - e.width - 44, 14, e.width + 24, 26, 13); cr.set_source_rgba(*rgb(C["bg"], 0.85)); cr.fill()
+            cr.set_source_rgba(*rgb(C["fg"])); cr.move_to(W - e.width - 32 - e.x_bearing, 32); cr.show_text(lab)
+        draw_toolbar(cr)
+    return False
+
+
+def on_press(w, e):
+    x, y = e.x, e.y
+    if S["mode"] == "edit" and e.button == 2:
+        V["pan"] = (e.x, e.y, V["x"], V["y"]); return True
+    if S["mode"] == "select":
+        if e.button == 1:
+            S["drag"] = (x, y); S["mouse"] = (x, y)
+        elif e.button == 3:
+            quit_()
+        return True
+    if e.button == 3:
+        undo(); refresh(); return True
+    it = hit(x, y)
+    if it:
+        toolbar_click(it)
+        if S["mode"] == "edit": refresh()
+        return True
+    hd = handle_at(x, y)
+    if hd and e.button == 1:
+        S["rs"] = (hd, S["region"]); start_autopan()
+        return True
+    x, y = v2i(x, y)
+    rx, ry, rw, rh = S["region"]
+    if not (rx <= x <= rx + rw and ry <= y <= ry + rh):
+        return True
+    if S["text"]:
+        commit_text(); region_inval()
+    t = S["tool"]; c = S["color"]; sz = SIZES[S["size"]]
+    if t in ("pen", "hl"):
+        S["cur"] = dict(k=t, c=c, w=sz, pts=[(x, y)])
+    elif t in ("line", "arrow", "rect", "oval", "blur"):
+        S["cur"] = dict(k=t, c=c, w=sz, a=(x, y), b=(x, y))
+    elif t == "text":
+        S["text"] = dict(k="text", c=c, w=sz, a=(x, y), s="")
+    elif t == "num":
+        n = 1 + sum(1 for i in S["items"] if i["k"] == "num")
+        S["items"].append(dict(k="num", c=c, w=sz, a=(x, y), n=n)); S["redo"].clear()
+    if S["cur"]: start_autopan()
+    region_inval()
+    return True
+
+
+def on_motion(w, e):
+    S["mouse"] = (e.x, e.y)
+    if V["pan"]:
+        V["x"] = V["pan"][2] + e.x - V["pan"][0]; V["y"] = V["pan"][3] + e.y - V["pan"][1]
+        layout_toolbar(); win.queue_draw(); return True
+    if S["mode"] == "select":
+        if S["drag"]:
+            r = norm(*S["drag"], e.x, e.y)
+            for rr in (r, S.get("prev")):
+                if rr: inval(*rr, pad=44)
+            S["prev"] = r
+        return True
+    if S.get("rs"):
+        (hi, hj), (ox, oy, ow, oh) = S["rs"]
+        x0, y0, x1, y1 = ox, oy, ox + ow, oy + oh
+        ex_, ey_ = v2i(e.x, e.y)
+        mx, my = max(0, min(ex_, W)), max(0, min(ey_, H))
+        if hi == 0: x0 = min(mx, x1 - 20)
+        elif hi == 2: x1 = max(mx, x0 + 20)
+        if hj == 0: y0 = min(my, y1 - 20)
+        elif hj == 2: y1 = max(my, y0 + 20)
+        S["region"] = (x0, y0, x1 - x0, y1 - y0)
+        layout_toolbar(); win.queue_draw()
+        return True
+    h = hit(e.x, e.y)
+    if h is not S["hover"]:
+        S["hover"] = h; tb_inval()
+    hd = handle_at(e.x, e.y)
+    if hd != S.get("hd"):
+        S["hd"] = hd
+        names = {(0, 0): "top_left_corner", (2, 0): "top_right_corner", (0, 2): "bottom_left_corner",
+                 (2, 2): "bottom_right_corner", (1, 0): "top_side", (1, 2): "bottom_side",
+                 (0, 1): "left_side", (2, 1): "right_side"}
+        d = Gdk.Display.get_default()
+        win.get_window().set_cursor(Gdk.Cursor.new_from_name(d, names.get(hd, "crosshair")))
+    cur = S["cur"]
+    if cur:
+        rx, ry, rw, rh = S["region"]
+        ex_, ey_ = v2i(e.x, e.y)
+        px, py = max(rx, min(ex_, rx + rw)), max(ry, min(ey_, ry + rh))
+        if cur["k"] in ("pen", "hl"):
+            x0, y0 = cur["pts"][-1]
+            cur["pts"].append((px, py))
+            inval(min(x0, px), min(y0, py), abs(px - x0), abs(py - y0), pad=cur["w"] * 4 + 8)
+        else:
+            old = (cur["a"], cur["b"])
+            cur["b"] = (px, py)
+            r = norm(*cur["a"], *cur["b"]); inval(*r, pad=cur["w"] * 2 + 40)
+            r = norm(*old[0], *old[1]); inval(*r, pad=cur["w"] * 2 + 40)
+    return True
+
+
+def on_release(w, e):
+    if V["pan"] and e.button == 2:
+        V["pan"] = None; return True
+    if S["mode"] == "select" and S["drag"]:
+        x0, y0 = S["drag"]; S["drag"] = None
+        r = norm(x0, y0, e.x, e.y)
+        if r[2] < 6 or r[3] < 6:  # plain click: grab the monitor under the pointer
+            d = Gdk.Display.get_default()
+            m = d.get_monitor_at_point(int(e.x), int(e.y)).get_geometry()
+            r = (m.x, m.y, m.width, m.height)
+        S["region"] = (max(0, r[0]), max(0, r[1]), min(r[2], W - max(0, r[0])), min(r[3], H - max(0, r[1])))
+        S["mode"] = "edit"; S["prev"] = None; layout_toolbar()
+        win.queue_draw()
+    elif S["mode"] == "edit" and S.get("rs"):
+        S["rs"] = None
+        S["region"] = tuple(int(v) for v in S["region"])
+        layout_toolbar(); win.queue_draw()
+    elif S["mode"] == "edit" and S["cur"]:
+        it = S["cur"]; S["cur"] = None
+        if it["k"] in ("pen", "hl") or it["a"] != it["b"]:
+            S["items"].append(it); S["redo"].clear()
+        region_inval()
+    return True
+
+
+def on_scroll(w, e):
+    if S["mode"] != "edit" or S["text"]:
+        return True
+    if e.direction == Gdk.ScrollDirection.UP: f = 1.18
+    elif e.direction == Gdk.ScrollDirection.DOWN: f = 1 / 1.18
+    elif e.direction == Gdk.ScrollDirection.SMOOTH: f = math.exp(-e.delta_y * 0.18)
+    else: return True
+    zoom_view(f, e.x, e.y)
+    return True
+
+
+def on_key(w, e):
+    k = e.keyval
+    ctrl = e.state & Gdk.ModifierType.CONTROL_MASK
+    shift = e.state & Gdk.ModifierType.SHIFT_MASK
+    if S["text"]:
+        if k == Gdk.KEY_Escape: S["text"] = None
+        elif k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter): commit_text()
+        elif k == Gdk.KEY_BackSpace: S["text"]["s"] = S["text"]["s"][:-1]
+        elif e.string and e.string.isprintable() and not ctrl: S["text"]["s"] += e.string
+        region_inval(); return True
+    if k == Gdk.KEY_Escape:
+        if S["mode"] == "edit" and (V["z"] != 1.0 or V["x"] or V["y"]):     # first Esc leaves the zoom
+            V.update(z=1.0, x=0.0, y=0.0); layout_toolbar(); win.queue_draw(); return True
+        quit_(); return True
+    name = Gdk.keyval_name(k) or ""
+    if S["mode"] == "select":
+        if name == "f":    # whole desktop
+            S["mode"] = "edit"; S["region"] = (0, 0, W, H); layout_toolbar(); win.queue_draw()
+        elif name == "m":  # monitor under the pointer
+            d = Gdk.Display.get_default()
+            g = d.get_monitor_at_point(int(S["mouse"][0]), int(S["mouse"][1])).get_geometry()
+            S["mode"] = "edit"; S["region"] = (g.x, g.y, g.width, g.height); layout_toolbar(); win.queue_draw()
+        return True
+    if ctrl and name.lower() == "z":
+        redo() if shift else undo()
+    elif ctrl and name.lower() == "y": redo()
+    elif ctrl and name.lower() == "c": finish(True, False); return True
+    elif ctrl and name.lower() == "s": finish(False, True); return True
+    elif k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter): finish(True, True); return True
+    elif k in (Gdk.KEY_BackSpace, Gdk.KEY_Delete) and not FULL:
+        S.update(mode="select", region=None, items=[], redo=[], cur=None, text=None, tbrect=None, tb=[])
+        win.queue_draw(); return True
+    elif name == "x": finish_ocr(); return True
+    elif name in ("0", "KP_0"): V.update(z=1.0, x=0.0, y=0.0); layout_toolbar(); win.queue_draw(); return True
+    elif name in ("plus", "equal", "KP_Add"): zoom_view(1.25, W / 2, H / 2); return True
+    elif name in ("minus", "KP_Subtract"): zoom_view(1 / 1.25, W / 2, H / 2); return True
+    elif name == "f": set_region(region_monitor()); return True
+    elif name in KEYTOOL.keys(): S["tool"] = KEYTOOL[name]
+    elif name in "123456": S["color"] = int(name) - 1
+    elif name == "bracketleft": S["size"] = max(0, S["size"] - 1)
+    elif name == "bracketright": S["size"] = min(len(SIZES) - 1, S["size"] + 1)
+    refresh()
+    return True
+
+
+win.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK |
+               Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.KEY_PRESS_MASK)
+win.connect("draw", on_draw)
+win.connect("button-press-event", on_press)
+win.connect("button-release-event", on_release)
+win.connect("motion-notify-event", on_motion)
+win.connect("key-press-event", on_key)
+win.connect("scroll-event", on_scroll)
+if S["mode"] == "edit":
+    layout_toolbar()
+win.show_all()
+
+
+def setup():
+    d = Gdk.Display.get_default()
+    win.get_window().set_cursor(Gdk.Cursor.new_from_name(d, "crosshair"))
+    seat = d.get_default_seat()
+    r = seat.grab(win.get_window(), Gdk.SeatCapabilities.KEYBOARD, False, None, None, None)
+    if r == Gdk.GrabStatus.SUCCESS:
+        return False
+    setup.n += 1
+    return setup.n < 30
+
+
+setup.n = 0
+GLib.timeout_add(30, setup)
+Gtk.main()

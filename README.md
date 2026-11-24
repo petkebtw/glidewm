@@ -106,8 +106,7 @@ Full reference: [docs/dwm-features.md](docs/dwm-features.md).
 ## The rice
 
 The screenshots show mwm with a full desktop shell on top. The shell is a set of Python/GTK helpers and a Quickshell QML
-layer that talk to mwm through its keys and IPC. They live outside this repo (see the note under [Build](#build)).
-mwm runs fine without them.
+layer that talk to mwm through its keys and IPC. They live in [`rice/`](rice). mwm runs fine without them.
 
 <details>
 <summary><b>Theming from the wallpaper</b></summary>
@@ -213,9 +212,35 @@ sudo make install            # installs the binary to /usr/local/bin/dwm
 Then add `exec dwm` to the end of `~/.xinitrc`, or pick the session in your display manager.
 
 > [!IMPORTANT]
-> The default binds call helper scripts that are **not in this repo**: `rice-search`, `rice-center`, `rice-map`, `rice-lock`,
-> `rice-power`, `rice-media`, `rice-record`, `rice-settings`, `rice-gamebar` and `dwm-volume`.
-> Without them those keys do nothing. Point them at your own commands in `config.h` or in `~/.config/rice/binds.conf`.
+> The default binds call the helpers in [`rice/`](rice): `rice-search`, `rice-center`, `rice-map`, `rice-lock`, `rice-power`,
+> `rice-media`, `rice-record`, `rice-settings`, `rice-gamebar` and `dwm-volume`. Install them (next section), or point the
+> binds at your own commands in `config.h` or `~/.config/rice/binds.conf`.
+
+### Install the rice (optional)
+
+The whole desktop from the screenshots is in [`rice/`](rice):
+
+| Path | What |
+| --- | --- |
+| `rice/bin` | 41 commands: `rice-*`, `dwm-status`, `dwm-volume`, `audio-fix`, `clip-daemon`, `polkit-agent`, `rofi-launcher`, `screenshot.sh` ... |
+| `rice/lib` | the Python library they share: `themes.py` (palette), `designs.py`, `hooks.py` (per-app theme apply), `rice.py`, `widgets.py`, `settings.py` ... |
+| `rice/shell` | `port.sh`, `dss-start`, `Wm.dwm.qml`, patches: builds DarkShadow's Shell for Quickshell on X11 |
+| `rice/config` | `rice.conf` (picom), `binds.conf` (runtime keys), `xprofile.example` |
+
+```sh
+sudo emerge dev-python/pygobject x11-misc/rofi x11-misc/picom   # or your distro's equivalents
+cd rice && ./install.sh          # symlinks into ~/.local/bin, ~/.local/lib/rice, ~/.config
+cp config/xprofile.example ~/.xprofile   # then edit monitors, wallpaper, layout
+```
+
+Needs Python 3, PyGObject (GTK 3), `python-pillow`, cairo bindings, `rofi`, `picom`, `feh`, `xdotool`, `maim`, `xclip`, `pipewire` with
+`wpctl`, `tesseract` (OCR) and `ffmpeg` (recorder, convert). The helpers need no build step.
+
+The QML shell is DarkShadow's Shell, which is not copied here. Put its source in `~/.local/share/dss/src`, install
+[Quickshell](https://quickshell.org) built for X11 (`gui-apps/quickshell` with `X`, without `layer-shell`), then run
+`~/.local/share/dss/port.sh`. It rebuilds `~/.config/quickshell` from that source with the X11 and mwm changes applied.
+
+`rice-dl` needs a [cobalt](https://github.com/imputnet/cobalt) API URL: put it in `~/.cache/rice/cobalt_url`.
 
 ## Keys
 
@@ -332,7 +357,7 @@ No. It is a personal fork, built on the dwm 6.8 source. The suckless history is 
 <details>
 <summary><b>Do I need the rice scripts or Quickshell?</b></summary>
 
-No. mwm runs without them. They only provide the launcher, widgets and menus shown in the screenshots.
+No. mwm runs without them. They provide the launcher, widgets and menus shown in the screenshots, and live in [`rice/`](rice).
 
 </details>
 

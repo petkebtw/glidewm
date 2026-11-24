@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Wallpaper picker (DarkShadowShell style sheet): rice-wall toggles a glass card with a thumbnail grid.
+Click = apply (colours follow), wheel / arrows = page, r = random, Esc = close.
+rice-wall --list prints the items (used by tests)."""
+import os, sys, signal, math, random, threading, fcntl
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+if "--list" in sys.argv:
+    import themes
+    for it in themes.items():
+        print(it["name"])
+    sys.exit(0)
+
+CACHE = os.path.expanduser("~/.cache/rice")
+os.makedirs(CACHE, exist_ok=True)
+lockf = open(os.path.join(CACHE, "wall.lock"), "w")
+PIDF = os.path.join(CACHE, "wall.pid")
+try:
+    fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    try:
+        os.kill(int(open(PIDF).read()), signal.SIGTERM)
+    except Exception:
+        pass
+    sys.exit(0)
+open(PIDF, "w").write(str(os.getpid()))
+
+import rice, themes
+from rice import Gtk, Gdk, GLib
+from gi.repository import GdkPixbuf
+
+COLS, ROWS, TW, TH, GAP = 4, 3, 190, 112, 12
+PER = COLS * ROWS
+W = COLS * TW + (COLS + 1) * GAP + 8
+H = 54 + ROWS * (TH + GAP) + GAP + 6
+win = rice.Card(W, H, radius=28)
+c = win.c
+ITEMS = themes.items()
+CURN = [None]
+try:
+    CURN[0] = themes.current_item()["name"]
+except Exception:
+    pass
+PAGE = [0]
+PB = {}
+HOVER = [None]
+CELLS = []
+
+
+def pages():
+    return max(1, math.ceil(len(ITEMS) / PER))
+
+
+def load_thumbs():
+    for it in ITEMS:
+        try:
+            PB[it["name"]] = GdkPixbuf.Pixbuf.new_from_file_at_scale(themes.thumb(it["wall"]), TW, TH, False)
+        except Exception:
+            pass
+        GLib.idle_add(win.queue_draw)
+
+
+area = Gtk.DrawingArea()
+area.set_size_request(W, H)
+win.add(area)
+win.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK)
+
+
+def draw(w, cr):
+    CELLS.clear()
+    cr.select_font_face(rice.SANS_FONT, 0, 1)
+    cr.set_font_size(15)
+    cr.set_source_rgba(*rice.rgb(c["fg"]))
+    cr.move_to(GAP + 12, 34)
+    cr.show_text("Wallpapers")
+    cr.select_font_face(rice.SANS_FONT, 0, 0)
+    cr.set_font_size(12)
+    cr.set_source_rgba(*rice.rgb(c["dim"]))
+    t = f"{PAGE[0] + 1} / {pages()}   ·   r random   ·   scroll for more"
+    cr.move_to(W - GAP - 12 - cr.text_extents(t).x_advance, 33)
+    cr.show_text(t)
+    for i, it in enumerate(ITEMS[PAGE[0] * PER:(PAGE[0] + 1) * PER]):
+        cx, cy = i % COLS, i // COLS
+        x = GAP + 4 + cx * (TW + GAP)
+        y = 54 + cy * (TH + GAP)
+        CELLS.append((it, x, y))
+        cr.save()
+        rice.rounded(cr, x, y, TW, TH, 16)
+        cr.clip()
+        pb = PB.get(it["name"])
+        if pb:
+            Gdk.cairo_set_source_pixbuf(cr, pb, x + (TW - pb.get_width()) / 2, y + (TH - pb.get_height()) / 2)
+            cr.paint()
+        else:
+            cr.set_source_rgba(*rice.rgb(c["bg2"]))
+            cr.paint()
+        if HOVER[0] == it["name"]:
+            cr.set_source_rgba(1, 1, 1, 0.12)
+            cr.paint()
+        cr.restore()
+        if it["name"] == CURN[0]:
+            cr.set_line_width(3)
+            cr.set_source_rgba(*rice.rgb(c["accent"]))
+            rice.rounded(cr, x + 1.5, y + 1.5, TW - 3, TH - 3, 15)
+            cr.stroke()
+
+
+def hit(e):
+    for it, x, y in CELLS:
+        if x <= e.x <= x + TW and y <= e.y <= y + TH:
+            return it
+    return None
+
+
+def apply(it):
+    CURN[0] = it["name"]
+    win.queue_draw()
+    threading.Thread(target=lambda: themes.apply(it), daemon=True).start()
+
+
+def motion(w, e):
+    it = hit(e)
+    n = it["name"] if it else None
+    if n != HOVER[0]:
+        HOVER[0] = n
+        win.queue_draw()
+
+
+def press(w, e):
+    it = hit(e)
+    if it:
+        apply(it)
+    return True
+
+
+def page(d):
+    PAGE[0] = (PAGE[0] + d) % pages()
+    win.queue_draw()
+
+
+def key(w, e):
+    k = e.keyval
+    if k == Gdk.KEY_Escape:
+        close()
+    elif k in (Gdk.KEY_Right, Gdk.KEY_Down, Gdk.KEY_Page_Down):
+        page(1)
+    elif k in (Gdk.KEY_Left, Gdk.KEY_Up, Gdk.KEY_Page_Up):
+        page(-1)
+    elif k == Gdk.KEY_r and ITEMS:
+        apply(random.choice(ITEMS))
+
+
+closing = [False]
+
+
+def close(*_):
+    if not closing[0]:
+        closing[0] = True
+        win.quit_anim()
+
+
+area.connect("draw", draw)
+win.connect("button-press-event", press)
+win.connect("motion-notify-event", motion)
+win.connect("scroll-event", lambda w, e: page(1 if e.direction == Gdk.ScrollDirection.DOWN else -1))
+win.connect("key-press-event", key)
+win.connect("destroy", lambda *_: Gtk.main_quit())
+g = rice.primary_geometry()
+win.move(g.x + (g.width - W) // 2, g.y + (g.height - H) // 2)
+win.show_all()
+threading.Thread(target=load_thumbs, daemon=True).start()
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (close(), True)[1])
+Gtk.main()
+try:
+    os.remove(PIDF)
+except OSError:
+    pass

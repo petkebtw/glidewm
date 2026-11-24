@@ -1,0 +1,32 @@
+#!/bin/sh
+# One-time root setup for the rice. Run:  sudo rice-setup-root
+# (For SDDM alone the easy way is `rice-sddm` as your user: it asks once via pkexec.)
+#  - SDDM: installs + activates the own "rice" theme (rice-sddm --root install); the theme reads its
+#    colours/wallpaper from /var/lib/rice-sddm, which theme-switch rewrites without root.
+#    The old "silent" theme keeps reading /var/lib/rice-sddm too, if it is installed.
+#  - sudoers: lets rice-session reboot/poweroff without a password prompt (runit)
+set -e
+U=${SUDO_USER:-$USER}
+[ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
+H=$(getent passwd "$U" | cut -d: -f6)
+"$H/.local/bin/rice-sddm" --root install "$U" "$H/.local/share/rice/sddm-theme"
+T=/usr/share/sddm/themes/silent
+if [ -f "$T/metadata.desktop" ]; then
+	S=/var/lib/rice-sddm
+	[ -e "$S/rice.conf" ] || cp "$T/configs/default.conf" "$S/rice.conf"
+	[ -e "$S/rice-bg.jpg" ] || cp "$T/backgrounds/default.jpg" "$S/rice-bg.jpg"
+	chown "$U":"$U" "$S"/*; chmod 644 "$S"/*
+	ln -sf "$S/rice.conf" "$T/configs/rice.conf"
+	ln -sf "$S/rice-bg.jpg" "$T/backgrounds/rice-bg.jpg"
+	sed -i 's|^ConfigFile=configs/.*\.conf|ConfigFile=configs/rice.conf|' "$T/metadata.desktop"
+fi
+# optional: passwordless reboot/poweroff fallback (only if sudoers reads /etc/sudoers.d)
+if grep -qs '^[#@]*includedir */etc/sudoers.d' /etc/sudoers; then
+	mkdir -p /etc/sudoers.d
+	printf '%s ALL=(root) NOPASSWD: /sbin/runit-init 0, /sbin/runit-init 6\n' "$U" > /etc/sudoers.d/rice-power
+	chmod 440 /etc/sudoers.d/rice-power
+	visudo -cf /etc/sudoers.d/rice-power
+else
+	echo "note: /etc/sudoers has no includedir, skipped sudoers (rice-session uses loginctl instead)"
+fi
+echo "done. Now pick any theme (Mod+Shift+t, Enter) or run 'rice-sddm --sync' to fill the SDDM theme."

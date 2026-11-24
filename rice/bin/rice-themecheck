@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""rice-themecheck [--fix] [-q]: check that the live theme matches what the current wallpaper should give.
+
+Compares the palette, ~/.cache/theme files, live xrdb (dwm colours), the feh wallpaper, the Konsole Rice
+scheme (colours, opacity, blur), btop, cava, fastfetch, picom (blur strength, one process, GL sync display)
+and the contrast of the palette. --fix re-applies the theme once when something drifted and checks again;
+what still fails afterwards is shown as a notification. -q prints only problems. Every run is logged to
+~/.cache/rice/themecheck.log. Runs by itself after every final theme apply and at login.
+"""
+import os, sys, re, subprocess, time
+
+HOME = os.path.expanduser("~")
+sys.path.insert(0, f"{HOME}/.local/lib/rice")
+import themes, hooks, settings
+
+FIX = "--fix" in sys.argv
+QUIET = "-q" in sys.argv
+LOG = f"{HOME}/.cache/rice/themecheck.log"
+PICOM_CONF = f"{HOME}/.config/picom/rice.conf"
+GL_SYNC = "DP-4"                 # ~/.xprofile starts picom with __GL_SYNC_DISPLAY_DEVICE=DP-4 (Session 6b)
+
+
+def read(p):
+    try:
+        with open(p) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def contrast(a, b):
+    def rl(h):
+        r, g, b_ = themes.hexrgb(h)
+        return 0.2126 * themes._lin(r) + 0.7152 * themes._lin(g) + 0.0722 * themes._lin(b_)
+    x, y = sorted((rl(a), rl(b)))
+    return (y + 0.05) / (x + 0.05)
+
+
+def current():
+    wall = (read(f"{themes.CACHE}/wall") or "").strip()
+    name = (read(f"{themes.CACHE}/current") or "").strip()
+    return dict(name=name or os.path.splitext(os.path.basename(wall))[0], wall=wall, colors=None,
+                online=os.path.dirname(os.path.realpath(wall)) == themes.ONLINE) if wall else None
+
+
+def run_checks(item):
+    """-> list of (ok, fixable, name, detail)"""
+    out = []
+
+    def chk(ok, name, detail="", fixable=True, info=""):
+        out.append((bool(ok), fixable, name, info if ok else detail))
+
+    if not item or not os.path.exists(item["wall"]):
+        chk(False, "wallpaper", f"missing: {item and item['wall']}", fixable=False)
+        return out
+    c, glass, light = themes.colors_for(item)
+    lk = themes.look_for(item["wall"], glass)
+
+    # palette file
+    try:
+        import json
+        cj = json.loads(read(f"{themes.CACHE}/colors.json") or "{}")
+    except ValueError:
+        cj = {}
+    diff = [k for k in themes.KEYS if cj.get(k) != c[k]]
+    chk(not diff, "colors.json", f"stale: {', '.join(diff)}" if diff else "")
+    chk(cj.get("glass") == (1 if glass else 0) and cj.get("light") == (1 if light else 0), "colors.json glass/light",
+        f"has glass={cj.get('glass')} light={cj.get('light')}, want {int(glass)}/{int(light)}")
+    chk(read(f"{themes.CACHE}/colors.rasi") == themes.rasi_text(c, glass), "colors.rasi")
+    chk(read(f"{themes.CACHE}/dwm.Xresources") == themes.xres_text(c), "dwm.Xresources")
+
+    # live X resources (what dwm actually draws with)
+    try:
+        q = subprocess.run(["xrdb", "-query"], capture_output=True, text=True, timeout=5).stdout
+        live = dict(re.findall(r"^dwm\.(\w+):\s*(\S+)", q, re.M))
+        bad = [r for r, k in themes.XRES if live.get(r, "").lower() != c[k].lower()]
+        chk(not bad, "xrdb (dwm bar)", f"differs: {', '.join(bad)}" if bad else "")
+    except (OSError, subprocess.SubprocessError) as e:
+        chk(False, "xrdb (dwm bar)", str(e), fixable=False)
+
+    # wallpaper actually set
+    fb = read(f"{HOME}/.fehbg") or ""
+    chk(item["wall"] in fb, "feh wallpaper", "~/.fehbg points elsewhere")
+
+    # terminal
+    ks = read(f"{hooks.KONSOLE_DIR}/Rice.colorscheme")
+    want = hooks.konsole_text(c, lk, glass)
+    if ks != want:
+        op = re.search(r"Opacity=([\d.]+)", ks or "")
+        chk(False, "konsole Rice.colorscheme",
+            f"opacity {op.group(1) if op else '?'} want {lk['opacity']:.2f}" if op and f"Opacity={lk['opacity']:.2f}" not in ks else "colours differ")
+    else:
+        chk(True, "konsole Rice.colorscheme", info=f"opacity {lk['opacity']:.2f}, blur {'on' if glass else 'off'}")
+    chk(read(f"{hooks.KONSOLE_DIR}/rice.profile") == hooks.KONSOLE_PROFILE, "konsole rice.profile")
+    if os.path.exists(f"{HOME}/.config/kitty/kitty.conf"):
+        chk(read(hooks.KITTY_THEME) == hooks.kitty_text(c, lk, glass), "kitty theme")
+
+    # other apps (only when they are set up here)
+    if os.path.exists(os.path.dirname(hooks.BTOP_THEME)):
+        chk(read(hooks.BTOP_THEME) == hooks.btop_text(c), "btop theme")
+    cava = read(f"{HOME}/.config/cava/config")
+    if cava is not None:
+        miss = [x for x in hooks.cava_cols(c) if f"'{x}'" not in cava]
+        chk(not miss, "cava gradient", f"{len(miss)} colours differ" if miss else "")
+    ff = read(f"{HOME}/.config/fastfetch/config.jsonc")
+    if ff is not None and os.path.exists(f"{HOME}/.config/fastfetch/config.jsonc.tmpl"):
+        chk(hooks.ansi(c["accent"]) in ff, "fastfetch accent")
+
+    # picom: blur strength in the config, exactly one compositor, synced to the fast monitor
+    pc = read(PICOM_CONF) or ""
+    m = re.search(r"^blur-strength = (\d+);", pc, re.M)
+    chk(m and int(m.group(1)) == lk["blur"], "picom blur-strength", f"{m and m.group(1)} want {lk['blur']}", info=f"{lk['blur']}")
+    cards = [int(x) for x in re.findall(r"class_g = 'Rice(?:Card|Ghost|Panel)'\"?;[^}]*?blur-strength = (\d+)", pc)]
+    chk(cards and min(cards) > lk["blur"], "picom menu blur", f"menus {cards} vs global {lk['blur']}" if cards else "rules not found", fixable=False)
+    pids = subprocess.run(["pgrep", "-x", "picom"], capture_output=True, text=True).stdout.split()
+    mains = []
+    for p in pids:
+        try:
+            ppid = open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()[1]
+            if ppid not in pids:
+                mains.append(p)
+        except OSError:
+            pass
+    chk(len(mains) == 1, "picom running", f"{len(mains)} instances: {' '.join(mains)}", fixable=False, info=f"pid {mains[0]}" if mains else "")
+    if len(mains) == 1:
+        try:
+            env = open(f"/proc/{mains[0]}/environ", "rb").read().decode(errors="replace").split("\0")
+            chk(f"__GL_SYNC_DISPLAY_DEVICE={GL_SYNC}" in env, "picom vsync display",
+                f"not synced to {GL_SYNC}: animations step at the slower monitor's rate", fixable=False)
+        except OSError:
+            pass
+
+    # readability of the palette itself (re-applying cannot fix these)
+    for a, b, need, what in (("fg", "bg", 7, "text"), ("dim", "bg", 4.5, "dim text"), ("accent", "bg", 3, "accent"),
+                             ("bg", "accent", 4.5, "bar text on accent")):
+        r = contrast(c[a], c[b])
+        chk(r >= need, f"contrast {what}", f"{r:.1f}:1 (need {need})", fixable=False, info=f"{r:.1f}:1")
+    norm, bright = hooks.ansi_colors(c)
+    worst = min(contrast(x, c["bg"]) for x in norm[1:7] + bright[1:7])
+    chk(worst >= 4.5, "contrast terminal colours", f"worst {worst:.1f}:1", fixable=False, info=f"worst {worst:.1f}:1")
+    return out
+
+
+def report(res, title):
+    bad = [r for r in res if not r[0]]
+    lines = []
+    for ok, fixable, name, detail in res:
+        if ok and QUIET:
+            continue
+        lines.append(f"{'ok  ' if ok else 'FAIL'} {name}" + (f": {detail}" if detail else ""))
+    if lines or not QUIET:
+        print(f"-- {title}: {len(res) - len(bad)}/{len(res)} ok")
+        print("\n".join(lines))
+    return bad
+
+
+def log(msg):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(f"{time.strftime('%F %T')} {msg}\n")
+        if os.path.getsize(LOG) > 200_000:      # keep the log small
+            t = open(LOG).read()[-100_000:]
+            open(LOG, "w").write(t)
+    except OSError:
+        pass
+
+
+def notify(text):
+    subprocess.run(["notify-send", "-a", "rice", "-u", "normal", "Theme check", text],
+                   stderr=subprocess.DEVNULL, timeout=5)
+
+
+def main():
+    item = current()
+    res = run_checks(item)
+    bad = report(res, f"theme {item and item['name']}")
+    if bad and FIX and any(f for _, f, _, _ in bad):
+        log("drift: " + "; ".join(n + (f" ({d})" if d else "") for _, _, n, d in bad))
+        os.environ["RICE_THEMECHECK"] = "1"       # apply() must not spawn another check
+        themes.apply(item, final=True)
+        time.sleep(0.5)
+        res = run_checks(item)
+        bad = report(res, "after re-apply")
+        fixed = "re-applied; " if not [b for b in bad if b[1]] else "re-apply did not help; "
+        log(fixed + ("still: " + "; ".join(n for _, _, n, _ in bad) if bad else "all ok"))
+    else:
+        log("ok" if not bad else "problems: " + "; ".join(n + (f" ({d})" if d else "") for _, _, n, d in bad))
+    if bad and FIX:
+        notify("\n".join(f"{n}: {d}" if d else n for _, _, n, d in bad[:6]))
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()

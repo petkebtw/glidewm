@@ -1,0 +1,1375 @@
+#!/usr/bin/env python3
+"""Dock: glass pill at the bottom centre with pinned apps, running windows, a compact media widget
+and a show-desktop button.
+
+rice-dock            start (single instance per X display; a second start exits quietly)
+rice-dock --reload   re-read settings (SIGUSR1 to the running dock)
+rice-dock --quit     stop the running dock
+
+Settings: settings.get("dock") dict in ~/.cache/rice/settings.json
+  pins     list of desktop ids or commands  (default konsole firefox dolphin steam rice-settings)
+  autohide bool  (default True)   hidden off the bottom edge, slides up when the pointer touches it
+  size     int   (default 44)     icon px
+  monitor  "pointer" | "all" | "primary"  (default "pointer")
+  magnify  bool  (default True)
+Motion preset / speed come from settings motion / motion_speed (rice.spring, rice.mdur).
+
+Windows (all override-redirect, _NET_WM_WINDOW_TYPE_DOCK):
+  RiceDock    the glass pill only (picom blurs, rounds, shadows it); resized only when the item list changes
+  RiceDockFx  transparent overlay with the icons, mapped at its biggest size; magnify is a repaint,
+              the slide is a MOVE of both windows (never a per-frame resize/shape change)
+  RiceDockFx  2 px trigger strip at the bottom edge while the dock is hidden"""
+import os, sys, signal, fcntl, time
+
+signal.signal(signal.SIGUSR1, signal.SIG_IGN)   # a --reload must never kill us while we start
+
+CACHE = os.path.expanduser("~/.cache/rice")
+os.makedirs(CACHE, exist_ok=True)
+_disp = (os.environ.get("DISPLAY") or ":0").split(":")[-1].split(".")[0] or "0"
+LOCK = os.path.join(CACHE, f"dock-{_disp}.lock")
+PIDF = os.path.join(CACHE, f"dock-{_disp}.pid")
+ARGS = sys.argv[1:]
+lockf = open(LOCK, "w")
+try:
+    fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if "--reload" in ARGS or "--quit" in ARGS:
+        sys.exit(0)                      # nothing running: nothing to reload / stop
+except OSError:
+    if "--reload" in ARGS or "--quit" in ARGS:
+        for _ in range(20):
+            try:
+                os.kill(int(open(PIDF).read()), signal.SIGTERM if "--quit" in ARGS else signal.SIGUSR1)
+                break
+            except (OSError, ValueError):
+                time.sleep(0.05)
+    sys.exit(0)
+open(PIDF, "w").write(str(os.getpid()))
+
+import math, shlex, threading, subprocess, ctypes, warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)   # PyGObject: Gio.DesktopAppInfo, set_wmclass
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import rice, settings
+from rice import Gtk, Gdk, GLib, cairo
+from gi.repository import Gio, GdkPixbuf
+
+Gtk.Window.set_default_icon_name("user-desktop")
+
+DEF = dict(pins=["konsole", "firefox", "dolphin", "steam", "rice-settings"], autohide=True, size=44,
+           monitor="pointer", magnify=True)
+CMD_ICON = {"rice-settings": ("preferences-system", "")}   # pins without a .desktop file
+CMD_NAME = {"rice-settings": "Settings", "rice-media": "Media", "rice-tools": "Tools", "rice-search": "Search"}
+G_PLAY, G_PAUSE, G_NEXT, G_MUSIC, G_DESK, G_APP = "", "", "", "", "", ""
+HIDE_DELAY = 600            # ms after the pointer leaves
+DWELL = 300                 # ms the pointer must rest on a bottom edge that is not a screen edge (monitor below)
+RADIUS = __import__('designs').geo()['dock']
+SFX = __import__('designs').geo()['sfx']
+
+
+def conf():
+    d = dict(DEF)
+    try:
+        d.update(settings.get("dock") or {})
+    except Exception:
+        pass
+    d["size"] = max(24, min(int(d.get("size") or 44), 96))
+    if d.get("monitor") not in ("pointer", "all", "primary"):
+        d["monitor"] = "pointer"
+    if not isinstance(d.get("pins"), list):
+        d["pins"] = list(DEF["pins"])
+    return d
+
+
+def save_pins(pins):
+    try:
+        d = dict(settings.get("dock") or {})
+        d["pins"] = pins
+        settings.put("dock", d)
+    except Exception:
+        pass
+
+
+# ---- motion -------------------------------------------------------------------------------
+def _local_spring(t, preset=None):
+    if t <= 0: return 0.0
+    if t >= 1: return 1.0
+    return 1.0 - (1.0 - t) ** 3
+
+
+SPRING = getattr(rice, "spring", None) or _local_spring
+_MDUR = getattr(rice, "mdur", None)
+
+
+def mdur(base):
+    if _MDUR:
+        try: return _MDUR(base)
+        except Exception: pass
+    try:
+        if not settings.get("anim"): return 0.001
+        sp = min(max(float(settings.get("motion_speed") or 1.0), 0.5), 2.0)
+    except Exception:
+        sp = 1.0
+    return base / sp
+
+
+def motion_params():
+    """(zeta, omega) for the hover springs."""
+    try:
+        m = rice.motion()
+        return m.get("zeta", 1.0), m.get("omega", 8.0) * 2.4 * m.get("speed", 1.0)
+    except Exception:
+        tbl = dict(calm=(1.0, 19), lively=(0.62, 22), bouncy=(0.4, 28), snappy=(1.0, 26), minimal=(1.0, 30))
+        try:
+            n = settings.get("motion") or "calm"
+            sp = float(settings.get("motion_speed") or 1.0)
+        except Exception:
+            n, sp = "calm", 1.0
+        z, w = tbl.get(n, tbl["calm"])
+        return z, w * sp
+
+
+class Spring:
+    def __init__(self, x):
+        self.x = self.t = x
+        self.v = 0.0
+
+    def step(self, dt, z, w):
+        n = max(1, int(dt / 0.004) + 1)
+        h = dt / n
+        for _ in range(n):
+            a = -w * w * (self.x - self.t) - 2 * z * w * self.v
+            self.v += a * h
+            self.x += self.v * h
+        if abs(self.x - self.t) < 0.0008 and abs(self.v) < 0.01:
+            self.x, self.v = self.t, 0.0
+            return False
+        return True
+
+
+# ---- raw Xlib through ctypes (event-driven root/client property changes, no python-xlib) ----
+class X:
+    PropertyNotify, PropertyChangeMask = 28, 1 << 22
+
+    def __init__(self):
+        L = self.L = ctypes.CDLL("libX11.so.6")
+        L.XOpenDisplay.restype = ctypes.c_void_p
+        L.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        L.XDefaultRootWindow.restype = ctypes.c_ulong
+        L.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        L.XInternAtom.restype = ctypes.c_ulong
+        L.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        L.XGetWindowProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long,
+                                         ctypes.c_int, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+                                         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong),
+                                         ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p)]
+        L.XFree.argtypes = [ctypes.c_void_p]
+        L.XSelectInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long]
+        L.XPending.argtypes = [ctypes.c_void_p]
+        L.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        L.XConnectionNumber.argtypes = [ctypes.c_void_p]
+        L.XFlush.argtypes = [ctypes.c_void_p]
+        L.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        L.XGetGeometry.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+                                   ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                                   ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+                                   ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+        L.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        self.d = L.XOpenDisplay(None)
+        if not self.d:
+            raise SystemExit("rice-dock: cannot open display")
+        # X errors (a window vanished between list and query) must not kill us. Xlib's handler is
+        # process-wide, so errors on GDK's own connection are handed on to GDK's handler.
+        EH = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        L.XSetErrorHandler.restype = ctypes.c_void_p
+        L.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+        prev = [None]
+
+        def handler(dpy, ev):
+            if dpy == self.d or not prev[0]:
+                return 0
+            return prev[0](dpy, ev)
+        self._eh = EH(handler)
+        p = L.XSetErrorHandler(ctypes.cast(self._eh, ctypes.c_void_p))
+        prev[0] = EH(p) if p else None
+        self.root = L.XDefaultRootWindow(self.d)
+        self._atoms = {}
+        self.selected = set()
+        L.XSelectInput(self.d, self.root, self.PropertyChangeMask)
+        L.XFlush(self.d)
+
+    def atom(self, name):
+        a = self._atoms.get(name)
+        if a is None:
+            a = self._atoms[name] = self.L.XInternAtom(self.d, name.encode(), 0)
+        return a
+
+    def prop(self, win, name, length=1 << 16):
+        t, f, n, after, p = ctypes.c_ulong(), ctypes.c_int(), ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+        if self.L.XGetWindowProperty(self.d, win, self.atom(name), 0, length, 0, 0, ctypes.byref(t), ctypes.byref(f),
+                                     ctypes.byref(n), ctypes.byref(after), ctypes.byref(p)) != 0 or not p.value:
+            return None
+        try:
+            if f.value == 8:
+                return ctypes.string_at(p.value, n.value)
+            if f.value == 32:
+                return list((ctypes.c_ulong * n.value).from_address(p.value))
+            return None
+        finally:
+            self.L.XFree(p)
+
+    def geometry(self, win):
+        r, x, y, w, h, b, dp = (ctypes.c_ulong(), ctypes.c_int(), ctypes.c_int(), ctypes.c_uint(), ctypes.c_uint(),
+                                ctypes.c_uint(), ctypes.c_uint())
+        if not self.L.XGetGeometry(self.d, win, *(ctypes.byref(v) for v in (r, x, y, w, h, b, dp))):
+            return None
+        return x.value, y.value, w.value, h.value
+
+    def watch(self, win):
+        if win not in self.selected:
+            self.L.XSelectInput(self.d, win, self.PropertyChangeMask)
+            self.selected.add(win)
+
+    def events(self):
+        """Drain the queue -> list of (window, atom name or None)."""
+        out = []
+        ev = (ctypes.c_long * 24)()
+        while self.L.XPending(self.d):
+            self.L.XNextEvent(self.d, ev)
+            if ev[0] & 0xffffffff == self.PropertyNotify:
+                out.append((ev[4] & 0xffffffffffffffff, ev[5] & 0xffffffffffffffff))
+        return out
+
+    def rice_cmd(self, vals):
+        arr = (ctypes.c_long * len(vals))(*vals)
+        self.L.XChangeProperty(self.d, self.root, self.atom("_RICE_CMD"), 6, 32, 0, arr, len(vals))  # 6 = CARDINAL
+        self.L.XFlush(self.d)
+
+
+XC = X()
+_cmdq = []
+
+
+def ipc(*vals):
+    """dwm IPC via root _RICE_CMD; writes are 50 ms apart (two in a row swallow each other)."""
+    _cmdq.append(list(vals))
+    if len(_cmdq) == 1:
+        def go():
+            if not _cmdq:
+                return False
+            XC.rice_cmd(_cmdq.pop(0))
+            return bool(_cmdq)
+        go()
+        if _cmdq:
+            GLib.timeout_add(50, go)
+
+
+# ---- apps -----------------------------------------------------------------------------------
+_INDEX = None
+ITHEME = Gtk.IconTheme.new()
+_SURF = {}
+
+
+def icon_theme_name():
+    try:
+        sec = None
+        for ln in open(os.path.expanduser("~/.config/kdeglobals")):
+            ln = ln.strip()
+            if ln.startswith("["):
+                sec = ln
+            elif sec == "[Icons]" and ln.startswith("Theme="):
+                return ln.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+_t = icon_theme_name()
+if _t:
+    ITHEME.set_custom_theme(_t)
+
+
+def app_index():
+    """lower-case key (desktop id stem, last id part, StartupWMClass, exec basename, icon) -> DesktopAppInfo"""
+    global _INDEX
+    if _INDEX is None:
+        idx = {}
+        for a in Gio.AppInfo.get_all():
+            if not isinstance(a, Gio.DesktopAppInfo):
+                continue
+            keys = []
+            aid = (a.get_id() or "").lower()
+            if aid.endswith(".desktop"):
+                aid = aid[:-8]
+            keys += [aid, aid.split(".")[-1]]
+            if a.get_startup_wm_class():
+                keys.append(a.get_startup_wm_class().lower())
+            ex = a.get_executable()
+            if ex:
+                keys.append(os.path.basename(ex).lower())
+            for k in keys:
+                if k and (k not in idx or (a.should_show() and not idx[k].should_show())):
+                    idx[k] = a
+        _INDEX = idx
+    return _INDEX
+
+
+def find_app(name):
+    if not name:
+        return None
+    n = name.lower()
+    try:
+        a = Gio.DesktopAppInfo.new(name if name.endswith(".desktop") else name + ".desktop")
+        if a: return a
+    except TypeError:
+        pass
+    idx = app_index()
+    for k in (n, n[:-8] if n.endswith(".desktop") else None, n.split(".")[-1], n.replace("-esr", "")):
+        if k and k in idx:
+            return idx[k]
+    return None
+
+
+def app_keys(app, pin):
+    ks = {pin.lower(), pin.lower().split(".")[-1]}
+    if app:
+        aid = (app.get_id() or "").lower().replace(".desktop", "")
+        ks |= {aid, aid.split(".")[-1]}
+        if app.get_startup_wm_class(): ks.add(app.get_startup_wm_class().lower())
+        if app.get_executable(): ks.add(os.path.basename(app.get_executable()).lower())
+    ks |= {k.replace("-esr", "") for k in list(ks)}
+    ks.discard("")
+    return ks
+
+
+def launch(app, pin):
+    if app:
+        cmd = app.get_commandline() or app.get_executable() or pin
+        argv = [a for a in shlex.split(cmd) if not (len(a) == 2 and a[0] == "%")]
+    else:
+        argv = shlex.split(pin)
+    if not argv:
+        return
+    loc = os.path.expanduser("~/.local/bin/" + os.path.basename(argv[0]))
+    if os.access(loc, os.X_OK):                  # user wrappers (steam -cef-disable-gpu, dolphin stylesheet)
+        argv[0] = loc
+    env = dict(os.environ); env.pop("DESKTOP_STARTUP_ID", None)
+    try:
+        subprocess.Popen(["setsid", "-f"] + argv, cwd=os.path.expanduser("~"), env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def pixbuf_surface(pb):
+    return Gdk.cairo_surface_create_from_pixbuf(pb, 1, None) if pb else None
+
+
+def icon_surface(app, pin, px):
+    key = ("app", app.get_id() if app else pin, px)
+    if key in _SURF:
+        return _SURF[key]
+    pb = None
+    try:
+        if app and app.get_icon():
+            info = ITHEME.lookup_by_gicon(app.get_icon(), px, Gtk.IconLookupFlags.FORCE_SIZE)
+            if info: pb = info.load_icon()
+    except Exception:
+        pb = None
+    if pb is None:
+        for nm in (CMD_ICON.get(pin, (None,))[0], pin, os.path.basename(pin.split()[0]) if pin else None):
+            if not nm: continue
+            try:
+                pb = ITHEME.load_icon(nm, px, Gtk.IconLookupFlags.FORCE_SIZE)
+                if pb: break
+            except Exception:
+                pb = None
+    s = _SURF[key] = pixbuf_surface(pb)
+    return s
+
+
+def wm_icon_surface(win, px):
+    key = ("win", win, px)
+    if key in _SURF:
+        return _SURF[key]
+    s = None
+    try:
+        d = XC.prop(win, "_NET_WM_ICON", 1 << 20)
+        best, i = None, 0
+        while d and i + 2 <= len(d):
+            w, h = d[i] & 0xffffffff, d[i + 1] & 0xffffffff
+            if w * h == 0 or i + 2 + w * h > len(d): break
+            if best is None or (best[0] < px and w > best[0]) or (w >= px and w < best[0]):
+                best = (w, h, i + 2)
+            i += 2 + w * h
+        if best:
+            w, h, o = best
+            px_ = d[o:o + w * h]
+            raw = bytearray(w * h * 4)
+            for j, v in enumerate(px_):
+                k = j * 4
+                raw[k] = (v >> 16) & 255; raw[k + 1] = (v >> 8) & 255; raw[k + 2] = v & 255; raw[k + 3] = (v >> 24) & 255
+            pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(raw)), GdkPixbuf.Colorspace.RGB, True, 8, w, h, w * 4)
+            s = pixbuf_surface(pb.scale_simple(px, px, GdkPixbuf.InterpType.BILINEAR))
+    except Exception:
+        s = None
+    _SURF[key] = s
+    return s
+
+
+# ---- window state --------------------------------------------------------------------------
+class State:
+    def __init__(self):
+        self.clients = []         # window ids, _NET_CLIENT_LIST order
+        self.cls = {}             # win -> (instance, class)
+        self.active = 0
+        self.recent = []          # most recently focused first
+        self.fs = []              # geometry of visible fullscreen clients
+
+    def refresh(self):
+        cl = XC.prop(XC.root, "_NET_CLIENT_LIST") or []
+        self.clients = [w for w in cl if w]
+        for w in self.clients:
+            XC.watch(w)
+            if w not in self.cls:
+                raw = XC.prop(w, "WM_CLASS", 256) or b""
+                parts = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+                self.cls[w] = (parts[0] if parts else "", parts[1] if len(parts) > 1 else (parts[0] if parts else "?"))
+        for w in list(self.cls):
+            if w not in self.clients:
+                self.cls.pop(w, None)
+        XC.selected &= set(self.clients)
+        a = XC.prop(XC.root, "_NET_ACTIVE_WINDOW")
+        self.active = a[0] if a else 0
+        if self.active in self.clients:
+            if self.active in self.recent: self.recent.remove(self.active)
+            self.recent.insert(0, self.active)
+        self.recent = [w for w in self.recent if w in self.clients]
+        fsa = XC.atom("_NET_WM_STATE_FULLSCREEN")
+        self.fs = []
+        for w in self.clients:
+            st = XC.prop(w, "_NET_WM_STATE") or []
+            if fsa in st:
+                g = XC.geometry(w)
+                if g: self.fs.append(g)
+
+    def groups(self):
+        """class key -> list of windows, most recent first"""
+        g = {}
+        order = sorted(self.clients, key=lambda w: self.recent.index(w) if w in self.recent else 10 ** 6)
+        for w in order:
+            inst, cl = self.cls.get(w, ("", "?"))
+            g.setdefault((cl or inst).lower(), []).append(w)
+        return g
+
+    def fullscreen_on(self, m):
+        for x, y, w, h in self.fs:
+            cx, cy = x + w // 2, y + h // 2
+            if m.x <= cx < m.x + m.width and m.y <= cy < m.y + m.height:
+                return True
+        return False
+
+
+ST = State()
+
+
+# ---- media -----------------------------------------------------------------------------------
+class Media:
+    def __init__(self, changed):
+        self.changed = changed
+        self.player, self.info, self.art = None, None, None
+        self._pend = False
+        try:
+            import mpris
+            self.mp = mpris
+            mpris.BUS.signal_subscribe(None, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                       "/org/mpris/MediaPlayer2", None, Gio.DBusSignalFlags.NONE, self._sig)
+            mpris.BUS.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                                       "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE, self._name)
+        except Exception:
+            self.mp = None
+        self.poke()
+
+    def _name(self, *a):
+        try:
+            if str(a[5][0]).startswith("org.mpris.MediaPlayer2."):
+                self.poke()
+        except Exception:
+            pass
+
+    def _sig(self, *a):
+        self.poke()
+
+    def poke(self):
+        if self.mp is None:
+            return
+        if self._pend:
+            self._again = True
+            return
+        self._again = False
+        self._pend = True
+
+        def work():
+            p = inf = None
+            try:
+                p = self.mp.active()
+                inf = self.mp.info(p) if p else None
+            except Exception:
+                pass
+            GLib.idle_add(self._done, p, inf)
+        GLib.timeout_add(120, lambda: (threading.Thread(target=work, daemon=True).start(), False)[1])
+
+    def _done(self, p, inf):
+        self._pend = False
+        if getattr(self, "_again", False):
+            GLib.timeout_add(50, lambda: (self.poke(), False)[1])
+        old = (self.player is not None, (self.info or {}).get("art"), (self.info or {}).get("playing"), (self.info or {}).get("title"))
+        self.player, self.info = p, inf
+        if inf and inf.get("art") != old[1]:
+            self.art = None
+            try:
+                self.art = GdkPixbuf.Pixbuf.new_from_file(inf["art"]) if inf.get("art") else None
+            except Exception:
+                self.art = None
+        new = (p is not None and inf is not None, (inf or {}).get("art"), (inf or {}).get("playing"), (inf or {}).get("title"))
+        if new != old:
+            self.changed(new[0] != old[0])
+        return False
+
+    def act(self, m):
+        if self.player and self.mp:
+            p = self.player
+            threading.Thread(target=lambda: self.mp.call(p, m), daemon=True).start()
+            GLib.timeout_add(250, lambda: (self.poke(), False)[1])
+
+
+# ---- the dock (one per monitor) ----------------------------------------------------------------
+def popup(cls):
+    w = Gtk.Window(type=Gtk.WindowType.POPUP)
+    w.set_wmclass("rice-dock", cls + (SFX if cls == "RiceDock" else ""))
+    w.set_type_hint(Gdk.WindowTypeHint.DOCK)
+    w.set_app_paintable(True)
+    w.set_decorated(False)
+    vis = w.get_screen().get_rgba_visual()
+    if vis: w.set_visual(vis)
+    return w
+
+
+def rounded(cr, x, y, w, h, r):
+    rice.rounded(cr, x, y, w, h, min(r, w / 2, h / 2))
+
+
+class Dock:
+    def __init__(self, app, mon):
+        self.app, self.mon = app, mon
+        self.items, self.layout_key = [], None
+        self.shown = False         # target state
+        self.off = 1.0             # 0 = up, 1 = hidden (slide progress)
+        self.anim = None           # (t0, dur, from, to)
+        self.hover_x = None
+        self.scales = []
+        self.bounce = {}
+        self.hide_tm = self.dwell_tm = None
+        self.tick = None
+        self.last = time.monotonic()
+        self.menu_open = False
+        self.pressed = None
+
+        self.glass = popup("RiceDock")
+        self.glass.connect("draw", self._draw_glass)
+        self.fx = popup("RiceDockFx")
+        self.fx.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                           Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK |
+                           Gdk.EventMask.LEAVE_NOTIFY_MASK | Gdk.EventMask.SCROLL_MASK)
+        self.fx.connect("draw", self._draw_fx)
+        self.fx.connect("motion-notify-event", self._motion)
+        self.fx.connect("enter-notify-event", self._enter)
+        self.fx.connect("leave-notify-event", self._leave)
+        self.fx.connect("button-press-event", self._press)
+        self.fx.connect("button-release-event", self._release)
+        self.trig = popup("RiceDockFx")
+        self.trig.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK)
+        self.trig.connect("draw", lambda w, cr: (cr.set_operator(cairo.OPERATOR_SOURCE), cr.set_source_rgba(0, 0, 0, 0), cr.paint(), False)[-1])
+        self.trig.connect("enter-notify-event", self._trig_enter)
+        self.edge = True
+        self.relayout()
+
+    # -- geometry ------------------------------------------------------------------------
+    def dims(self):
+        c = self.app.cfg
+        S = c["size"]
+        dn = self.app.colors.get("design", "default")
+        M = (1.75 if dn == "macos" else 1.0 if dn in ("material3", "brutal") else 1.45) if c["magnify"] else 1.0
+        return S, M
+
+    def build_items(self):
+        c = self.app.cfg
+        S, M = self.dims()
+        groups = ST.groups()
+        used = set()
+        items = []
+        for pin in c["pins"]:
+            a = find_app(pin)
+            ks = app_keys(a, pin)
+            wins = []
+            for k, ws in groups.items():
+                if k in ks:
+                    wins += ws; used.add(k)
+            wins.sort(key=lambda w: ST.recent.index(w) if w in ST.recent else 10 ** 6)
+            items.append(dict(kind="app", pin=pin, app=a, wins=wins, pinned=True,
+                              name=a.get_name() if a else CMD_NAME.get(pin, pin), w=S + self.gap))
+        extra = []
+        for k, ws in groups.items():
+            if k in used:
+                continue
+            a = find_app(k) or find_app(ST.cls.get(ws[0], ("", ""))[0])
+            same = [it for it in items + extra if a and it.get("app") is not None and it["app"].get_id() == a.get_id()]
+            if same:                              # two classes of one app (e.g. firefox / Navigator)
+                same[0]["wins"] += ws
+                continue
+            extra.append(dict(kind="app", pin=(a.get_id()[:-8] if a and a.get_id().endswith(".desktop") else (a.get_id() if a else k)),
+                              app=a, wins=list(ws), pinned=False,
+                              name=a.get_name() if a else (ST.cls.get(ws[0], ("", k))[1] or k), w=S + self.gap))
+        if extra:
+            items.append(dict(kind="sep", w=14))
+            items += extra
+        tail = []
+        if self.app.media.player and self.app.media.info:
+            tail += [dict(kind="cover", w=S + self.gap, name=self._media_name()),
+                     dict(kind="play", w=int(S * 0.62) + self.gap // 2, name="Play / pause"),
+                     dict(kind="next", w=int(S * 0.62) + self.gap // 2, name="Next")]
+        tail.append(dict(kind="desk", w=int(S * 0.8) + self.gap, name="Show desktop"))
+        items.append(dict(kind="sep", w=14))
+        items += tail
+        return items
+
+    def _media_name(self):
+        i = self.app.media.info or {}
+        t = i.get("title") or ""
+        return (t[:34] + "…") if len(t) > 35 else t
+
+    def relayout(self):
+        """Rebuild items; resizes the windows only if the item list (count/widths) changed."""
+        S, M = self.dims()
+        self.gap = max(8, S // 4)
+        old = {self._ikey(it): sc for it, sc in zip(self.items, self.scales)}
+        self.items = self.build_items()
+        self.scales = [old.get(self._ikey(it)) or Spring(1.0) for it in self.items]
+        self.PADX, self.PADY = 10, 8
+        self.W = int(sum(it["w"] for it in self.items) + 2 * self.PADX)
+        self.H = S + 2 * self.PADY + 6
+        self.SIDE = int(S * (M - 1) * 1.3 + 30)
+        self.HEAD = int(S * (M - 1) + 40)
+        self.BM = 8
+        self.BW, self.BH = self.W + 2 * self.SIDE, self.HEAD + self.H + self.BM
+        x = self.SIDE + self.PADX
+        for it in self.items:
+            it["cx"] = x + it["w"] / 2
+            x += it["w"]
+        m = self.mon
+        below = any(o.x < m.x + m.width and o.x + o.width > m.x and o.y == m.y + m.height for o in self.app.monitors)
+        self.edge = not below
+        key = (self.W, self.H, self.BW, self.BH, m.x, m.y, m.width, m.height)
+        if key != self.layout_key:
+            self.layout_key = key
+            self.glass.set_size_request(self.W, self.H); self.glass.resize(self.W, self.H)
+            self.fx.set_size_request(self.BW, self.BH); self.fx.resize(self.BW, self.BH)
+            tw = self.W
+            self.trig.set_size_request(tw, 2); self.trig.resize(tw, 2)
+            self.trig.move(m.x + (m.width - tw) // 2, m.y + m.height - 2)
+            self._shapes()
+            self.place()
+        self.fx.queue_draw()
+
+    def _ikey(self, it):
+        return (it["kind"], it.get("pin"))
+
+    def _shapes(self):
+        for w in (self.glass, self.fx):
+            w.realize()
+        self.glass.get_window().input_shape_combine_region(cairo.Region(), 0, 0)
+        self.fx.get_window().input_shape_combine_region(
+            cairo.Region(cairo.RectangleInt(self.SIDE, self.HEAD, self.W, self.H + self.BM)), 0, 0)
+
+    def ypos(self):
+        """(fx y, glass y) for the current slide progress"""
+        m = self.mon
+        up = m.y + m.height - self.BH
+        e = self.off
+        dy = (self.H + self.BM + 40) if self.edge else 26
+        y = int(round(up + dy * e))
+        return y, y + self.HEAD
+
+    def place(self):
+        m = self.mon
+        x = m.x + (m.width - self.BW) // 2
+        y, gy = self.ypos()
+        for w, xx, yy in ((self.fx, x, y), (self.glass, x + self.SIDE, gy)):
+            gw = w.get_window()
+            if gw is not None and w.get_mapped():
+                gw.move(xx, yy)
+            else:
+                w.move(xx, yy)
+        if not self.edge:
+            o = max(0.0, min(1.0, 1.0 - self.off))
+            self.glass.set_opacity(o); self.fx.set_opacity(o)
+
+    # -- show / hide ---------------------------------------------------------------------------
+    def allowed(self):
+        if ST.fullscreen_on(self.mon):
+            return False
+        mode = self.app.cfg["monitor"]
+        if mode == "primary":
+            return self.app.is_primary(self.mon)
+        return True
+
+    def update_visibility(self):
+        """Called after any state change: fullscreen, settings, pointer monitor."""
+        ok = self.allowed()
+        c = self.app.cfg
+        if ok and c["autohide"]:
+            if not self.shown: self.trig.show(); self.trig.get_window().raise_()
+        else:
+            self.trig.hide()
+        if not ok:
+            self.slide(False)
+        elif not c["autohide"]:
+            want = True
+            if c["monitor"] == "pointer":
+                want = self.app.pointer_mon() is self.mon
+            self.slide(want)
+
+    def slide(self, up):
+        tgt = 0.0 if up else 1.0
+        if self.shown == up and ((self.anim is not None and self.anim[3] == tgt) or (self.anim is None and self.off == tgt)):
+            return
+        self.shown = up
+        if up:
+            self.cancel_hide()
+            self.relayout()
+            self.trig.hide()
+            for w in (self.glass, self.fx):
+                if not w.get_mapped():
+                    self.place(); w.show()
+            self.raise_()
+        else:
+            self.hover_x = None
+            for s in self.scales: s.t = 1.0
+        dur = mdur(0.42 if up else 0.30)
+        self.anim = (time.monotonic(), dur, self.off, tgt)
+        self.kick()
+
+    def raise_(self):
+        for w in (self.glass, self.fx):
+            gw = w.get_window()
+            if gw is not None and w.get_mapped():
+                gw.raise_()
+        if self.trig.get_mapped():
+            self.trig.get_window().raise_()
+
+    def cancel_hide(self):
+        if self.hide_tm:
+            GLib.source_remove(self.hide_tm); self.hide_tm = None
+
+    def schedule_hide(self):
+        if not self.app.cfg["autohide"] or self.menu_open:
+            return
+        self.cancel_hide()
+
+        def go():
+            self.hide_tm = None
+            if self.menu_open or self.pointer_inside():
+                return False
+            self.slide(False)
+            return False
+        self.hide_tm = GLib.timeout_add(HIDE_DELAY, go)
+
+    def pointer_inside(self):
+        x, y = self.app.pointer()
+        m = self.mon
+        bx = m.x + (m.width - self.BW) // 2 + self.SIDE
+        top = m.y + m.height - self.BM - self.H
+        return bx <= x < bx + self.W and top <= y <= m.y + m.height
+
+    def _trig_enter(self, w, e):
+        if self.shown or not self.allowed():
+            return False
+        if self.edge:
+            self.app.reveal(self)
+        else:
+            if self.dwell_tm: GLib.source_remove(self.dwell_tm)
+
+            def chk():
+                self.dwell_tm = None
+                x, y = self.app.pointer()
+                m = self.mon
+                if m.y + m.height - 4 <= y < m.y + m.height and m.x <= x < m.x + m.width:
+                    self.app.reveal(self)
+                return False
+            self.dwell_tm = GLib.timeout_add(DWELL, chk)
+        return False
+
+    # -- animation -----------------------------------------------------------------------------
+    def kick(self):
+        if self.tick is None:
+            self.last = time.monotonic()
+            self.tick = self.fx.add_tick_callback(self._tick)
+
+    def _tick(self, w, clock):
+        now = time.monotonic()
+        dt = min(now - self.last, 0.05); self.last = now
+        busy = False
+        if self.anim:
+            t0, dur, a, b = self.anim
+            t = min((now - t0) / dur, 1.0)
+            k = SPRING(t) if b < a else (t * t * t if t < 1 else 1.0)
+            self.off = a + (b - a) * k
+            self.place()
+            if t >= 1.0:
+                self.anim = None
+                self.off = b
+                if b >= 1.0:
+                    self.glass.hide(); self.fx.hide()
+                    if self.app.cfg["autohide"] and self.allowed():
+                        self.trig.show(); self.trig.get_window().raise_()
+                else:
+                    if self.app.cfg["autohide"] and not self.pointer_inside():
+                        self.schedule_hide()
+            else:
+                busy = True
+        self._targets()
+        z, om = motion_params()
+        for s in self.scales:
+            if s.step(dt, z, om): busy = True
+        for k in list(self.bounce):
+            if now - self.bounce[k] > 1.6: del self.bounce[k]
+        if self.bounce: busy = True
+        self.fx.queue_draw()
+        if not busy:
+            self.tick = None
+            return False
+        return True
+
+    def _targets(self):
+        S, M = self.dims()
+        sig = S * 1.25
+        for it, s in zip(self.items, self.scales):
+            if self.hover_x is None or it["kind"] == "sep" or M <= 1.0:
+                s.t = 1.0
+            else:
+                d = (self.hover_x - it["cx"]) / sig
+                m = M if it["kind"] in ("app", "cover") else 1.0 + (M - 1) * 0.6
+                s.t = 1.0 + (m - 1.0) * math.exp(-d * d)
+
+    def disp(self):
+        """displayed centre x of every item (base centre + spread from magnified neighbours)"""
+        g = [it["w"] * (s.x - 1.0) * 0.6 for it, s in zip(self.items, self.scales)]
+        tot = sum(g)
+        out, acc = [], 0.0
+        for it, gi in zip(self.items, g):
+            out.append(it["cx"] + (acc + gi / 2) - tot / 2)
+            acc += gi
+        return out
+
+    def hit(self, x):
+        best = None
+        for i, (it, cx) in enumerate(zip(self.items, self.disp())):
+            half = it["w"] * self.scales[i].x / 2
+            if abs(x - cx) <= half and it["kind"] != "sep":
+                best = i
+        return best
+
+    # -- events ----------------------------------------------------------------------------------
+    def _motion(self, w, e):
+        self.hover_x = e.x
+        self.cancel_hide()
+        self.kick()
+        return False
+
+    def _enter(self, w, e):
+        self.cancel_hide()
+        if e.mode == Gdk.CrossingMode.NORMAL:
+            self.hover_x = e.x
+            self.kick()
+        return False
+
+    def _leave(self, w, e):
+        if e.mode != Gdk.CrossingMode.NORMAL or self.menu_open:
+            return False
+        self.hover_x = None
+        self.kick()
+        self.schedule_hide()
+        return False
+
+    def _press(self, w, e):
+        self.pressed = self.hit(e.x)
+        if e.button == 3 and self.pressed is not None:
+            self.context_menu(self.items[self.pressed], e)
+        return True
+
+    def _release(self, w, e):
+        i = self.hit(e.x)
+        if i is None or i != self.pressed or e.button == 3:
+            return True
+        it = self.items[i]
+        k = it["kind"]
+        if k == "app":
+            if e.button == 2 or not it["wins"]:
+                launch(it["app"], it["pin"])
+                self.bounce[it["pin"]] = time.monotonic(); self.kick()
+            elif e.button == 1:
+                ws = it["wins"]
+                tgt = ws[1] if (ST.active in ws and len(ws) > 1) else ws[0]
+                if tgt != ST.active:
+                    ipc(9, tgt)
+        elif k == "cover":
+            launch(None, "rice-media")
+        elif k == "play":
+            self.app.media.act("PlayPause")
+        elif k == "next":
+            self.app.media.act("Next")
+        elif k == "desk":
+            m = self.mon
+            ipc(1, m.x + m.width // 2, m.y + m.height // 2)
+        return True
+
+    def context_menu(self, it, e):
+        if it["kind"] != "app" or self.menu_open:      # one menu at a time (right-click spam spawned many)
+            return
+        rows = []
+        if it["pinned"]:
+            rows.append(("Unpin from dock", lambda: self.app.unpin(it["pin"])))
+        else:
+            rows.append(("Pin to dock", lambda: self.app.pin(it["pin"])))
+
+        def new():
+            launch(it["app"], it["pin"])
+            self.bounce[it["pin"]] = time.monotonic(); self.kick()
+        rows.append(("New window", new))
+        self.menu_open = True
+        self.cancel_hide()
+        i = self.items.index(it)
+        gx, gy = self.fx.get_window().get_origin()[1:]
+        ax = gx + self.disp()[i]
+        top = gy + self.HEAD
+
+        def done():
+            self.menu_open = False
+            if not self.pointer_inside():
+                self.hover_x = None; self.kick(); self.schedule_hide()
+        Menu(self.app, rows, ax, top - 8, done)
+
+    # -- drawing ---------------------------------------------------------------------------------
+    def _draw_glass(self, w, cr):
+        c, al = self.app.colors, self.app.alpha
+        a = w.get_allocation()
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0); cr.paint()
+        dn = c.get("design", "default")
+        rounded(cr, 0.5, 0.5, a.width - 1, a.height - 1, RADIUS)
+        if dn == "material3":      # tonal surface container, no outline
+            cr.set_source_rgba(*rice.rgb(c["bg2"], max(al, 0.9))); cr.fill()
+            return False
+        if dn == "brutal":         # solid, hard outline
+            cr.set_source_rgba(*rice.rgb(c["bg"], 1.0)); cr.fill_preserve()
+            cr.set_operator(cairo.OPERATOR_OVER)
+            cr.set_source_rgba(*rice.rgb(c["border"], 1.0)); cr.set_line_width(3); cr.stroke()
+            return False
+        cr.set_source_rgba(*rice.rgb(c["bg"], al)); cr.fill_preserve()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        cr.set_source_rgba(*rice.rgb(c["fg"] if dn == "macos" else c["border"], 0.22 if dn == "macos" else 1.0))
+        cr.set_line_width(1); cr.stroke()
+        if dn == "macos":          # top sheen like the macOS dock
+            rounded(cr, 1.5, 1.5, a.width - 3, a.height - 3, RADIUS - 1)
+            g = cairo.LinearGradient(0, 0, 0, a.height)
+            g.add_color_stop_rgba(0, *rice.rgb(c["fg"], 0.10)); g.add_color_stop_rgba(0.5, *rice.rgb(c["fg"], 0.0))
+            cr.set_source(g); cr.fill()
+        return False
+
+    def _draw_fx(self, w, cr):
+        c = self.app.colors
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0); cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        S, M = self.dims()
+        base = self.HEAD + self.PADY + S          # icon bottom line
+        now = time.monotonic()
+        hov = self.hit(self.hover_x) if self.hover_x is not None else None
+        for i, (it, cx) in enumerate(zip(self.items, self.disp())):
+            s = self.scales[i].x
+            k = it["kind"]
+            if k == "sep":
+                cr.set_source_rgba(*rice.rgb(c["fg"], 0.18))
+                cr.rectangle(int(cx), self.HEAD + self.PADY + 4, 1, self.H - 2 * self.PADY - 8); cr.fill()
+                continue
+            lift = 0.0
+            b = self.bounce.get(it.get("pin")) if k == "app" else None
+            if b is not None:
+                t = (now - b) / 1.6
+                lift = abs(math.sin(t * math.pi * 3)) * 12 * (1 - t)
+            if k == "app":
+                sz = S * s
+                x0, y0 = cx - sz / 2, base - sz - lift
+                if hov == i and M <= 1.0:
+                    rounded(cr, cx - S / 2 - 5, self.HEAD + self.PADY - 5, S + 10, S + 10, 12)
+                    cr.set_source_rgba(*rice.rgb(c["fg"], 0.10)); cr.fill()
+                self._icon(cr, it, x0, y0, sz)
+                if it["wins"]:
+                    foc = ST.active in it["wins"]
+                    dy = self.HEAD + self.H - self.PADY + 1
+                    dn = c.get("design", "default")
+                    if dn == "macos":       # plain dot under running apps
+                        cr.arc(cx, dy, 2.2, 0, 2 * math.pi); cr.set_source_rgba(*rice.rgb(c["fg"], 0.85 if foc else 0.55)); cr.fill()
+                    elif dn == "material3":  # tonal pill behind the focused icon (state layer)
+                        if foc:
+                            rounded(cr, cx - sz / 2 - 8, y0 - 5, sz + 16, sz + 10, (sz + 10) / 2)
+                            cr.set_source_rgba(*rice.rgb(c["accent"], 0.28)); cr.fill()
+                            self._icon(cr, it, x0, y0, sz)
+                        else:
+                            cr.arc(cx, dy, 2, 0, 2 * math.pi); cr.set_source_rgba(*rice.rgb(c["dim"], 0.8)); cr.fill()
+                    elif dn == "brutal":     # hard bar
+                        cr.rectangle(cx - sz / 2, dy - 2, sz, 4 if foc else 2)
+                        cr.set_source_rgba(*rice.rgb(c["accent"] if foc else c["fg"], 1.0 if foc else 0.6)); cr.fill()
+                    elif foc:        # soft accent glow under the focused app + a pill
+                        g = cairo.RadialGradient(cx, dy - 2, 1, cx, dy - 2, sz * 0.55)
+                        g.add_color_stop_rgba(0, *rice.rgb(c["accent"], 0.38)); g.add_color_stop_rgba(1, *rice.rgb(c["accent"], 0.0))
+                        cr.set_source(g); cr.rectangle(cx - sz * 0.6, dy - sz * 0.6, sz * 1.2, sz * 0.7); cr.fill()
+                        rounded(cr, cx - 7, dy - 2, 14, 4, 2); cr.set_source_rgba(*rice.rgb(c["accent"], 1.0)); cr.fill()
+                    else:
+                        cr.arc(cx, dy, 2, 0, 2 * math.pi); cr.set_source_rgba(*rice.rgb(c["fg"], 0.55)); cr.fill()
+                    n = min(len(it["wins"]), 4) - 1       # one small dot per extra window
+                    for j in range(n):
+                        cr.arc(cx + 9 + j * 5, dy, 1.5, 0, 2 * math.pi)
+                        cr.set_source_rgba(*rice.rgb(c["accent"] if foc else c["fg"], 0.7 if foc else 0.35)); cr.fill()
+            elif k == "cover":
+                sz = S * s
+                x0, y0 = cx - sz / 2, base - sz
+                rounded(cr, x0, y0, sz, sz, 10)
+                art = self.app.media.art
+                if art is not None:
+                    cr.save(); cr.clip()
+                    aw, ah = art.get_width(), art.get_height()
+                    sc = sz / min(aw, ah)
+                    cr.translate(x0 + (sz - aw * sc) / 2, y0 + (sz - ah * sc) / 2); cr.scale(sc, sc)
+                    Gdk.cairo_set_source_pixbuf(cr, art, 0, 0)
+                    cr.get_source().set_filter(cairo.FILTER_GOOD)
+                    cr.paint(); cr.restore()
+                else:
+                    cr.set_source_rgba(*rice.rgb(c["bg2"], 0.95)); cr.fill()
+                    self._glyph(cr, G_MUSIC, cx, y0 + sz / 2, sz * 0.42, c["accent"])
+                if (self.app.media.info or {}).get("playing"):
+                    dy = self.HEAD + self.H - self.PADY + 1
+                    rounded(cr, cx - 7, dy - 2, 14, 4, 2); cr.set_source_rgba(*rice.rgb(c["accent"], 1.0)); cr.fill()
+            elif k in ("play", "next", "desk"):
+                d = (S * 0.62 if k != "desk" else S * 0.72) * s
+                cy = base - S / 2 - (s - 1) * S * 0.3
+                cr.arc(cx, cy, d / 2, 0, 2 * math.pi)
+                on = hov == i
+                cr.set_source_rgba(*rice.rgb(c["fg"], 0.16 if on else 0.08)); cr.fill()
+                g = {"next": G_NEXT, "desk": G_DESK}.get(k) or (G_PAUSE if (self.app.media.info or {}).get("playing") else G_PLAY)
+                self._glyph(cr, g, cx + (1.5 if g == G_PLAY else 0), cy, d * 0.40, c["fg"])
+        if hov is not None and not self.menu_open:
+            it = self.items[hov]
+            s = self.scales[hov].x
+            a = 1.0 if M <= 1.0 else max(0.0, min(1.0, (s - 1.0) / (M - 1.0) * 1.6 - 0.3))
+            if a > 0.02 and it.get("name"):
+                cx = self.disp()[hov]
+                top = base - S * s - 10 if it["kind"] in ("app", "cover") else self.HEAD - 4
+                self._label(cr, it["name"], cx, top, a)
+        return False
+
+    def _icon(self, cr, it, x, y, sz):
+        S, M = self.dims()
+        px = int(round(S * M))
+        surf = icon_surface(it["app"], it["pin"], px)
+        if surf is None and it["wins"]:
+            surf = wm_icon_surface(it["wins"][0], px)
+        if surf is None:
+            c = self.app.colors
+            rounded(cr, x, y, sz, sz, sz * 0.26)
+            cr.set_source_rgba(*rice.rgb(c["bg2"], 0.95)); cr.fill()
+            g = CMD_ICON.get(it["pin"], (None, G_APP))[1]
+            self._glyph(cr, g, x + sz / 2, y + sz / 2, sz * 0.45, c["accent"])
+            return
+        cr.save()
+        cr.translate(x, y)
+        cr.scale(sz / px, sz / px)
+        cr.set_source_surface(surf, 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_GOOD)
+        cr.paint()
+        cr.restore()
+
+    def _glyph(self, cr, g, cx, cy, size, colr):
+        cr.select_font_face(rice.ICON_FONT, 0, 0)
+        cr.set_font_size(size)
+        e = cr.text_extents(g)
+        cr.move_to(cx - e.width / 2 - e.x_bearing, cy - e.height / 2 - e.y_bearing)
+        cr.set_source_rgba(*rice.rgb(colr, 1.0)); cr.show_text(g)
+
+    def _label(self, cr, s, cx, bottom, a):
+        c = self.app.colors
+        cr.select_font_face(rice.SANS_FONT, 0, 1)      # theme mood font
+        cr.set_font_size(12)
+        e = cr.text_extents(s)
+        w, h = e.x_advance + 20, 22
+        x = max(2, min(cx - w / 2, self.BW - w - 2))
+        y = bottom - h
+        rounded(cr, x, y, w, h, 11)
+        cr.set_source_rgba(*rice.rgb(c["bg"], 0.92 * a)); cr.fill_preserve()
+        cr.set_source_rgba(*rice.rgb(c["border"], a)); cr.set_line_width(1); cr.stroke()
+        cr.move_to(x + 10, y + 15)
+        cr.set_source_rgba(*rice.rgb(c["fg"], a)); cr.show_text(s)
+
+    def destroy(self):
+        self.cancel_hide()
+        if self.tick is not None:
+            self.fx.remove_tick_callback(self.tick); self.tick = None
+        for w in (self.glass, self.fx, self.trig):
+            w.destroy()
+
+
+class Menu:
+    """Small glass menu above a dock item (own cairo drawing, class RiceDock so picom blurs it).
+    Grabs the pointer and keyboard: a click outside, right click or Esc closes it."""
+    RH, PAD = 32, 6
+
+    def __init__(self, app, rows, ax, bottom, done):
+        self.app, self.rows, self.done, self.hov, self.closed = app, rows, done, None, False
+        cr = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
+        cr.select_font_face(rice.SANS_FONT, 0, 1); cr.set_font_size(12)
+        self.W = int(max(cr.text_extents(r[0]).x_advance for r in rows) + 2 * self.PAD + 32)
+        self.H = len(rows) * self.RH + 2 * self.PAD
+        w = self.win = popup("RiceDock")
+        w.set_size_request(self.W, self.H)
+        w.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                     Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        w.connect("draw", self._draw)
+        w.connect("motion-notify-event", self._motion)
+        w.connect("leave-notify-event", lambda *a: (setattr(self, "hov", None), w.queue_draw(), False)[2])
+        w.connect("button-release-event", self._release)
+        w.connect("key-press-event", lambda wd, e: (self.close() if e.keyval == Gdk.KEY_Escape else None, True)[1])
+        x = int(ax - self.W / 2)
+        w.move(x, int(bottom - self.H))
+        w.show()
+        w.get_window().raise_()
+        self.tries = 0
+        GLib.timeout_add(20, self._grab)
+
+    def _grab(self):
+        if self.closed:
+            return False
+        seat = Gdk.Display.get_default().get_default_seat()
+        if seat.grab(self.win.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None) == Gdk.GrabStatus.SUCCESS:
+            return False
+        self.tries += 1
+        return self.tries < 25
+
+    def _row(self, x, y):
+        if not (0 <= x < self.W): return None
+        i = int((y - self.PAD) // self.RH)
+        return i if 0 <= i < len(self.rows) and y >= self.PAD else None
+
+    def _motion(self, w, e):
+        h = self._row(e.x, e.y)
+        if h != self.hov:
+            self.hov = h; w.queue_draw()
+        return True
+
+    def _release(self, w, e):
+        i = self._row(e.x, e.y) if e.button == 1 else None
+        self.close()
+        if i is not None:
+            self.rows[i][1]()
+        return True
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try: Gdk.Display.get_default().get_default_seat().ungrab()
+        except Exception: pass
+        self.win.destroy()
+        self.done()
+
+    def _draw(self, w, cr):
+        c = self.app.colors
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0); cr.paint()
+        rounded(cr, 0.5, 0.5, self.W - 1, self.H - 1, RADIUS)   # picom rounds RiceDock at 22
+        cr.set_source_rgba(*rice.rgb(c["bg"], max(self.app.alpha, 0.75))); cr.fill_preserve()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        cr.set_source_rgba(*rice.rgb(c["border"], 1.0)); cr.set_line_width(1); cr.stroke()
+        cr.select_font_face(rice.SANS_FONT, 0, 1); cr.set_font_size(12)
+        for i, (lab, _cb) in enumerate(self.rows):
+            y = self.PAD + i * self.RH
+            if i == self.hov:
+                rounded(cr, self.PAD + 4, y + 2, self.W - 2 * self.PAD - 8, self.RH - 4, 12)
+                cr.set_source_rgba(*rice.rgb(c["accent"], 0.85)); cr.fill()
+            cr.set_source_rgba(*rice.rgb(c["bg"] if i == self.hov else c["fg"], 1.0))
+            cr.move_to(self.PAD + 16, y + self.RH / 2 + 4.5); cr.show_text(lab)
+        return False
+
+
+class App:
+    def __init__(self):
+        self.cfg = conf()
+        self.recolor(force=True)
+        self.media = Media(self._media_changed)
+        self.docks = []
+        self._ev_tm = self._raise_tm = None
+        ST.refresh()
+        self.build()
+        GLib.io_add_watch(XC.L.XConnectionNumber(XC.d), GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, self._xev)
+        GLib.timeout_add_seconds(2, self.recolor)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.reload)
+        scr = Gdk.Screen.get_default()
+        scr.connect("monitors-changed", lambda *_: GLib.timeout_add(300, lambda: (self.build(), False)[1]))
+        GLib.idle_add(lambda: (app_index(), self.relayout_all(), False)[2])   # warm the .desktop index after start-up
+        XC.L.XFlush(XC.d)
+        self._xev()
+
+    # -- monitors ------------------------------------------------------------------------------
+    def build(self):
+        for d in self.docks:
+            d.destroy()
+        disp = Gdk.Display.get_default()
+        self.monitors = [disp.get_monitor(i).get_geometry() for i in range(disp.get_n_monitors())]
+        p = disp.get_primary_monitor() or disp.get_monitor(0)
+        self.primary = p.get_geometry() if p else self.monitors[0]
+        mons = [self.primary] if self.cfg["monitor"] == "primary" else self.monitors
+        self.docks = [Dock(self, m) for m in mons]
+        for d in self.docks:
+            d.update_visibility()
+        if getattr(self, "_follow_tm", None):
+            GLib.source_remove(self._follow_tm); self._follow_tm = None
+        if self.cfg["monitor"] == "pointer" and not self.cfg["autohide"] and len(self.docks) > 1:
+            self._follow_tm = GLib.timeout_add(700, self._follow)   # always-visible dock follows the pointer's monitor
+
+    def _follow(self):
+        pm = self.pointer_mon()
+        if pm is not None and not any(d.shown and d.mon is pm for d in self.docks):
+            for d in self.docks:
+                d.update_visibility()
+        return True
+
+    def is_primary(self, m):
+        return (m.x, m.y, m.width, m.height) == (self.primary.x, self.primary.y, self.primary.width, self.primary.height)
+
+    def pointer(self):
+        try:
+            _s, x, y = Gdk.Display.get_default().get_default_seat().get_pointer().get_position()
+            return x, y
+        except Exception:
+            return -1, -1
+
+    def pointer_mon(self):
+        x, y = self.pointer()
+        for d in self.docks:
+            m = d.mon
+            if m.x <= x < m.x + m.width and m.y <= y < m.y + m.height:
+                return d.mon
+        return self.docks[0].mon if self.docks else None
+
+    def reveal(self, dock):
+        if self.cfg["monitor"] == "pointer":
+            for d in self.docks:
+                if d is not dock and d.shown:
+                    d.slide(False)
+        dock.slide(True)
+
+    # -- state changes ---------------------------------------------------------------------------
+    def _xev(self, *a):
+        evs = XC.events()
+        if evs or not a:
+            names = {XC.atom(n) for n in ("_NET_CLIENT_LIST", "_NET_ACTIVE_WINDOW", "_NET_WM_STATE", "_NET_WM_ICON", "WM_CLASS")}
+            if not a or any(at in names for _w, at in evs):
+                if self._ev_tm is None:
+                    self._ev_tm = GLib.timeout_add(40, self._state)
+                    GLib.timeout_add(450, self._state_late)
+        return True
+
+    def _state(self):
+        self._ev_tm = None
+        ST.refresh()
+        for d in self.docks:
+            if d.shown or not self.cfg["autohide"]:
+                d.relayout()
+            d.update_visibility()
+            if d.shown: d.raise_()
+            elif d.trig.get_mapped(): d.trig.get_window().raise_()
+            if d.bounce:
+                for it in d.items:
+                    if it["kind"] == "app" and it.get("pin") in d.bounce and it["wins"]:
+                        del d.bounce[it["pin"]]
+        return False
+
+    def _state_late(self):
+        """dwm slides workspaces / animates geometry: look again once that settled (fullscreen visibility)"""
+        if self._ev_tm is None:
+            self._state()
+        return False
+
+    def relayout_all(self):
+        for d in self.docks:
+            d.relayout()
+
+    def _media_changed(self, presence):
+        for d in self.docks:
+            if presence or d.shown or not self.cfg["autohide"]:
+                d.relayout()
+            for it in d.items:
+                if it["kind"] == "cover": it["name"] = d._media_name()
+            d.fx.queue_draw()
+
+    def pin(self, p):
+        pins = list(self.cfg["pins"])
+        if p not in pins:
+            pins.append(p)
+        self.cfg["pins"] = pins
+        save_pins(pins)
+        self.relayout_all()
+
+    def unpin(self, p):
+        pins = [x for x in self.cfg["pins"] if x != p]
+        self.cfg["pins"] = pins
+        save_pins(pins)
+        self.relayout_all()
+
+    def reload(self, *a):
+        self.cfg = conf()
+        self.recolor(force=True)
+        self.build()
+        return True
+
+    # -- theme -----------------------------------------------------------------------------------
+    def recolor(self, force=False):
+        fs = (rice.COLORS_FILE, os.path.expanduser("~/.local/share/konsole/Rice.colorscheme"))
+        st = []
+        for f in fs:
+            try: st.append(os.stat(f).st_mtime_ns)
+            except OSError: st.append(0)
+        if force is True or st != getattr(self, "_mt", None):
+            self._mt = st
+            self.colors = rice.colors()
+            rice.CUR.clear(); rice.CUR.update(self.colors)
+            self.alpha = rice.glass_alpha(0.66) if self.colors.get("glass", 1) else 1.0
+            dn = self.colors.get("design", "default")
+            if __import__("designs").geo(dn)["sfx"] != SFX:      # radius/class changed with the design: restart via rice-supervise
+                os._exit(1)
+            redo, self._design = dn != getattr(self, "_design", dn), dn      # magnify differs per design: new geometry
+            for d in getattr(self, "docks", []):
+                if redo: d.relayout()
+                d.glass.queue_draw(); d.fx.queue_draw()
+        return True
+
+    def quit(self, *a):
+        try: os.remove(PIDF)
+        except OSError: pass
+        GLib.timeout_add(800, lambda: os._exit(0))     # never linger half-dead (a later start would see the lock)
+        Gtk.main_quit()
+        return False
+
+
+if __name__ == "__main__":
+    App()
+    Gtk.main()
+    os._exit(0)

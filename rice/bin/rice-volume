@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""Volume card.
+rice-volume --at X Y   bar icon click: card drops under the icon, with output/input pickers and a mic test.
+                       Grabs input; Esc, right-click or a click outside closes it.
+rice-volume --osd      volume keys: slim pill in the centre of the screen, closes 2s after the last change.
+rice-volume            same as --at at the top centre."""
+import os, sys, signal, fcntl, time
+
+OSD = "--osd" in sys.argv
+AT = None
+if "--at" in sys.argv:
+    try:
+        i = sys.argv.index("--at")
+        AT = (int(sys.argv[i + 1]), int(sys.argv[i + 2]))
+    except (ValueError, IndexError):
+        AT = None
+signal.signal(signal.SIGUSR1, signal.SIG_IGN)  # a refresh must never kill us while we start
+
+# ---- single instance, decided BEFORE the slow GTK import ----------------
+CACHE = os.path.expanduser("~/.cache/rice")
+os.makedirs(CACHE, exist_ok=True)
+PID = os.path.join(CACHE, "volume.pid")
+lockf = open(os.path.join(CACHE, "volume.lock"), "w")
+try:
+    fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    for _ in range(30):
+        try:
+            pid = int(open(PID).read())
+            os.kill(pid, signal.SIGUSR1 if OSD else signal.SIGTERM)
+            break
+        except (OSError, ValueError):
+            time.sleep(0.05)
+    sys.exit(0)
+open(PID, "w").write(str(os.getpid()))
+
+import subprocess, json, math, threading
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import rice
+from rice import Gtk, Gdk, GLib
+from gi.repository import Pango
+import cairo
+
+SINK = "@DEFAULT_AUDIO_SINK@"
+TAU = 2 * math.pi
+
+
+def run(*a, t=2):
+    try:
+        return subprocess.run(["timeout", str(t), *a], capture_output=True, text=True).stdout
+    except Exception:
+        return ""
+
+
+def get_vol():
+    try:
+        out = run("wpctl", "get-volume", SINK)
+        return float(out.split()[1]), "MUTED" in out
+    except Exception:
+        return 0.0, False
+
+
+vol, muted = get_vol()
+CLICK = not OSD
+W = 360 if CLICK else 340
+H = 296 if CLICK else 64
+win = rice.Card(W, H, radius=26)
+c = win.c
+
+
+# ---- critically damped spring (zeta = 1): no overshoot, ends in minimum time
+class Spring:
+    def __init__(self, x, response=0.26):
+        self.x = self.t = x
+        self.v = 0.0
+        self.response = response
+
+    def step(self, dt):
+        w = TAU / self.response
+        d = self.x - self.t
+        e = math.exp(-w * dt)
+        j = self.v + w * d
+        self.x = self.t + (d + j * dt) * e
+        self.v = (self.v - w * j * dt) * e
+        if abs(self.x - self.t) < 0.0004 and abs(self.v) < 0.002:
+            self.x, self.v = self.t, 0.0
+            return False
+        return True
+
+
+state = dict(drag=False, closing=False, pending=False, hover=False, inflight=None, want=None)
+lvl = Spring(0.0 if muted else vol)
+thick = Spring(0.0, 0.16)   # 0 resting .. 1 hover/drag: track and knob grow
+mic = Spring(0.0, 0.07)     # mic meter
+
+# ---- layout --------------------------------------------------------------
+root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+root.set_margin_start(22); root.set_margin_end(22)
+root.set_margin_top(14 if CLICK else 0); root.set_margin_bottom(14 if CLICK else 0)
+
+row = Gtk.Box(spacing=12)
+icon = Gtk.DrawingArea(); icon.set_size_request(26, 26)
+icon.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+slider = Gtk.DrawingArea(); slider.set_size_request(-1, 44 if CLICK else H)
+slider.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                  Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK |
+                  Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+pct = Gtk.Label(); pct.set_width_chars(4); pct.set_xalign(1.0)
+row.pack_start(icon, False, False, 0)
+row.pack_start(slider, True, True, 0)
+row.pack_end(pct, False, False, 0)
+icon.set_valign(Gtk.Align.CENTER)
+root.pack_start(row, False, False, 0)
+
+
+def level_of(v, m):
+    return 0 if (m or v <= 0.001) else 1 if v < 0.34 else 2 if v < 0.67 else 3
+
+
+def draw_icon(w, cr):
+    a = w.get_allocation()
+    cx, cy = a.width / 2 - 2, a.height / 2
+    lv = level_of(vol, muted)
+    cr.set_source_rgba(*rice.rgb(c["fg"]))
+    cr.set_line_width(2)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND); cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.move_to(cx - 9, cy - 3.6); cr.line_to(cx - 4.6, cy - 3.6); cr.line_to(cx + 0.6, cy - 7.6)
+    cr.line_to(cx + 0.6, cy + 7.6); cr.line_to(cx - 4.6, cy + 3.6); cr.line_to(cx - 9, cy + 3.6); cr.close_path()
+    cr.fill_preserve(); cr.stroke()
+    if lv == 0:
+        cr.move_to(cx + 5, cy - 4); cr.line_to(cx + 12, cy + 4)
+        cr.move_to(cx + 12, cy - 4); cr.line_to(cx + 5, cy + 4); cr.stroke()
+    else:
+        for i in range(min(lv, 2)):
+            r = 5 + 4.2 * i
+            cr.new_sub_path(); cr.arc(cx + 1, cy, r, -0.85, 0.85); cr.stroke()
+    return False
+
+
+icon.connect("draw", draw_icon)
+
+
+# ---- slider: drawn at display refresh on the frame clock -------------------
+def target():
+    return 0.0 if muted else vol
+
+
+def settle_ticks(wd, clock):
+    now = clock.get_frame_time() / 1e6
+    last = state.get("tlast") or now
+    dt = min(now - last, 0.05)
+    state["tlast"] = now
+    lvl.t = target()
+    thick.t = 1.0 if (state["drag"] or state["hover"]) else 0.0
+    lvl.response = 0.05 if state["drag"] else 0.30   # tight while dragging, soft otherwise
+    alive = lvl.step(dt)
+    alive = thick.step(dt) or alive
+    if micstate["on"] or mic.x > 0.0004:
+        mic.t = micstate["level"] if micstate["on"] else 0.0
+        alive = mic.step(dt) or alive
+        meter.queue_draw()
+    slider.queue_draw()
+    if not alive:
+        state["tick"] = None
+        state["tlast"] = None
+        return False
+    return True
+
+
+def kick():
+    if state.get("tick") is None:
+        state["tick"] = slider.add_tick_callback(settle_ticks)
+
+
+def draw_slider(w, cr):
+    a = w.get_allocation()
+    th = 10 + 6 * thick.x
+    pad = 12
+    y = (a.height - th) / 2
+    tw = a.width - 2 * pad
+    rice.rounded(cr, pad, y, tw, th, th / 2)
+    cr.set_source_rgba(*rice.rgb(c["border"], 0.85))
+    cr.fill()
+    fw = tw * lvl.x
+    if fw > 0.5:
+        cr.save()
+        rice.rounded(cr, pad, y, tw, th, th / 2)
+        cr.clip()
+        rice.rounded(cr, pad - th, y, fw + th, th, th / 2)
+        cr.set_source_rgba(*rice.rgb(c["dim"] if muted else c["accent"]))
+        cr.fill()
+        cr.restore()
+    kr = 8 + 3 * thick.x
+    kx = pad + fw
+    cr.arc(kx, a.height / 2 + 1.5, kr + 1.5, 0, TAU)   # soft shadow
+    cr.set_source_rgba(0, 0, 0, 0.18); cr.fill()
+    cr.arc(kx, a.height / 2, kr, 0, TAU)
+    cr.set_source_rgba(1, 1, 1, 1); cr.fill()
+    return False
+
+
+slider.connect("draw", draw_slider)
+
+
+def set_labels():
+    pct.set_markup(f'<span size="14000" weight="bold">{"mute" if muted else f"{round(vol * 100)}%"}</span>')
+    icon.queue_draw()
+
+
+# ---- writes to PipeWire: one call in flight, latest value wins -----------
+def push():
+    if state["inflight"] or state["want"] is None:
+        return
+    v, state["want"] = state["want"], None
+    p = subprocess.Popen(["timeout", "2", "sh", "-c",
+                          f"wpctl set-mute {SINK} 0; wpctl set-volume -l 1.0 {SINK} {v:.3f}; pkill -RTMIN+10 -x dwm-status"])
+    state["inflight"] = p
+
+    def done(pid, status):
+        state["inflight"] = None
+        push()
+    GLib.child_watch_add(GLib.PRIORITY_DEFAULT, p.pid, done)
+
+
+def apply(v, snap=True):
+    global vol, muted
+    vol = max(0.0, min(1.0, round(v * 100) / 100 if snap else v))
+    muted = False
+    state["want"] = vol
+    set_labels()
+    kick()
+    push()
+    reset_timer()
+
+
+def frac(x):
+    a = slider.get_allocation()
+    return (x - 12) / max(a.width - 24, 1)
+
+
+def drag_poll():
+    """While dragging, read the real pointer: follows it outside the slider and ends the drag on release
+    wherever the button comes up (events outside the slider never reach its handlers)."""
+    if not state["drag"]:
+        return False
+    gw = slider.get_window()
+    if gw is None:
+        state["drag"] = False
+        return False
+    pointer = Gdk.Display.get_default().get_default_seat().get_pointer()
+    _, x, _y, mask = gw.get_device_position(pointer)
+    if not (mask & Gdk.ModifierType.BUTTON1_MASK):
+        end_drag(frac(x))
+        return False
+    f = max(0.0, min(1.0, frac(x)))
+    if abs(f - vol) > 0.004:
+        apply(f)
+    return True
+
+
+def end_drag(f):
+    if state["drag"]:
+        state["drag"] = False
+        apply(f)
+        kick()
+
+
+def on_press(w, e):
+    if e.button == 1:
+        state["drag"] = True
+        apply(frac(e.x))
+        GLib.timeout_add(8, drag_poll)
+    return True
+
+
+def on_motion(w, e):
+    if state["drag"]:
+        apply(frac(e.x))
+    return True
+
+
+def on_release(w, e):
+    end_drag(frac(e.x))
+    return True
+
+
+def on_scroll(w, e):
+    d = 0.05 if e.direction == Gdk.ScrollDirection.UP else -0.05 if e.direction == Gdk.ScrollDirection.DOWN else 0
+    if d:
+        apply(vol + d)
+    return True
+
+
+def on_enter(w, e):
+    state["hover"] = True; kick()
+
+
+def on_leave(w, e):
+    state["hover"] = False; kick()
+
+
+slider.connect("button-press-event", on_press)
+slider.connect("motion-notify-event", on_motion)
+slider.connect("button-release-event", on_release)
+slider.connect("scroll-event", on_scroll)
+slider.connect("enter-notify-event", on_enter)
+slider.connect("leave-notify-event", on_leave)
+
+
+def toggle_mute(w, e):
+    global muted
+    subprocess.Popen(["timeout", "2", "sh", "-c", f"wpctl set-mute {SINK} toggle; pkill -RTMIN+10 -x dwm-status"])
+    muted = not muted
+    set_labels(); kick(); reset_timer()
+    return True
+
+
+icon.connect("button-press-event", toggle_mute)
+
+
+# ---- device pickers (click mode) -------------------------------------------
+micstate = dict(on=False, level=0.0)
+meter = Gtk.DrawingArea()
+stack = Gtk.Stack()
+stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+stack.set_transition_duration(160)
+
+
+def devices(kind):
+    """kind: sinks | sources -> (list of (name, description), default_name)"""
+    try:
+        data = json.loads(run("pactl", "--format=json", "list", kind) or "[]")
+    except Exception:
+        data = []
+    default = run("pactl", "get-default-" + kind[:-1]).strip()
+    out = []
+    for d in data:
+        if kind == "sources" and (d.get("monitor_source") or d["name"].endswith(".monitor") or d.get("monitor_of_sink") is not None):
+            continue
+        out.append((d["name"], d.get("description") or d["name"]))
+    return out, default
+
+
+def short(s, n=30):
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def set_default(kind, name):
+    def job():
+        run("pactl", "set-default-" + kind[:-1], name)
+        if kind == "sinks":
+            for ln in run("pactl", "list", "short", "sink-inputs").splitlines():
+                run("pactl", "move-sink-input", ln.split()[0], name)
+        else:
+            for ln in run("pactl", "list", "short", "source-outputs").splitlines():
+                run("pactl", "move-source-output", ln.split()[0], name)
+        subprocess.Popen(["pkill", "-RTMIN+10", "-x", "dwm-status"])
+        GLib.idle_add(refresh_pickers)
+    threading.Thread(target=job, daemon=True).start()
+
+
+class Picker(Gtk.Button):
+    def __init__(self, title, kind):
+        super().__init__()
+        self.kind = kind
+        b = Gtk.Box(spacing=10)
+        t = Gtk.Label(); t.set_markup(f'<span size="9500" weight="bold" foreground="{c["dim"]}">{title}</span>')
+        t.set_width_chars(7); t.set_xalign(0)
+        self.name = Gtk.Label(xalign=0); self.name.set_hexpand(True)
+        self.name.set_ellipsize(Pango.EllipsizeMode.END); self.name.set_max_width_chars(24)
+        ch = Gtk.Label(label="›")
+        b.pack_start(t, False, False, 0); b.pack_start(self.name, True, True, 0); b.pack_end(ch, False, False, 0)
+        self.add(b)
+        self.set_relief(Gtk.ReliefStyle.NONE)
+        self.connect("clicked", lambda *_: open_list(self.kind, title))
+
+    def refresh(self):
+        lst, d = devices(self.kind)
+        self.name.set_text(short(next((x[1] for x in lst if x[0] == d), "No device" if not lst else lst[0][1])))
+        if self.kind == "sources":
+            mic_btn.set_sensitive(bool(lst))
+            if not lst: self.name.set_text("No microphone detected")
+
+
+mic_btn = Gtk.Button(label="Test microphone")
+outp = Picker("Output", "sinks")
+inp = Picker("Input", "sources")
+
+
+def refresh_pickers():
+    outp.refresh(); inp.refresh()
+    return False
+
+
+def ensure_input():
+    """USB headsets often sit on an output-only profile: switch to the one with a mono input."""
+    if devices("sources")[0]:
+        return
+    try:
+        cards = json.loads(run("pactl", "--format=json", "list", "cards") or "[]")
+    except Exception:
+        return
+    for cd in cards:
+        profs = cd.get("profiles", {})
+        cur = cd.get("active_profile", "")
+        if "input:" in cur or not cur.startswith("output:"):
+            continue
+        for n in profs:
+            if n == cur + "+input:mono-fallback" or (n.startswith(cur + "+input") and profs[n].get("available", True)):
+                run("pactl", "set-card-profile", cd["name"], n)
+                GLib.idle_add(refresh_pickers)
+                return
+
+
+listbox_holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+
+def open_list(kind, title):
+    for ch in listbox_holder.get_children():
+        listbox_holder.remove(ch)
+    back = Gtk.Button(label=f"‹   {title}")
+    back.set_relief(Gtk.ReliefStyle.NONE)
+    back.get_child().set_xalign(0)
+    back.connect("clicked", lambda *_: stack.set_visible_child_name("main"))
+    listbox_holder.pack_start(back, False, False, 0)
+    lst, d = devices(kind)
+    for name, desc in lst:
+        b = Gtk.Button()
+        lab = Gtk.Label(xalign=0)
+        lab.set_ellipsize(Pango.EllipsizeMode.END); lab.set_max_width_chars(30)
+        sel = name == d
+        lab.set_markup(f'<span {"weight=\"bold\" foreground=\"" + c["accent"] + "\"" if sel else ""}>{GLib.markup_escape_text(short(desc, 34))}</span>')
+        bx = Gtk.Box(spacing=8)
+        bx.pack_start(lab, True, True, 0)
+        if sel:
+            bx.pack_end(Gtk.Label(label="✓"), False, False, 0)
+        b.add(bx); b.set_relief(Gtk.ReliefStyle.NONE)
+
+        def pick(_b, n=name):
+            set_default(kind, n)
+            stack.set_visible_child_name("main")
+        b.connect("clicked", pick)
+        listbox_holder.pack_start(b, False, False, 0)
+    listbox_holder.show_all()
+    stack.set_visible_child_name("list")
+
+
+# ---- mic test: record 4 s with a live meter, then play it back -----------------
+mic_btn.set_relief(Gtk.ReliefStyle.NONE)
+meter.set_size_request(-1, 10)
+meter.set_valign(Gtk.Align.CENTER)
+
+
+def draw_meter(w, cr):
+    a = w.get_allocation()
+    h = 8
+    y = (a.height - h) / 2
+    rice.rounded(cr, 0, y, a.width, h, h / 2)
+    cr.set_source_rgba(*rice.rgb(c["border"], 0.85)); cr.fill()
+    fw = a.width * min(1.0, mic.x)
+    if fw > 1:
+        cr.save(); rice.rounded(cr, 0, y, a.width, h, h / 2); cr.clip()
+        rice.rounded(cr, -h, y, fw + h, h, h / 2)
+        cr.set_source_rgba(*rice.rgb(c["accent2"] if micstate["phase"] == "play" else c["accent"])); cr.fill(); cr.restore()
+    return False
+
+
+micstate["phase"] = "idle"
+meter.connect("draw", draw_meter)
+
+
+def mic_test(*_):
+    if micstate["on"] or micstate["phase"] != "idle":
+        return
+
+    def job():
+        micstate["on"] = True; micstate["phase"] = "rec"
+        GLib.idle_add(lambda: (mic_btn.set_label("Recording… speak"), kick()) and False)
+        buf = bytearray()
+        try:
+            p = subprocess.Popen(["timeout", "4", "parec", "--format=s16le", "--rate=16000", "--channels=1",
+                                  "--latency-msec=30"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            while True:
+                chunk = p.stdout.read(1024)
+                if not chunk:
+                    break
+                buf += chunk
+                n = len(chunk) // 2
+                if n:
+                    import array
+                    a = array.array("h", chunk[: n * 2])
+                    rms = math.sqrt(sum(x * x for x in a) / n) / 32768.0
+                    micstate["level"] = min(1.0, rms * 5)
+                GLib.idle_add(kick)
+        except Exception:
+            pass
+        micstate["on"] = False
+        micstate["phase"] = "play"
+        GLib.idle_add(lambda: (mic_btn.set_label("Playing back…"), False)[1])
+        try:
+            q = subprocess.Popen(["timeout", "6", "paplay", "--raw", "--rate=16000", "--channels=1", "--format=s16le"],
+                                 stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            # fake meter while playing: follow the recorded envelope
+            q.stdin.write(bytes(buf)); q.stdin.close(); q.wait()
+        except Exception:
+            pass
+        micstate["phase"] = "idle"
+        micstate["level"] = 0.0
+        GLib.idle_add(lambda: (mic_btn.set_label("Test microphone"), kick(), False)[2])
+    threading.Thread(target=job, daemon=True).start()
+
+
+mic_btn.connect("clicked", mic_test)
+
+if CLICK:
+    main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    root.remove(row)
+    main.pack_start(row, False, False, 0)
+    sep = Gtk.Box(); sep.set_size_request(-1, 6)
+    main.pack_start(sep, False, False, 0)
+    main.pack_start(outp, False, False, 0)
+    main.pack_start(inp, False, False, 0)
+    mrow = Gtk.Box(spacing=12)
+    mrow.pack_start(mic_btn, False, False, 0)
+    mrow.pack_start(meter, True, True, 0)
+    main.pack_start(mrow, False, False, 4)
+    stack.add_named(main, "main")
+    stack.add_named(listbox_holder, "list")
+    root.pack_start(stack, True, True, 0)
+    refresh_pickers()
+    threading.Thread(target=ensure_input, daemon=True).start()
+win.add(root)
+
+
+def poll():
+    """Follow outside changes (headset wheel, keys) while open."""
+    global vol, muted
+    if not state["drag"] and not state["want"] and not state["inflight"]:
+        vol, muted = get_vol()
+        set_labels(); kick()
+    return True
+
+
+# ---- closing ------------------------------------------------------------
+timer = [None]
+
+
+def close():
+    if not state["closing"]:
+        micstate["on"] = False
+        state["closing"] = True
+        win.quit_anim()
+    return False
+
+
+def idle_close():
+    timer[0] = None
+    if state["drag"]:
+        reset_timer()
+        return False
+    return close()
+
+
+def reset_timer():
+    if timer[0]:
+        GLib.source_remove(timer[0])
+        timer[0] = None
+    if OSD:
+        timer[0] = GLib.timeout_add(2000, idle_close)
+
+
+def on_key(w, e):
+    if e.keyval == Gdk.KEY_Escape:
+        if CLICK and stack.get_visible_child_name() == "list":
+            stack.set_visible_child_name("main")
+        else:
+            close()
+    return True
+
+
+def on_win_press(w, e):
+    a = win.get_allocation()
+    if e.button == 3 or not (0 <= e.x <= a.width and 0 <= e.y <= a.height):
+        close()
+        return True
+    return False
+
+
+def grab():
+    seat = Gdk.Display.get_default().get_default_seat()
+    if seat.grab(win.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None) == Gdk.GrabStatus.SUCCESS:
+        return False
+    grab.n += 1
+    return grab.n < 30
+
+
+grab.n = 0
+win.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.SCROLL_MASK)
+win.connect("scroll-event", on_scroll)
+win.connect("key-press-event", on_key)
+win.connect("button-press-event", on_win_press)
+
+
+def on_usr1():
+    if state["closing"]:
+        state["pending"] = True
+    else:
+        poll()
+        reset_timer()
+    return True
+
+
+# ---- placement ----------------------------------------------------------
+disp = Gdk.Display.get_default()
+if AT and CLICK:
+    mon = disp.get_monitor_at_point(*AT) or disp.get_primary_monitor()
+    g = mon.get_geometry()
+    x = min(max(AT[0] - W // 2, g.x + 12), g.x + g.width - W - 12)
+    y = AT[1] + 8
+else:
+    _, px, py = disp.get_default_seat().get_pointer().get_position()
+    mon = disp.get_monitor_at_point(px, py) or disp.get_primary_monitor()
+    g = mon.get_geometry()
+    x = g.x + (g.width - W) // 2
+    y = g.y + (g.height - H) // 2 if OSD else g.y + 70   # volume keys: dead centre
+if AT and CLICK:
+    win.origin = AT        # pops out of the volume icon that was clicked
+win.move(x, y)
+lvl.x = lvl.t = target()
+set_labels()
+win.show_all()
+if CLICK:
+    GLib.timeout_add(60, grab)
+GLib.timeout_add(1000, poll)
+reset_timer()
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, on_usr1)
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (close(), True)[1])
+Gtk.main()
+
+try:
+    os.remove(PID)
+except OSError:
+    pass
+if state["pending"]:
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), "--osd"])

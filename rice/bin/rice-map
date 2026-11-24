@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""Canvas zoom (Mod+z): the whole canvas zooms out like a camera. Scroll = zoom at the cursor,
+drag background = pan, drag a window = move it, click a window = zoom into it, middle click closes it,
+arrows = next window, f = fit all, 0 = back to 100%, Esc/Enter = leave (windows end up where the camera was)."""
+import os, sys, math, ctypes, ctypes.util, signal, subprocess, fcntl
+signal.signal(signal.SIGUSR1, signal.SIG_IGN)      # keep early signals from killing us during the slow GTK import
+CACHE = os.path.expanduser("~/.cache/rice"); os.makedirs(CACHE, exist_ok=True)
+PIDF, ZOOMF = f"{CACHE}/map.pid", f"{CACHE}/map.zoom"
+CHILD = "--mon" in sys.argv
+ZARG = sys.argv[sys.argv.index("--zoom") + 1] if "--zoom" in sys.argv and sys.argv.index("--zoom") + 1 < len(sys.argv) else None
+if not CHILD:
+    _lk = open(f"{CACHE}/map.lock", "w"); fcntl.flock(_lk, fcntl.LOCK_EX)
+    try:
+        _op = int(open(PIDF).read().strip())
+        if "rice-map" not in open(f"/proc/{_op}/cmdline").read():
+            raise OSError
+    except Exception:
+        _op = None
+    if _op:                                   # already open: a scroll step goes to it, Mod+z again closes it
+        if ZARG:
+            with open(ZOOMF, "a") as _f: _f.write("+" if ZARG == "in" else "-")
+            os.kill(_op, signal.SIGUSR1)
+        else:
+            os.kill(_op, signal.SIGTERM)
+        sys.exit(0)
+    open(PIDF, "w").write(str(os.getpid()))
+    if ZARG:
+        open(ZOOMF, "w").write("+" if ZARG == "in" else "-")      # the step that opened us
+    else:
+        try: os.unlink(ZOOMF)
+        except OSError: pass
+    fcntl.flock(_lk, fcntl.LOCK_UN)
+SCROLLMODE = bool(ZARG)
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import rice, widgets as w
+import gi
+gi.require_version("GdkX11", "3.0")
+from gi.repository import GdkX11
+from rice import Gtk, Gdk, GLib
+import cairo
+
+# ---- tiny X client: talk to dwm through _RICE_CMD, read _RICE_MAP -----------------------------
+X = ctypes.CDLL(ctypes.util.find_library("X11"))
+X.XOpenDisplay.restype = ctypes.c_void_p
+X.XOpenDisplay.argtypes = [ctypes.c_char_p]
+X.XDefaultRootWindow.restype = ctypes.c_ulong
+X.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+X.XInternAtom.restype = ctypes.c_ulong
+X.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+X.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+X.XGetWindowProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long,
+                                 ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                 ctypes.c_void_p, ctypes.c_void_p]
+X.XFlush.argtypes = [ctypes.c_void_p]
+X.XFree.argtypes = [ctypes.c_void_p]
+DPY = X.XOpenDisplay(None)
+ROOT = X.XDefaultRootWindow(DPY)
+A_CMD = X.XInternAtom(DPY, b"_RICE_CMD", 0)
+A_MAP = None   # set once we know our monitor: dwm answers on _RICE_MAP_<mx>_<my>
+CARD = 6
+
+
+def cmd(*vals):
+    arr = (ctypes.c_long * len(vals))(*[int(v) for v in vals])
+    X.XChangeProperty(DPY, ROOT, A_CMD, CARD, 32, 0, ctypes.byref(arr), len(vals))
+    X.XFlush(DPY)
+
+
+def read_map():
+    at = ctypes.c_ulong(); fmt = ctypes.c_int(); n = ctypes.c_ulong(); after = ctypes.c_ulong()
+    p = ctypes.c_void_p()
+    if X.XGetWindowProperty(DPY, ROOT, A_MAP, 0, 600, 0, CARD, ctypes.byref(at), ctypes.byref(fmt),
+                            ctypes.byref(n), ctypes.byref(after), ctypes.byref(p)) != 0 or not p.value or n.value < 10:
+        return None
+    arr = ctypes.cast(p, ctypes.POINTER(ctypes.c_ulong))
+    v = [arr[i] & 0xffffffff for i in range(n.value)]
+    X.XFree(p)
+    v = [x - (1 << 32) if x >= (1 << 31) else x for x in v]
+    mon = dict(mx=v[0], my=v[1], mw=v[2], mh=v[3], wx=v[4], wy=v[5], ww=v[6], wh=v[7], canvas=v[8])
+    wins = []
+    for i in range(v[9]):
+        b = 10 + i * 6
+        if b + 6 > len(v):
+            break
+        wins.append(dict(id=v[b] & 0xffffffff, x=v[b + 1], y=v[b + 2], w=v[b + 3], h=v[b + 4], sel=v[b + 5]))
+    return mon, wins
+
+
+
+import time
+# ---- overlay: covers the monitor; at zoom 100% and the camera on the work area it is pixel-identical to the screen
+d = Gdk.Display.get_default()
+if CHILD:
+    i_ = sys.argv.index("--mon"); px_, py_ = int(sys.argv[i_ + 1]), int(sys.argv[i_ + 2])
+else:
+    _, px_, py_ = d.get_default_seat().get_pointer().get_position()
+mon0 = d.get_monitor_at_point(px_, py_) or d.get_primary_monitor()
+g0 = mon0.get_geometry()
+MX, MY = g0.x + g0.width // 2, g0.y + g0.height // 2     # a point on our monitor: dwm picks the monitor with it
+A_MAP = X.XInternAtom(DPY, b"_RICE_MAP_%d_%d" % (g0.x, g0.y), 0)
+KIDS = []
+if not CHILD and not SCROLLMODE:    # one overlay per monitor, each with its own camera; this one (pointer monitor) owns the keyboard
+    for k in range(d.get_n_monitors()):
+        m_ = d.get_monitor(k)
+        if m_.get_geometry().x != g0.x or m_.get_geometry().y != g0.y:
+            gg = m_.get_geometry()
+            KIDS.append(subprocess.Popen([sys.argv[0], "--mon", str(gg.x + gg.width // 2), str(gg.y + gg.height // 2)],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+C = rice.colors()
+cmd(6, MX, MY); time.sleep(0.12)
+r0 = read_map()
+if not r0:
+    if not CHILD:      # old dwm (no _RICE_MAP) or no windows: say so instead of doing nothing
+        w.toast("Map: no data from dwm. Run sudo make install, then Mod+Shift+q", 3.2)
+        GLib.timeout_add(3600, Gtk.main_quit); Gtk.main()
+    sys.exit(0)
+if SCROLLMODE and not CHILD and not r0[0]["canvas"]:     # zooming only means something on a canvas
+    try: os.unlink(PIDF)
+    except OSError: pass
+    sys.exit(0)
+S = dict(mon=r0[0], wins=r0[1], thumb={}, cls={}, hover=None, drag=None, pick=None, leaving=False, rr=0, dirty=True, hint=1.0)
+M = S["mon"]
+CX0, CY0 = M["wx"] + M["ww"] / 2, M["wy"] + M["wh"] / 2
+RCX, RCY = M["wx"] - M["mx"] + M["ww"] / 2, M["wy"] - M["my"] + M["wh"] / 2
+cam = dict(s=1.0, cx=CX0, cy=CY0)
+tgt = dict(s=1.0, cx=CX0, cy=CY0)
+MINS, MAXS = 0.04, 2.5
+
+win = Gtk.Window(type=Gtk.WindowType.POPUP)
+win.set_wmclass("rice", "RiceMap")
+win.set_app_paintable(True)
+win.set_default_size(g0.width, g0.height); win.set_size_request(g0.width, g0.height)
+win.move(g0.x, g0.y)
+area = Gtk.DrawingArea()
+area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+win.add(area)
+
+
+def to_scr(X, Y):
+    return (X - cam["cx"]) * cam["s"] + RCX, (Y - cam["cy"]) * cam["s"] + RCY
+
+
+def to_world(x, y):
+    return (x - RCX) / cam["s"] + cam["cx"], (y - RCY) / cam["s"] + cam["cy"]
+
+
+def wclass(wid):
+    if wid not in S["cls"]:
+        try:
+            o = subprocess.run(["xprop", "-id", str(wid), "WM_CLASS"], capture_output=True, text=True, timeout=1).stdout
+            s = o.split("=", 1)[1].split(",")[-1].strip().strip('"')
+        except Exception:
+            s = "window"
+        s = s.replace("-256color", "")
+        S["cls"][wid] = s[:1].upper() + s[1:]
+    return S["cls"][wid]
+
+
+def order():
+    return sorted(S["wins"], key=lambda c: c["sel"])
+
+
+def hit(x, y):
+    X, Y = to_world(x, y)
+    for c in reversed(order()):
+        if c["x"] <= X <= c["x"] + c["w"] and c["y"] <= Y <= c["y"] + c["h"]:
+            return c
+    return None
+
+
+def fit_box(x1, y1, x2, y2, margin=0.88):
+    usable = g0.height - 80          # keep clear of the hint pill at the bottom
+    s = min(g0.width * margin / max(1, x2 - x1), usable * margin / max(1, y2 - y1), 1.0)
+    return max(MINS, s), (x1 + x2) / 2, (y1 + y2) / 2 + 40 / max(s, MINS)
+
+
+def fit_all():
+    x1, y1, x2, y2 = M["wx"], M["wy"], M["wx"] + M["ww"], M["wy"] + M["wh"]
+    for c in S["wins"]:
+        x1 = min(x1, c["x"]); y1 = min(y1, c["y"]); x2 = max(x2, c["x"] + c["w"]); y2 = max(y2, c["y"] + c["h"])
+    s, cx, cy = fit_box(x1, y1, x2, y2, 0.86)
+    tgt.update(s=s, cx=cx, cy=cy)
+
+
+def look_at(c, zoom=None):
+    s, cx, cy = fit_box(c["x"], c["y"], c["x"] + c["w"], c["y"] + c["h"], 0.78 if zoom is None else 1)
+    tgt.update(s=zoom or s, cx=cx, cy=cy)
+
+
+def draw(wd, cr):
+    s = cam["s"]
+    cr.set_source_rgba(*rice.rgb(C["bg"], 1)); cr.paint()
+    # dot grid in world space
+    step = 100 * s
+    while step < 16:
+        step *= 2
+    if step > 0:
+        ox, oy = to_scr(0, 0)
+        cr.set_source_rgba(*rice.rgb(C["fg"], 0.16))
+        yy = oy % step
+        while yy < g0.height:
+            xx = ox % step
+            while xx < g0.width:
+                cr.arc(xx, yy, 1.4, 0, 6.3); cr.fill()
+                xx += step
+            yy += step
+    # what the real screen shows
+    x0, y0 = to_scr(M["wx"], M["wy"])
+    if s < 0.97:
+        rice.rounded(cr, x0, y0, M["ww"] * s, M["wh"] * s, 10 * s + 2)
+        cr.set_source_rgba(*rice.rgb(C["fg"], 0.04)); cr.fill_preserve()
+        cr.set_source_rgba(*rice.rgb(C["accent"], 0.7)); cr.set_line_width(2); cr.set_dash([8, 6]); cr.stroke()
+        cr.set_dash([])
+    for c in order():
+        rx, ry = to_scr(c["x"], c["y"])
+        rw, rh = c["w"] * s, c["h"] * s
+        if rx > g0.width or ry > g0.height or rx + rw < 0 or ry + rh < 0 or rw < 1.5 or rh < 1.5:
+            continue
+        rad = min(12 * s, rw / 4, rh / 4)
+        rice.rounded(cr, rx, ry, rw, rh, rad)
+        cr.save(); cr.clip_preserve()
+        cr.set_source_rgba(*rice.rgb(C["bg2"], 1)); cr.fill()
+        pb = S["thumb"].get(c["id"])
+        if pb:
+            cr.translate(rx, ry); cr.scale(rw / pb.get_width(), rh / pb.get_height())
+            Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0); cr.paint()
+        cr.restore()
+        rice.rounded(cr, rx, ry, rw, rh, rad)
+        if c["sel"] or c["id"] == S["pick"]:
+            cr.set_source_rgba(*rice.rgb(C["accent"], 1)); cr.set_line_width(max(1.5, 2.5 * s) if s < 1 else 2)
+        elif S["hover"] == c["id"]:
+            cr.set_source_rgba(*rice.rgb(C["fg"], 0.9)); cr.set_line_width(2)
+        else:
+            cr.set_source_rgba(*rice.rgb(C["fg"], 0.3)); cr.set_line_width(1)
+        cr.stroke()
+        if s < 0.9 and rw > 60:
+            lab = wclass(c["id"])
+            cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(12)
+            ext = cr.text_extents(lab)
+            lw = min(ext.width + 16, rw - 10)
+            rice.rounded(cr, rx + 8, ry + 8, lw, 20, 10)
+            cr.set_source_rgba(*rice.rgb(C["bg"], 0.82)); cr.fill()
+            cr.save(); cr.rectangle(rx + 8, ry + 8, lw, 20); cr.clip()
+            cr.set_source_rgba(*rice.rgb(C["fg"], 0.95)); cr.move_to(rx + 16, ry + 22); cr.show_text(lab)
+            cr.restore()
+    # zoom pill
+    if s < 0.99 or S["hint"] > 0.02:
+        txt = f"{round(s * 100)}%   scroll zoom · drag pan · click window · f fit · 0 reset · esc"
+        if not M["canvas"]:
+            txt = f"{round(s * 100)}%   tiled layout: focus only · Mod+Shift+g for canvas · esc"
+        cr.select_font_face(rice.FONT, 0, 0); cr.set_font_size(12)
+        ext = cr.text_extents(txt)
+        pw = ext.width + 28
+        rice.rounded(cr, (g0.width - pw) / 2, g0.height - 54, pw, 28, 14)
+        cr.set_source_rgba(*rice.rgb(C["bg2"], 0.92)); cr.fill()
+        cr.set_source_rgba(*rice.rgb(C["fg"], 0.8)); cr.move_to((g0.width - pw) / 2 + 14, g0.height - 35); cr.show_text(txt)
+    return False
+
+
+area.connect("draw", draw)
+
+
+def finish(pick=None):
+    """Camera glides back to 100%; then the real windows are shifted by the same amount and we leave."""
+    if S["leaving"]:
+        return
+    S["leaving"] = True
+    S["drag"] = None
+    for k in KIDS:   # leave on every monitor together; each one shifts its own canvas
+        try: k.send_signal(signal.SIGTERM)
+        except Exception: pass
+    if pick:
+        tgt.update(s=1.0, cx=pick["x"] + pick["w"] / 2, cy=pick["y"] + pick["h"] / 2)
+    else:
+        tgt.update(s=1.0, cx=tgt["cx"], cy=tgt["cy"])
+    S["pick_final"] = pick
+
+
+def conclude():
+    dx, dy = round(CX0 - cam["cx"]), round(CY0 - cam["cy"])
+    # dwm reads the property when the event arrives, so back-to-back writes would swallow each other
+    if M["canvas"] and (dx or dy):
+        cmd(8, dx, dy, MX, MY)
+    p = S.get("pick_final")
+    fid = p["id"] if p else S["pick"]
+    if fid:
+        GLib.timeout_add(40 if not CHILD else 60, lambda: (cmd(9, fid), False)[1])
+    def bye():
+        for k in KIDS:
+            try: k.terminate()
+            except Exception: pass
+        Gtk.main_quit(); return False
+    GLib.timeout_add(150, bye)
+
+
+def zoom_at(x, y, f):
+    wx_, wy_ = (x - RCX) / tgt["s"] + tgt["cx"], (y - RCY) / tgt["s"] + tgt["cy"]
+    ns = min(MAXS, max(MINS, tgt["s"] * f))
+    tgt["s"] = ns
+    tgt["cx"] = wx_ - (x - RCX) / ns
+    tgt["cy"] = wy_ - (y - RCY) / ns
+    S["hint"] = 0
+    if SCROLLMODE and 0.97 <= ns <= 1.03 and not S["leaving"]:     # back at 100%: leave, like un-zooming the desktop
+        finish()
+
+
+def scroll_steps(*_):
+    """Mod+scroll notches sent by new rice-map calls (SIGUSR1 + ~/.cache/rice/map.zoom)."""
+    try:
+        steps = open(ZOOMF).read(); open(ZOOMF, "w").close()
+    except OSError:
+        return True
+    ptr = Gdk.Display.get_default().get_default_seat().get_pointer().get_position()
+    px, py = ptr[1] - g0.x, ptr[2] - g0.y
+    for ch in steps:
+        if not S["leaving"]:
+            zoom_at(px, py, 1.18 if ch == "+" else 1 / 1.18)
+    return True
+
+
+def on_scroll(wd, e):
+    if S["leaving"]:
+        return True
+    if e.direction == Gdk.ScrollDirection.UP: f = 1.18
+    elif e.direction == Gdk.ScrollDirection.DOWN: f = 1 / 1.18
+    elif e.direction == Gdk.ScrollDirection.SMOOTH: f = math.exp(-e.delta_y * 0.16)
+    else: return False
+    zoom_at(e.x, e.y, f)
+    return True
+
+
+def on_press(wd, e):
+    if S["leaving"]:
+        return True
+    global SCROLLMODE
+    SCROLLMODE = False
+    c = hit(e.x, e.y)
+    if e.button == 2:
+        if c:
+            subprocess.Popen(["xdotool", "windowclose", str(c["id"])], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            S["wins"] = [o for o in S["wins"] if o is not c]
+        return True
+    if e.button == 3:
+        finish(); return True
+    if e.button != 1:
+        return False
+    S["drag"] = dict(x0=e.x, y0=e.y, c=c, moved=False, cx=tgt["cx"], cy=tgt["cy"], wx=c["x"] if c else 0, wy=c["y"] if c else 0, s=cam["s"])
+    return True
+
+
+def on_motion(wd, e):
+    dr = S["drag"]
+    if not dr:
+        c = hit(e.x, e.y); hid = c["id"] if c else None
+        if hid != S["hover"]:
+            S["hover"] = hid; S["dirty"] = True
+        return False
+    if not dr["moved"] and math.hypot(e.x - dr["x0"], e.y - dr["y0"]) < 5:
+        return True
+    dr["moved"] = True
+    s = dr["s"]
+    ddx, ddy = (e.x - dr["x0"]) / s, (e.y - dr["y0"]) / s
+    if dr["c"] and M["canvas"]:
+        c = dr["c"]
+        c["x"], c["y"] = round(dr["wx"] + ddx), round(dr["wy"] + ddy)
+        cmd(10, c["id"], c["x"], c["y"])
+    else:
+        # pan: camera moves against the drag, at once (no glide while dragging)
+        tgt["cx"] = cam["cx"] = dr["cx"] - ddx
+        tgt["cy"] = cam["cy"] = dr["cy"] - ddy
+    S["dirty"] = True
+    return True
+
+
+def on_release(wd, e):
+    dr = S["drag"]; S["drag"] = None
+    if not dr or e.button != 1 or S["leaving"]:
+        return False
+    if not dr["moved"] and dr["c"]:
+        finish(dr["c"])
+    elif dr["moved"] and dr["c"]:
+        cmd(9, dr["c"]["id"])
+    return True
+
+
+area.connect("scroll-event", on_scroll)
+area.connect("button-press-event", on_press)
+area.connect("motion-notify-event", on_motion)
+area.connect("button-release-event", on_release)
+
+
+def neighbour(dxs, dys):
+    wins = S["wins"]
+    if not wins:
+        return
+    cur = next((c for c in wins if c["id"] == S["pick"]), None) or next((c for c in wins if c["sel"]), None)
+    cx = cur["x"] + cur["w"] / 2 if cur else tgt["cx"]
+    cy = cur["y"] + cur["h"] / 2 if cur else tgt["cy"]
+    best, bs = None, 1e18
+    for c in wins:
+        if c is cur:
+            continue
+        ex, ey = c["x"] + c["w"] / 2 - cx, c["y"] + c["h"] / 2 - cy
+        along, across = ex * dxs + ey * dys, abs(ex * dys) + abs(ey * dxs)
+        if along > 0 and along + 2 * across < bs:
+            best, bs = c, along + 2 * across
+    if best:
+        S["pick"] = best["id"]; look_at(best)
+
+
+def on_key(wd, e):
+    global SCROLLMODE
+    SCROLLMODE = False
+    k = e.keyval
+    if S["leaving"]:
+        return True
+    if k == Gdk.KEY_Escape or k == Gdk.KEY_q:
+        finish(); return True
+    if k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+        finish(next((c for c in S["wins"] if c["id"] == S["pick"]), None)); return True
+    if k == Gdk.KEY_Left: neighbour(-1, 0)
+    elif k == Gdk.KEY_Right: neighbour(1, 0)
+    elif k == Gdk.KEY_Up: neighbour(0, -1)
+    elif k == Gdk.KEY_Down: neighbour(0, 1)
+    elif k in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):      # cycle through windows
+        wl = sorted(S["wins"], key=lambda c: (c["x"], c["y"]))
+        if wl:
+            i = next((n for n, c in enumerate(wl) if c["id"] == (S["pick"] or next((o["id"] for o in wl if o["sel"]), None))), -1)
+            c = wl[(i + (-1 if k == Gdk.KEY_ISO_Left_Tab else 1)) % len(wl)]
+            S["pick"] = c["id"]; look_at(c)
+    elif k in (Gdk.KEY_f, Gdk.KEY_h): fit_all()
+    elif k in (Gdk.KEY_0, Gdk.KEY_KP_0): tgt.update(s=1.0, cx=CX0, cy=CY0)
+    elif k in (Gdk.KEY_plus, Gdk.KEY_equal): zoom_at(g0.width / 2, g0.height / 2, 1.3)
+    elif k == Gdk.KEY_minus: zoom_at(g0.width / 2, g0.height / 2, 1 / 1.3)
+    else: return False
+    return True
+
+
+win.connect("key-press-event", on_key)
+last = [time.monotonic()]
+
+
+def step():
+    now = time.monotonic(); dt = min(0.05, now - last[0]); last[0] = now
+    k = 1 - math.exp(-dt * 13)
+    ds = tgt["s"] / cam["s"]
+    moving = abs(math.log(ds)) > 0.0008 or abs(tgt["cx"] - cam["cx"]) * cam["s"] > 0.2 or abs(tgt["cy"] - cam["cy"]) * cam["s"] > 0.2
+    if moving and not S["drag"]:
+        cam["s"] *= math.exp(math.log(ds) * k)
+        cam["cx"] += (tgt["cx"] - cam["cx"]) * k
+        cam["cy"] += (tgt["cy"] - cam["cy"]) * k
+        S["dirty"] = True
+    elif not S["drag"]:
+        cam.update(tgt)
+        if S["leaving"] and not S.get("done"):
+            S["done"] = True; S["dirty"] = True; area.queue_draw()
+            GLib.timeout_add(90 if CHILD else 1, lambda: (conclude(), False)[1])
+    if S["hint"] > 0 and cam["s"] < 0.97:
+        S["hint"] = max(0.0, S["hint"] - dt)
+    if S["dirty"]:
+        S["dirty"] = False; area.queue_draw()
+    return True
+
+
+def refresh_thumbs():
+    wins = [c for c in S["wins"] if True]
+    if not wins:
+        return True
+    disp = Gdk.Display.get_default()
+    s = cam["s"]
+    for _ in range(min(2, len(wins))):
+        S["rr"] = (S["rr"] + 1) % len(wins)
+        c = wins[S["rr"]]
+        x, y = to_scr(c["x"], c["y"])
+        if x > g0.width or y > g0.height or x + c["w"] * s < 0 or y + c["h"] * s < 0:
+            if c["id"] in S["thumb"]:
+                continue
+        try:
+            gw = GdkX11.X11Window.foreign_new_for_display(disp, c["id"])
+            pb = Gdk.pixbuf_get_from_window(gw, 0, 0, c["w"], c["h"]) if gw else None
+            if pb:
+                f = min(1.0, max(0.12, s * 1.1))
+                tw, th = max(8, int(pb.get_width() * f)), max(8, int(pb.get_height() * f))
+                if tw < pb.get_width():
+                    pb = pb.scale_simple(tw, th, 2)
+                S["thumb"][c["id"]] = pb; S["dirty"] = True
+        except Exception:
+            pass
+    return True
+
+
+def poll():
+    if CHILD and os.getppid() == 1:      # primary died: do not leave a blank overlay behind
+        Gtk.main_quit(); return False
+    if not S["drag"] and not S["leaving"]:
+        r = read_map()
+        if r:
+            S["mon"], S["wins"] = r
+            for k in [k for k in S["thumb"] if k not in {c["id"] for c in S["wins"]}]:
+                del S["thumb"][k]
+            S["dirty"] = True
+        cmd(6, MX, MY)
+    return True
+
+
+# first sharp frame before showing, so there is no blank flash
+disp = Gdk.Display.get_default()
+for c in S["wins"]:
+    try:
+        gw = GdkX11.X11Window.foreign_new_for_display(disp, c["id"])
+        pb = Gdk.pixbuf_get_from_window(gw, 0, 0, c["w"], c["h"])
+        if pb:
+            S["thumb"][c["id"]] = pb
+    except Exception:
+        pass
+win.show_all()
+if not CHILD:
+    w.grab_keys(win)
+if not CHILD:
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, scroll_steps)
+if SCROLLMODE:
+    GLib.idle_add(lambda: (scroll_steps(), False)[1])
+else:
+    fit_all()
+GLib.timeout_add(8, step)
+GLib.timeout_add(90, refresh_thumbs)
+GLib.timeout_add(200 if not CHILD else 230, poll)
+signal.signal(signal.SIGTERM, lambda *a: GLib.idle_add(finish))
+Gtk.main()
+if not CHILD:
+    try: os.unlink(PIDF)
+    except OSError: pass

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""rice-lyrics: current synced lyric as plain terminal text, huge and centred, in the terminal you run it in.
+Konsole: zooms its own font (Ctrl+= keys, only while this window has focus) to a big size. Theme colours from colors.json. q/Esc quits."""
+import subprocess, os, sys, time, bisect, threading, select, shutil, termios, tty, json, signal, textwrap
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+from gi.repository import GLib   # mpris.py needs gi
+import mpris, lyrics
+
+COLORS = os.path.expanduser("~/.cache/theme/colors.json")
+DEF = dict(bg="#282a36", fg="#f2f2f5", dim="#8a8ea8", accent="#bd93f9")
+S = dict(key=None, lines=None, title="", pos=0.0, t0=time.monotonic(), playing=False)
+T = dict(c=dict(DEF), mt=0, i=-2, t=0.0, size=None, base=None)
+KONSOLE = bool(os.environ.get("KONSOLE_VERSION"))
+
+
+def theme():
+    try:
+        m = os.stat(COLORS).st_mtime
+        if m != T["mt"]:
+            T["mt"], T["c"] = m, {**DEF, **json.load(open(COLORS))}
+    except Exception:
+        pass
+
+
+def rgb(h):
+    h = h.lstrip("#"); return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def poll():
+    theme()
+    p = mpris.active()
+    inf = mpris.info(p) if p else None
+    if not inf:
+        S.update(key=None, lines=None, title="", playing=False); return
+    S.update(pos=inf["pos"] / 1e6, t0=time.monotonic(), playing=inf["playing"])
+    key = (inf["title"], inf["artist"])
+    if key != S["key"]:
+        S.update(key=key, title=inf["title"], lines=None)
+        def work(k=key, a=inf["artist"], t=inf["title"], l=inf["length"] / 1e6):
+            ln = lyrics.get(a, t, l, timeout=4)
+            if S["key"] == k: S["lines"] = ln or []
+        threading.Thread(target=work, daemon=True).start()
+
+
+def pos():
+    if os.environ.get("RICE_LYR_POS"): return float(os.environ["RICE_LYR_POS"])
+    return S["pos"] + ((time.monotonic() - S["t0"]) if S["playing"] else 0)
+
+
+HOME_COLS = 20                                # pane width in cells at the "home" size: phrases of ~10 chars fill half
+
+
+def focused():
+    """Zoom keys go to the focused window, so only press them when that is this terminal."""
+    try:
+        return subprocess.run(["xdotool", "getwindowfocus"], capture_output=True, text=True, timeout=1).stdout.strip() == os.environ.get("WINDOWID")
+    except Exception:
+        return False
+
+
+def zoom(step):
+    if not focused(): return False
+    subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+equal" if step > 0 else "ctrl+minus"], timeout=1)
+    time.sleep(0.07)
+    return True
+
+
+def wrapped(text, cols):
+    return textwrap.wrap(text, max(cols - 2, 4)) or [text]
+
+
+def fit(text):
+    """Konsole zoom: stay at the home size; shrink only when the wrapped phrase no longer fits the rows."""
+    if not ZOOM: return
+    for _ in range(40):
+        cols, rows = shutil.get_terminal_size()
+        if len(wrapped(text, cols)) > rows - 2 or max(map(len, wrapped(text, cols))) > cols - 2:
+            if not zoom(-1): return
+        else:
+            break
+    for _ in range(40):                          # grow back toward home size while the phrase still fits
+        cols, rows = shutil.get_terminal_size()
+        if cols <= HOME_COLS: return
+        if not zoom(1): return
+        c2, r2 = shutil.get_terminal_size()
+        if len(wrapped(text, c2)) > r2 - 2:
+            zoom(-1); return
+
+
+ZOOM = KONSOLE and bool(os.environ.get("WINDOWID"))
+
+
+def frame():
+    c = T["c"]; FG, DIM = rgb(c["fg"]), rgb(c["dim"])
+    ln, txt, col = S["lines"], "", FG
+    if not S["key"] or ln is None: return None, []
+    if not ln: txt, col = S["title"], DIM
+    else:
+        i = bisect.bisect_right([t for t, _ in ln], pos() + 0.12) - 1
+        txt = ln[i][1] if i >= 0 else ""
+    txt = txt.strip().upper()
+    return col, [txt] if txt else []
+
+
+last = [None]
+
+
+def render():
+    col, texts = frame()
+    txt = texts[0] if texts else ""
+    if txt != last[0]:
+        last[0] = txt
+        sys.stdout.write("\x1b[2J\x1b[H")
+        if txt:
+            fit(txt)
+            cols, rows = shutil.get_terminal_size()
+            ls = wrapped(txt, cols)
+            sys.stdout.write("\x1b[H" + "\n" * max((rows - len(ls)) // 2, 0))
+            for l in ls:
+                sys.stdout.write(" " * max((cols - len(l)) // 2, 0) + f"\x1b[1;38;2;{col[0]};{col[1]};{col[2]}m{l}\x1b[0m\n")
+        sys.stdout.flush()
+
+
+if "--once" in sys.argv:
+    poll(); time.sleep(float(os.environ.get("RICE_LYR_WAIT", "4"))); T["base"] = shutil.get_terminal_size()
+    col, t = frame(); print(wrapped(t[0], T["base"][0]) if t else None); sys.exit(0)
+
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+resized = []
+signal.signal(signal.SIGWINCH, lambda *a: resized.append(1))
+try:
+    tty.setcbreak(fd)
+    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J"); sys.stdout.flush()
+    T["base"] = shutil.get_terminal_size()
+    if ZOOM and focused():
+        subprocess.run(["xdotool", "key", "ctrl+0"]); time.sleep(0.1)
+        for _ in range(60):
+            if shutil.get_terminal_size()[0] <= HOME_COLS or not zoom(1): break
+    poll(); lastpoll = time.monotonic()
+    while True:
+        render()
+        if select.select([sys.stdin], [], [], 0.05)[0]:
+            if os.read(fd, 8) in (b"q", b"\x1b", b"\x03"): break
+        if resized: resized.clear(); last[0] = None
+        if time.monotonic() - lastpoll > 0.8: poll(); lastpoll = time.monotonic()
+finally:
+    if ZOOM and focused(): subprocess.run(["xdotool", "key", "ctrl+0"])
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    sys.stdout.write("\x1b[?25h\x1b[?1049l"); sys.stdout.flush()

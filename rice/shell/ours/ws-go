@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# ws-go N | e+1 | e-1  : go to a dwm tag (Mod = Alt, tags 1-9)
+t=$(xprop -root _RICE_TAGS 2>/dev/null | sed -n 's/.*= *//p' | tr -d ' ')
+IFS=, read -r v _ <<<"${t:-1}"
+cur=1; for i in 1 2 3 4 5 6 7 8 9; do [ $(( (v >> (i-1)) & 1 )) -eq 1 ] && { cur=$i; break; }; done
+case "$1" in
+  e+1) n=$(( cur % 9 + 1 )) ;;
+  e-1) n=$(( (cur + 7) % 9 + 1 )) ;;
+  *) n=$1 ;;
+esac
+exec xdotool key "alt+$n"

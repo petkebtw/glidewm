@@ -1,0 +1,3 @@
+#!/bin/sh
+# app launcher: the rice search card (same animation as the other menus). Old rofi version: rofi-launcher.rofi
+exec rice-search "$@"

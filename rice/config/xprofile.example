@@ -1,0 +1,26 @@
+# ~/.xprofile for the mwm rice. Edit monitor names, wallpaper and keyboard layout.
+export PATH="$HOME/.local/bin:$PATH"
+
+# monitors (names from `xrandr`)
+xrandr --output DP-1 --primary --mode 1920x1080 --pos 0x1080 \
+       --output HDMI-1 --mode 1920x1080 --pos 0x0
+
+xrdb -merge ~/.Xresources
+theme-switch --restore || feh --bg-fill ~/Pictures/wall.jpg &
+
+# compositor (NVIDIA + mixed refresh rates: sync to the fast output)
+# __GL_SYNC_DISPLAY_DEVICE=DP-1 picom --config ~/.config/picom/rice.conf &
+picom --config ~/.config/picom/rice.conf &
+
+rice-supervise dwm-status &
+rice-supervise clip-daemon &
+rice-supervise polkit-agent &
+~/.local/share/dss/dss-start &          # Quickshell shell, after you build it with port.sh
+
+setxkbmap us
+xset s off; xset s noblank; xset -dpms
+export XCURSOR_THEME=Adwaita XCURSOR_SIZE=24
+export NO_AT_BRIDGE=1
+
+(sleep 2; pipewire-pulse) &
+(sleep 3; rice-apply) &

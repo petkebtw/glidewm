@@ -1,0 +1,14 @@
+#!/bin/bash
+# Rice scene: jump to an empty workspace on the main monitor and launch + tile the showcase apps there.
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/rice-scene.lock"; flock -n 9 || exit 0   # one scene at a time (a double call spawned every app twice)
+# (dwm listens for the _RICE_CMD root property; tile layout: first window = master)
+read -r PX PY < <(xrandr --listmonitors | awk '/\*/{split($3,a,"+"); print a[2]+10, a[3]+10; exit}')
+[ -n "$PX" ] || { PX=10; PY=10; }
+xprop -root -f _RICE_CMD 32c -set _RICE_CMD "1, $PX, $PY"
+sleep 0.6
+K="konsole --profile rice --hide-menubar --hide-tabbar"
+# new windows become master, so launch in reverse: asciiquarium, cava, fastfetch, then btop (master)
+setsid -f $K -e asciiquarium >/dev/null 2>&1 9>&-; sleep 0.5
+setsid -f $K -e cava >/dev/null 2>&1 9>&-; sleep 0.5
+setsid -f $K -e sh -c 'clear; fastfetch -c "$HOME/.config/fastfetch/rice.jsonc"; exec sleep infinity' >/dev/null 2>&1 9>&-; sleep 0.5
+setsid -f $K -e btop >/dev/null 2>&1 9>&-

@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Volume OSD: round dial, top center. Reads default sink via wpctl."""
+import os, sys, math, subprocess, signal
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import rice
+from rice import Gtk, GLib, cairo
+
+PID = os.path.expanduser("~/.cache/rice/osd.pid")
+try:  # replace previous instance
+    old = int(open(PID).read())
+    if "rice-osd" in open(f"/proc/{old}/cmdline").read():
+        os.kill(old, signal.SIGTERM)
+except Exception:
+    pass
+open(PID, "w").write(str(os.getpid()))
+
+out = subprocess.run(["timeout", "2", "wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], capture_output=True, text=True).stdout
+try:
+    vol = float(out.split()[1])
+except Exception:
+    vol = 0.0
+muted = "MUTED" in out
+
+win = rice.Card(150, 150, radius=36)
+da = Gtk.DrawingArea()
+win.add(da)
+
+
+def draw(w, cr):
+    c = win.c
+    W, H = 150, 150
+    cx, cy, r = W / 2, H / 2 - 6, 44
+    cr.set_line_width(7)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_source_rgba(*rice.rgb(c["border"], 0.9))
+    cr.arc(cx, cy, r, 0, 2 * math.pi)
+    cr.stroke()
+    frac = min(vol, 1.0)
+    if frac > 0 and not muted:
+        cr.set_source_rgba(*rice.rgb(c["accent"]))
+        cr.arc(cx, cy, r, -math.pi / 2, -math.pi / 2 + 2 * math.pi * frac)
+        cr.stroke()
+    icon = "" if muted or vol == 0 else "" if vol < 0.34 else "" if vol < 0.67 else ""
+    cr.set_source_rgba(*rice.rgb(c["fg"]))
+    cr.select_font_face(rice.ICON_FONT)
+    cr.set_font_size(30)
+    e = cr.text_extents(icon)
+    cr.move_to(cx - e.width / 2 - e.x_bearing, cy + e.height / 2)
+    cr.show_text(icon)
+    label = "muted" if muted else f"{round(vol * 100)}%"
+    cr.set_source_rgba(*rice.rgb(c["dim"]))
+    cr.select_font_face(rice.FONT)
+    cr.set_font_size(13)
+    e = cr.text_extents(label)
+    cr.move_to(W / 2 - e.width / 2 - e.x_bearing, H - 14)
+    cr.show_text(label)
+
+
+da.connect("draw", draw)
+win.top_center(70)
+win.show_all()
+GLib.timeout_add(1400, win.quit_anim)
+Gtk.main()
+try:
+    os.remove(PID)
+except OSError:
+    pass

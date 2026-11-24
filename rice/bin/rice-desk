@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Desktop widgets on the wallpaper (below all windows) with an editable-desktop mode.
+
+  rice-desk            start the daemon (single instance per X display)
+  rice-desk --edit     toggle edit mode (starts the daemon in edit mode if it is not running)
+  rice-desk --add      open the add-widget picker (starts the daemon if needed)
+  rice-desk --reload   re-read ~/.cache/rice/desk.json and the theme
+  rice-desk --stop     fade the widgets out and quit
+Layout: ~/.cache/rice/desk.json. IPC: FIFO $XDG_RUNTIME_DIR/rice-desk-<display>.fifo (also SIGUSR1 = edit,
+SIGUSR2 = add, SIGHUP = reload, SIGTERM = stop on the daemon pid)."""
+import os, sys, errno, fcntl, time
+
+RUN = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+TAG = "".join(ch if ch.isalnum() else "_" for ch in os.environ.get("DISPLAY", ":0").lstrip(":")) or "0"
+FIFO = os.path.join(RUN, f"rice-desk-{TAG}.fifo")
+LOCK = os.path.join(RUN, f"rice-desk-{TAG}.lock")
+CMDS = {"--edit": "edit", "--add": "add", "--reload": "reload", "--stop": "stop", "--save": "save"}
+
+
+def send(cmd):
+    """True if a running daemon took the command."""
+    try:
+        fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        if e.errno in (errno.ENXIO, errno.ENOENT):
+            return False
+        raise
+    try:
+        os.write(fd, (cmd + "\n").encode())
+    finally:
+        os.close(fd)
+    return True
+
+
+def main():
+    args = sys.argv[1:]
+    if any(a in ("-h", "--help") for a in args):
+        print(__doc__.strip()); return 0
+    cmd = next((CMDS[a] for a in args if a in CMDS), None)
+    unknown = [a for a in args if a not in CMDS]
+    if unknown:
+        print(f"rice-desk: unknown option {unknown[0]} (see --help)", file=sys.stderr); return 2
+    if cmd and send(cmd):
+        return 0
+    if cmd in ("reload", "stop", "save"):
+        print("rice-desk: not running", file=sys.stderr); return 1
+    lk = open(LOCK, "w")
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # another daemon holds the lock (maybe still starting): hand it the command
+        if cmd:
+            for _ in range(30):
+                time.sleep(0.1)
+                if send(cmd):
+                    return 0
+        else:
+            print("rice-desk: already running", file=sys.stderr)
+        return 0 if not cmd else 1
+    lk.write(str(os.getpid())); lk.flush()
+    try:
+        if not os.path.exists(FIFO):
+            os.mkfifo(FIFO, 0o600)
+    except FileExistsError:
+        pass
+    sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+    try:
+        import crashlog  # noqa: F401
+    except Exception:
+        pass
+    import desk
+    initial = {"edit": "edit-on", "add": "add"}.get(cmd)
+    try:
+        desk.run(FIFO, initial)
+    finally:
+        try: os.remove(FIFO)
+        except OSError: pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

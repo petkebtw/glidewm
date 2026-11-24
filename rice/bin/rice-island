@@ -1,0 +1,772 @@
+#!/usr/bin/env python3
+"""Dynamic island: a pill in the bar centre (like DarkShadowShell's Dynamic bar).
+
+Idle      clock (+ weather temp)
+Playing   clock + equaliser bars; the pill widens with the track title
+Hover     grows into a media card (title, artist, wavy progress, prev / play / next)
+Click     idle: open the control centre Today tab; card: buttons act
+
+rice-island          start (single instance per X display)
+rice-island --quit   stop it
+rice-island --reload re-read colours (SIGUSR1)
+
+One override-redirect ARGB window at the biggest size; only the drawn pill moves (spring), the input
+shape follows the target rect, so the bar below stays clickable."""
+import os, sys, signal, fcntl, time
+
+signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+CACHE = os.path.expanduser("~/.cache/rice")
+os.makedirs(CACHE, exist_ok=True)
+_disp = (os.environ.get("DISPLAY") or ":0").split(":")[-1].split(".")[0] or "0"
+LOCK, PIDF = os.path.join(CACHE, f"island-{_disp}.lock"), os.path.join(CACHE, f"island-{_disp}.pid")
+ARGS = sys.argv[1:]
+lockf = open(LOCK, "w")
+try:
+    fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if "--reload" in ARGS or "--quit" in ARGS:
+        sys.exit(0)
+except OSError:
+    if "--reload" in ARGS or "--quit" in ARGS:
+        try:
+            os.kill(int(open(PIDF).read()), signal.SIGTERM if "--quit" in ARGS else signal.SIGUSR1)
+        except (OSError, ValueError):
+            pass
+    sys.exit(0)
+open(PIDF, "w").write(str(os.getpid()))
+
+import math, json, subprocess, threading, warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import rice
+from rice import Gtk, Gdk, GLib, cairo
+import cairo as _c
+
+IDLE_H, CARD_W, CARD_H, TOP = 44, 420, 148, 0     # notch: flush with the screen top, 7 px taller than the 37 px bar
+BARC = 18.5                                      # vertical centre of the dwm bar
+TOAST_W, TOAST_H = 420, 98
+# design language -> geometry (colours already come from rice.colors()): corner scale, border px, shadow layers, icon shape
+TOKENS = {"default": dict(r=1.0, bw=1, sh=4, shape="circle"), "material3": dict(r=1.0, bw=0, sh=5, shape="cookie"),
+          "macos": dict(r=0.62, bw=1, sh=6, shape="circle"), "brutal": dict(r=0.0, bw=3, sh=0, shape="square")}
+MAXW, MAXH = CARD_W + 40, CARD_H + 40
+AREA_PAD = 16          # window size (room for the soft shadow)
+RAISE = os.environ.get("RICE_ISLAND_NORAISE") is None
+
+
+def mpris():
+    try:
+        import mpris as m
+        return m
+    except Exception:
+        return None
+
+
+class Island(Gtk.Window):
+    def __init__(self):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.set_wmclass("rice-island", "RiceIsland")
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.set_app_paintable(True)
+        self.set_decorated(False)
+        vis = self.get_screen().get_rgba_visual()
+        if vis:
+            self.set_visual(vis)
+        self.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK |
+                        Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK)
+        self.mp = mpris()
+        self.C = rice.colors()
+        self.player = None
+        self.info = None
+        self.state = "idle"                   # idle | card
+        self.cur = [150.0, float(IDLE_H)]     # drawn pill w, h
+        self.vel = [0.0, 0.0]
+        self.tgt = [150.0, float(IDLE_H)]
+        self.hover = False
+        self.phase = 0.0
+        self.t_last = time.monotonic()
+        self.tick = None
+        self.shape_done = False
+        self.btn = []                         # (name, x0, y0, x1, y1) in window coords
+        self.weather = ""
+        self.hide_tm = None
+        self.mode = self.dmode = "idle"       # idle | card | toast ; dmode = what is drawn while shrinking
+        self.queue, self.toast, self.toast_tm, self.nid = [], None, None, 0
+        self.hist = []
+        self.vol = None
+        self._tw = {}
+        self.last_draw = 0.0
+        self.tok = TOKENS["default"]
+        self.barbg = "#000000"
+        self.mon = self._primary()
+        self.set_default_size(MAXW, MAXH)
+        self.connect("draw", self.draw)
+        self.connect("motion-notify-event", self.on_motion)
+        self.connect("leave-notify-event", self.on_leave)
+        self.connect("button-press-event", self.on_press)
+        self.place()
+        self.show_all()
+        self.refresh()
+        self.retarget()
+        self.own_notifications()
+        GLib.timeout_add_seconds(6, self.own_watch)
+        threading.Thread(target=self.vol_watch, daemon=True).start()
+        GLib.timeout_add_seconds(1, self.slow)
+        GLib.timeout_add_seconds(3, self.raise_)
+        GLib.timeout_add_seconds(2, self.recolor)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, lambda: (self.recolor(), True)[1])
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (Gtk.main_quit(), False)[1])
+        if self.mp:
+            try:
+                self.mp.BUS.signal_subscribe(None, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                             None, None, 0, lambda *a: GLib.idle_add(self.refresh))
+                self.mp.BUS.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                                             None, None, 0, lambda *a: GLib.idle_add(self.refresh))
+            except Exception:
+                pass
+
+    # -- geometry ------------------------------------------------------------------------------
+    @staticmethod
+    def _primary():
+        d = Gdk.Display.get_default()
+        m = d.get_primary_monitor() or d.get_monitor(0)
+        return m.get_geometry()
+
+    def place(self):
+        self.mon = self._primary()
+        self.move(self.mon.x + (self.mon.width - MAXW) // 2, self.mon.y + TOP - 12)
+
+    def pill_rect(self):
+        w, h = self.cur
+        return (MAXW - w) / 2, 12, w, h
+
+    def raise_(self):
+        if RAISE and self.get_window():
+            self.get_window().raise_()
+        return True
+
+    def recolor(self):
+        self.C = rice.colors()
+        self.barbg = self.C["bg"]
+        try:                                           # the notch uses the dwm bar's own background so it reads as part of the bar
+            for ln in open(os.path.expanduser("~/.cache/theme/dwm.Xresources")):
+                if ln.startswith("dwm.normbgcolor"):
+                    self.barbg = ln.split(":")[1].strip()
+        except OSError:
+            pass
+        self.tok = TOKENS.get(self.C.get("design", "default"), TOKENS["default"])
+        self._tw.clear()
+        self.queue_draw()
+        return True
+
+    def dirty(self):
+        """Repaint only where the pill (and its shadow) is, not the whole 460x156 window."""
+        x, y, w, h = self.pill_rect()
+        px = AREA_PAD
+        self.queue_draw_area(int(x - px), int(y - px), int(w + 2 * px), int(h + 2 * px + 4))
+
+    # -- data ----------------------------------------------------------------------------------
+    def refresh(self):
+        if not self.mp:
+            return False
+        try:
+            self.player = self.mp.active()
+            self.info = self.mp.info(self.player) if self.player else None
+        except Exception:
+            self.player, self.info = None, None
+        self.art = None
+        if self.info and self.info.get("art"):
+            try:
+                from gi.repository import GdkPixbuf
+                self.art = GdkPixbuf.Pixbuf.new_from_file_at_scale(self.info["art"], 80, 80, True)
+            except Exception:
+                self.art = None
+        self.retarget()
+        return False
+
+    def slow(self):
+        try:
+            w = json.load(open(os.path.join(CACHE, "weather.json")))["d"]
+            self.weather = f"{w['temp']}°"
+        except Exception:
+            self.weather = ""
+        if self.info and self.player and self.info["playing"] and self.mp:
+            try:
+                self.info["pos"] = int(self.mp.get(self.player, "Position"))
+            except Exception:
+                pass
+        self.retarget()
+        self.queue_draw()
+        return True
+
+    def text_w(self, s, size, bold=False):
+        k = (s, size, bold)
+        v = self._tw.get(k)
+        if v is None:
+            cr = _c.Context(_c.ImageSurface(_c.FORMAT_ARGB32, 1, 1))
+            cr.select_font_face(rice.SANS_FONT, 0, 1 if bold else 0)
+            cr.set_font_size(size)
+            if len(self._tw) > 400:
+                self._tw.clear()
+            v = self._tw[k] = cr.text_extents(s).x_advance
+        return v
+
+    def clock_text(self):
+        t = time.strftime("%H:%M")
+        return t + (f"  {self.weather}" if self.weather else "")
+
+    def idle_w(self):
+        w = self.text_w(self.clock_text(), 14, True) + 34
+        if self.info and self.info["playing"]:
+            w += 54 + min(self.text_w(self.info["title"], 12), 170)
+        return max(w, 110)
+
+    def retarget(self):
+        if self.toast:
+            self.mode = "toast"
+            self.tgt = [float(TOAST_W), float(TOAST_H)]
+        elif self.state == "card" and self.info:
+            self.mode = "card"
+            self.tgt = [float(CARD_W), float(CARD_H)]
+        else:
+            self.state = self.mode = "idle"
+            self.tgt = [self.idle_w(), float(IDLE_H)]
+        if self.mode != "idle":
+            self.dmode = self.mode
+        self.set_shape()
+        self.start_anim()
+
+    def set_shape(self):
+        w, h = self.tgt
+        x, y = (MAXW - max(w, self.cur[0])) / 2, 12
+        ww, hh = max(w, self.cur[0]), max(h, self.cur[1])
+        r = cairo.RectangleInt(int(x), int(y), int(ww), int(hh))
+        reg = cairo.Region(r)
+        if self.get_window():
+            self.get_window().input_shape_combine_region(reg, 0, 0)
+
+    # -- animation -----------------------------------------------------------------------------
+    def start_anim(self):
+        if self.tick is None:
+            self.t_last = time.monotonic()
+            self.tick = self.add_tick_callback(self.step)
+
+    def step(self, widget=None, clock=None):
+        now = time.monotonic()
+        dt = min(now - self.t_last, 0.05)
+        self.t_last = now
+        k, d = 300.0, 25.0                      # spring: snappy, one soft overshoot
+        moving = False
+        for i in (0, 1):
+            acc = k * (self.tgt[i] - self.cur[i]) - d * self.vel[i]
+            self.vel[i] += acc * dt
+            self.cur[i] += self.vel[i] * dt
+            if abs(self.tgt[i] - self.cur[i]) > 0.12 or abs(self.vel[i]) > 0.25:
+                moving = True
+        live = bool(self.toast) or bool(self.info and self.info["playing"])
+        if live:
+            self.phase += dt * 6
+        if not moving:
+            self.cur = list(self.tgt)
+            self.vel = [0.0, 0.0]
+            if not self.shape_done:
+                self.set_shape()
+                self.shape_done = True
+        else:
+            self.shape_done = False
+        if moving or (live and now - self.last_draw > 0.033):   # idle animation (eq bars, toast timer) at ~30 fps
+            self.last_draw = now
+            self.dirty()
+        if moving or live:
+            return True
+        self.dirty()
+        self.tick = None
+        return False
+
+    # -- input ---------------------------------------------------------------------------------
+    def on_motion(self, w, e):
+        if self.state != "card" and self.info and not self.toast:
+            self.state = "card"
+            self.retarget()
+        if self.hide_tm:
+            GLib.source_remove(self.hide_tm)
+            self.hide_tm = None
+        return False
+
+    def on_leave(self, w, e):
+        if self.hide_tm:
+            GLib.source_remove(self.hide_tm)
+        self.hide_tm = GLib.timeout_add(350, self.collapse)
+        return False
+
+    def collapse(self):
+        self.hide_tm = None
+        self.state = "idle"
+        self.retarget()
+        return False
+
+    def on_press(self, w, e):
+        if e.button == 3 and not self.toast:               # right-click: game bar (no dwm key needed)
+            subprocess.Popen(["rice-gamebar"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        if e.button != 1:
+            return False
+        if self.toast:
+            self.next_toast()
+            return True
+        if self.state == "card":
+            for name, x0, y0, x1, y1 in self.btn:
+                if x0 <= e.x <= x1 and y0 <= e.y <= y1 and self.player and self.mp:
+                    m = {"prev": "Previous", "play": "PlayPause", "next": "Next"}[name]
+                    p = self.player
+                    threading.Thread(target=lambda: self.mp.call(p, m), daemon=True).start()
+                    GLib.timeout_add(300, self.refresh)
+                    return True
+        else:
+            subprocess.Popen(["rice-center", "today"], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+
+    # -- drawing -------------------------------------------------------------------------------
+    @staticmethod
+    def notch(cr, x, y, w, h, r):
+        """Flat top (flush with the screen edge), rounded bottom corners."""
+        r = max(0.0, min(r, w / 2, h))
+        cr.new_sub_path()
+        cr.move_to(x, y - 1)
+        cr.line_to(x + w, y - 1)
+        cr.line_to(x + w, y + h - r)
+        if r:
+            cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+            cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        else:
+            cr.line_to(x + w, y + h)
+            cr.line_to(x, y + h)
+        cr.line_to(x, y + h - r)
+        cr.close_path()
+
+    def draw(self, w, cr):
+        cr.set_operator(_c.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(_c.OPERATOR_OVER)
+        C = self.C
+        x, y, pw, ph = self.pill_rect()
+        tk = self.tok
+        big = ph > IDLE_H + 6
+        r = (26 if big else 16) * tk["r"] if tk["r"] else 0
+        r = min(r, ph / 2, pw / 2)
+        if big:                                        # shadow only while it hangs below the bar
+            for i in range(tk["sh"], 0, -1):
+                cr.set_source_rgba(0, 0, 0, 0.05)
+                self.notch(cr, x - i * 1.4, y, pw + i * 2.8, ph + i * 2.2, r + i * 1.4)
+                cr.fill()
+        self.notch(cr, x, y, pw, ph, r)
+        cr.set_source_rgba(*rice.rgb(self.barbg, 1.0))
+        if tk["bw"] >= 3:                              # brutal: hard outline
+            cr.fill_preserve()
+            cr.set_source_rgba(*rice.rgb(C["fg"], 1.0))
+            cr.set_line_width(tk["bw"])
+            cr.stroke()
+        elif big and tk["bw"]:
+            cr.fill_preserve()
+            cr.set_source_rgba(*rice.rgb(C["border"], 0.9))
+            cr.set_line_width(1)
+            cr.stroke()
+        else:
+            cr.fill()
+        self.btn = []
+        cr.save()
+        self.notch(cr, x, y, pw, ph, r)
+        cr.clip()
+        hm = TOAST_H if self.dmode == "toast" else CARD_H
+        t = max(0.0, min(1.0, (ph - IDLE_H) / (hm - IDLE_H)))
+        if t < 0.98:
+            self.draw_idle(cr, x, y, pw, 1 - t)
+        if t > 0.02:
+            if self.dmode == "toast" and self.toast:
+                self.draw_toast(cr, x, y + 8, pw, ph - 8, t)
+            elif self.dmode == "card" and self.info:
+                self.draw_card(cr, x, y + 8, pw, ph - 8, t)
+        cr.restore()
+
+    def font(self, cr, size, bold=False):
+        cr.select_font_face(rice.SANS_FONT, 0, 1 if bold else 0)
+        cr.set_font_size(size)
+
+    def eq(self, cr, x, cy, a):
+        bars = 4
+        for i in range(bars):
+            h = 4 + 8 * (0.5 + 0.5 * math.sin(self.phase + i * 1.7))
+            cr.set_source_rgba(*rice.rgb(self.C["accent"], a))
+            rice.rounded(cr, x + i * 5, cy - h / 2, 3, h, 1.5)
+            cr.fill()
+
+    def draw_idle(self, cr, x, y, pw, a):
+        C = self.C
+        playing = bool(self.info and self.info["playing"])
+        self.font(cr, 14, True)
+        txt = self.clock_text()
+        cy = y + BARC
+        if playing:
+            self.eq(cr, x + 16, cy, a)
+            title = self.info["title"]
+            self.font(cr, 12)
+            while title and self.text_w(title, 12) > 170:
+                title = title[:-2]
+            cr.set_source_rgba(*rice.rgb(C["dim"], a))
+            cr.move_to(x + 42, cy + 4.5)
+            cr.show_text(title)
+            self.font(cr, 14, True)
+            tw = cr.text_extents(txt).x_advance
+            cr.set_source_rgba(*rice.rgb(C["fg"], a))
+            cr.move_to(x + pw - tw - 16, cy + 5)
+            cr.show_text(txt)
+        else:
+            tw = cr.text_extents(txt).x_advance
+            cr.set_source_rgba(*rice.rgb(C["fg"], a))
+            cr.move_to(x + (pw - tw) / 2, cy + 5)
+            cr.show_text(txt)
+
+    # -- notifications + volume ----------------------------------------------------------------
+    NOTIF_XML = """<node><interface name="org.freedesktop.Notifications">
+ <method name="Notify"><arg type="s" direction="in"/><arg type="u" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="as" direction="in"/><arg type="a{sv}" direction="in"/><arg type="i" direction="in"/><arg type="u" direction="out"/></method>
+ <method name="CloseNotification"><arg type="u" direction="in"/></method>
+ <method name="GetCapabilities"><arg type="as" direction="out"/></method>
+ <method name="GetServerInformation"><arg type="s" direction="out"/><arg type="s" direction="out"/><arg type="s" direction="out"/><arg type="s" direction="out"/></method>
+ <signal name="NotificationClosed"><arg type="u"/><arg type="u"/></signal></interface></node>"""
+
+    def own_notifications(self):
+        from gi.repository import Gio
+        self.Gio = Gio
+        self._nconn = None
+        if getattr(self, "_own", None):
+            Gio.bus_unown_name(self._own)
+            self._own = None
+        if not getattr(self, "_killed", False):
+            self._killed = True
+            subprocess.run(["pkill", "-x", "dunst"])        # a stray dunst (D-Bus activated) would hold the name
+            time.sleep(0.15)
+        self._tried = getattr(self, "_tried", 0)
+        node = Gio.DBusNodeInfo.new_for_xml(self.NOTIF_XML)
+
+        def acquired(conn, name):
+            if getattr(self, "_reg", False):
+                return
+            self._reg = True
+            self._nconn = conn
+            conn.register_object("/org/freedesktop/Notifications", node.interfaces[0], self.n_call, None, None)
+
+        def lost(conn, name):
+            if self._tried < 5:                      # someone else holds the name: stop dunst, retry
+                self._tried += 1
+                subprocess.run(["pkill", "-x", "dunst"])
+                GLib.timeout_add(800, lambda: (self.own_notifications(), False)[1])
+
+        self._own = Gio.bus_own_name(Gio.BusType.SESSION, "org.freedesktop.Notifications",
+                                     Gio.BusNameOwnerFlags.REPLACE | Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT,
+                                     acquired, None, lost)
+
+    def own_watch(self):
+        """If the Notifications name is free or held by someone else (crashed owner, stray dunst), take it again."""
+        try:
+            r = self._nconn.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner",
+                                      GLib.Variant("(s)", ("org.freedesktop.Notifications",)), GLib.VariantType("(s)"), 0, 500, None)
+            ok = r[0] == self._nconn.get_unique_name()
+        except Exception:
+            ok = False
+        if not ok:
+            self._tried = 0
+            self.own_notifications()
+        return True
+
+    def n_call(self, conn, sender, path, iface, method, params, inv):
+        V = GLib.Variant
+        if method == "GetCapabilities":
+            inv.return_value(V("(as)", (["body", "actions", "persistence"],)))
+        elif method == "GetServerInformation":
+            inv.return_value(V("(ssss)", ("rice-island", "rice", "1.0", "1.2")))
+        elif method == "CloseNotification":
+            inv.return_value(None)
+        elif method == "Notify":
+            app, rid, icon, summ, body, acts, hints, tmo = params.unpack()
+            self.nid = rid if rid else self.nid + 1
+            urg = hints.get("urgency", 1)
+            n = dict(id=self.nid, app=app, icon=(icon if isinstance(icon, str) else ""), title=summ, body=body.replace("\n", " "), urg=urg,
+                     tmo=(tmo / 1000 if tmo > 0 else (0 if tmo == 0 else 5.5)))
+            if urg == 2 and tmo < 0:
+                n["tmo"] = 12
+            if n["tmo"] == 0:
+                n["tmo"] = 15
+            self.hist = (self.hist + [dict(n, ts=time.time())])[-100:]
+            try:
+                json.dump(self.hist, open(os.path.join(CACHE, "notifs.json"), "w"))
+            except Exception:
+                pass
+            inv.return_value(V("(u)", (self.nid,)))
+            GLib.idle_add(self.push, n)
+            self.sound(urg)
+
+    def sound(self, urg):
+        """Notification sound: name in ~/.cache/rice/sfx (default glass, 'off' = silent); not in DND."""
+        try:
+            name = open(os.path.join(CACHE, "sfx")).read().strip() or "glass"
+        except OSError:
+            name = "glass"
+        f = os.path.expanduser(f"~/.local/share/rice/sounds/{name}.wav")
+        if name == "off" or not os.path.exists(f) or (os.path.exists(os.path.join(CACHE, "dnd")) and urg < 2):
+            return
+        subprocess.Popen(["timeout", "4", "paplay", f], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def push(self, n):
+        if os.path.exists(os.path.join(CACHE, "dnd")) and n.get("urg", 1) < 2 and not n.get("osd"):
+            return False                           # Do Not Disturb: logged in notifs.json, not shown
+        if self.toast and self.toast.get("id") == n["id"] and not self.toast.get("osd"):
+            self.toast = n                         # same id: replace in place
+        elif n.get("osd") and self.toast and self.toast.get("osd"):
+            self.toast = n
+        else:
+            self.queue.append(n)
+            if not self.toast:
+                self.next_toast()
+                return False
+        self.arm_toast()
+        self.retarget()
+        return False
+
+    def arm_toast(self):
+        if self.toast is not None:
+            self.toast["t0"] = time.monotonic()
+        if self.toast_tm:
+            GLib.source_remove(self.toast_tm)
+        self.toast_tm = GLib.timeout_add(int(self.toast["tmo"] * 1000), self.next_toast) if self.toast else None
+
+    def next_toast(self):
+        self.toast_tm = None
+        self.toast = self.queue.pop(0) if self.queue else None
+        if self.toast:
+            self.state = "idle"
+            self.arm_toast()
+        self.retarget()
+        return False
+
+    def vol_watch(self):
+        """pactl subscribe -> show a volume toast when level or mute changed."""
+        last = None
+        while True:
+            try:
+                p = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+                for line in p.stdout:
+                    if "sink" not in line or "'change'" not in line or "sink-input" in line:
+                        continue
+                    out = subprocess.run(["timeout", "2", "wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                                         capture_output=True, text=True).stdout
+                    try:
+                        v = float(out.split()[1])
+                    except (IndexError, ValueError):
+                        continue
+                    cur = (round(v, 2), "MUTED" in out)
+                    if last is not None and cur != last:
+                        n = dict(id=-1, osd=True, app="volume", title="Muted" if cur[1] else "Volume",
+                                 body="", frac=min(1.0, v), urg=1, tmo=1.6)
+                        GLib.idle_add(self.push, n)
+                    last = cur
+            except Exception:
+                pass
+            time.sleep(3)
+
+    def icon_pb(self, n):
+        """App icon from the theme (or a file path), cached on the notification; None -> initial in a shape."""
+        if "pb" in n:
+            return n["pb"]
+        pb = None
+        name = n.get("icon") or (n.get("app") or "").lower()
+        try:
+            if name.startswith("/") or name.startswith("file://"):
+                from gi.repository import GdkPixbuf
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_size(name.replace("file://", ""), 44, 44)
+            elif name:
+                th = Gtk.IconTheme.get_default()
+                if th.has_icon(name):
+                    pb = th.load_icon(name, 44, Gtk.IconLookupFlags.FORCE_SIZE)
+        except Exception:
+            pb = None
+        n["pb"] = pb
+        return pb
+
+    def shape(self, cr, cx, cy, r):
+        sh = self.tok["shape"]
+        if sh == "square":
+            cr.rectangle(cx - r, cy - r, 2 * r, 2 * r)
+        elif sh == "cookie":                              # scalloped Material "cookie" blob
+            cr.new_sub_path()
+            for i in range(121):
+                t = i / 120 * 2 * math.pi
+                rr = r * (0.9 + 0.1 * math.cos(8 * t))
+                (cr.move_to if i == 0 else cr.line_to)(cx + rr * math.cos(t), cy + rr * math.sin(t))
+            cr.close_path()
+        else:
+            cr.new_sub_path()
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+
+    def draw_toast(self, cr, x, y, pw, ph, a):
+        C, n = self.C, self.toast
+        pad = 16
+        cy = y + ph / 2 - 3
+        tk = self.tok
+        if n.get("osd"):
+            cr.set_source_rgba(*rice.rgb(C["accent"], a))
+            self.font(cr, 14, True)
+            cr.move_to(x + pad + 6, cy + 5)
+            cr.show_text(n["title"])
+            bx0, bx1 = x + pad + 90, x + pw - pad - 6
+            cr.set_line_width(8)
+            cr.set_line_cap(_c.LINE_CAP_ROUND if tk["shape"] != "square" else _c.LINE_CAP_BUTT)
+            cr.set_source_rgba(*rice.rgb(C["dim"], a * 0.3))
+            cr.move_to(bx0, cy); cr.line_to(bx1, cy); cr.stroke()
+            cr.set_source_rgba(*rice.rgb(C["accent"], a))
+            cr.move_to(bx0, cy); cr.line_to(bx0 + max(0.1, (bx1 - bx0) * n["frac"]), cy); cr.stroke()
+            return
+        urg = n["urg"] == 2
+        accent = "#ff6b6b" if urg else C["accent"]
+        isz = 22
+        ix = x + pad + isz
+        pb = self.icon_pb(n)
+        if pb:
+            cr.save()
+            self.shape(cr, ix, cy, isz)
+            cr.clip()
+            Gdk.cairo_set_source_pixbuf(cr, pb, ix - pb.get_width() / 2, cy - pb.get_height() / 2)
+            cr.paint_with_alpha(a)
+            cr.restore()
+        else:
+            self.shape(cr, ix, cy, isz)
+            cr.set_source_rgba(*rice.rgb(accent, a))
+            cr.fill()
+            cr.set_source_rgba(*rice.rgb(C["bg"], a))
+            self.font(cr, 18, True)
+            ini = (n["app"] or n["title"] or "!")[:1].upper()
+            ex = cr.text_extents(ini)
+            cr.move_to(ix - ex.x_advance / 2, cy + 6.5)
+            cr.show_text(ini)
+        tx = x + pad + 2 * isz + 14
+        mw = x + pw - pad - tx
+        def fit(txt, size, bold):
+            self.font(cr, size, bold)
+            if txt and cr.text_extents(txt).x_advance > mw:
+                while txt and cr.text_extents(txt + "…").x_advance > mw:
+                    txt = txt[:-1]
+                txt += "…"
+            return txt
+        app = (n["app"] or "").upper()
+        if app:
+            self.font(cr, 10, True)
+            cr.set_source_rgba(*rice.rgb(accent, a * 0.9))
+            cr.move_to(tx, cy - 17)
+            cr.show_text(app[:28])
+        cr.set_source_rgba(*rice.rgb(C["fg"], a))
+        cr.move_to(tx, cy + 1)
+        cr.show_text(fit(n["title"] or n["app"], 15, True) or "")
+        cr.set_source_rgba(*rice.rgb(C["dim"], a))
+        cr.move_to(tx, cy + 19)
+        cr.show_text(fit(n["body"], 12, False) or "")
+        # time-left line along the bottom edge
+        left = max(0.0, 1 - (time.monotonic() - n.get("t0", time.monotonic())) / max(n["tmo"], 0.1))
+        bx0, bx1 = x + pad + 6, x + pw - pad - 6
+        by = y + ph - 9
+        cr.set_line_width(3)
+        cr.set_line_cap(_c.LINE_CAP_ROUND if tk["shape"] != "square" else _c.LINE_CAP_BUTT)
+        cr.set_source_rgba(*rice.rgb(C["dim"], a * 0.22))
+        cr.move_to(bx0, by); cr.line_to(bx1, by); cr.stroke()
+        cr.set_source_rgba(*rice.rgb(accent, a * 0.9))
+        cr.move_to(bx0, by); cr.line_to(bx0 + max(0.1, (bx1 - bx0) * left), by); cr.stroke()
+
+    def draw_card(self, cr, x, y, pw, ph, a):
+        C, I = self.C, self.info
+        pad = 16
+        sz = 72
+        ax, ay = x + pad, y + pad
+        if self.art:
+            cr.save()
+            rice.rounded(cr, ax, ay, sz, sz, 16)
+            cr.clip()
+            Gdk.cairo_set_source_pixbuf(cr, self.art, ax, ay)
+            cr.paint_with_alpha(a)
+            cr.restore()
+        else:
+            cr.set_source_rgba(*rice.rgb(C["bg2"], a))
+            rice.rounded(cr, ax, ay, sz, sz, 16)
+            cr.fill()
+        tx = ax + sz + 14
+        mw = x + pw - pad - tx
+        for txt, size, bold, col, dy in ((I["title"], 15, True, C["fg"], 22), (I["artist"], 12, False, C["dim"], 42)):
+            self.font(cr, size, bold)
+            while txt and cr.text_extents(txt).x_advance > mw:
+                txt = txt[:-2]
+            cr.set_source_rgba(*rice.rgb(col, a))
+            cr.move_to(tx, ay + dy)
+            cr.show_text(txt)
+        # wavy progress
+        py = ay + 60
+        frac = min(1.0, max(0.0, I["pos"] / I["length"]))
+        cr.set_line_width(2.5)
+        cr.set_line_cap(_c.LINE_CAP_ROUND)
+        cr.set_source_rgba(*rice.rgb(C["accent"], a))
+        px0, px1 = tx, x + pw - pad
+        xe = px0 + (px1 - px0) * frac
+        n = max(2, int(xe - px0))
+        for i in range(n + 1):
+            xx = px0 + i
+            yy = py + (2.2 * math.sin(i * 0.45 - self.phase * 1.2) if I["playing"] else 0)
+            (cr.move_to if i == 0 else cr.line_to)(xx, yy)
+        cr.stroke()
+        cr.set_source_rgba(*rice.rgb(C["dim"], a * 0.45))
+        cr.move_to(xe + 3, py)
+        cr.line_to(px1, py)
+        cr.stroke()
+        # buttons
+        by = y + ph - 28
+        cx = x + pw / 2
+        for name, dx, rad in (("prev", -46, 13), ("play", 0, 17), ("next", 46, 13)):
+            bx = cx + dx
+            if name == "play":
+                cr.set_source_rgba(*rice.rgb(C["accent"], a))
+                cr.arc(bx, by, rad, 0, 2 * math.pi)
+                cr.fill()
+                cr.set_source_rgba(*rice.rgb(C["bg"], a))
+            else:
+                cr.set_source_rgba(*rice.rgb(C["fg"], a))
+            self.glyph(cr, name, bx, by, I["playing"])
+            self.btn.append((name, bx - 20, by - 20, bx + 20, by + 20))
+
+    @staticmethod
+    def glyph(cr, name, bx, by, playing):
+        if name == "play":
+            if playing:
+                for off in (-4, 2):
+                    cr.rectangle(bx + off, by - 6, 3, 12)
+                cr.fill()
+            else:
+                cr.move_to(bx - 4, by - 7)
+                cr.line_to(bx + 7, by)
+                cr.line_to(bx - 4, by + 7)
+                cr.close_path()
+                cr.fill()
+        else:
+            s = -1 if name == "prev" else 1
+            cr.move_to(bx - s * 5, by - 6)
+            cr.line_to(bx + s * 4, by)
+            cr.line_to(bx - s * 5, by + 6)
+            cr.close_path()
+            cr.fill()
+            cr.rectangle(bx + s * 4 - (1 if s > 0 else 2), by - 6, 2, 12)
+            cr.fill()
+
+
+if __name__ == "__main__":
+    isl = Island()
+    try:
+        Gtk.main()
+    finally:
+        try:
+            os.remove(PIDF)
+        except OSError:
+            pass

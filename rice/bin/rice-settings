@@ -1,0 +1,840 @@
+#!/usr/bin/env python3
+"""System settings: big panel from the right edge, sidebar + pages (like KDE System Settings). Mod+o. Run again / Esc closes."""
+import os, sys, re, signal, subprocess, threading, shutil
+# single instance (spam-safe): decided before the heavy imports
+import fcntl as _fc, signal as _sg
+_cd = os.path.expanduser("~/.cache/rice"); os.makedirs(_cd, exist_ok=True)
+_lk = open(os.path.join(_cd, "once-rice-settings.lock"), "w")
+try:
+    _fc.flock(_lk, _fc.LOCK_EX | _fc.LOCK_NB)
+except OSError:
+    if False:
+        try: os.kill(int(open(os.path.join(_cd, "once-rice-settings.pid")).read()), _sg.SIGTERM)
+        except Exception: pass
+    sys.exit(0)
+open(os.path.join(_cd, "once-rice-settings.pid"), "w").write(str(os.getpid()))
+
+PID = os.path.expanduser("~/.cache/rice/settings.pid")
+try:
+    old = int(open(PID).read())
+    if "rice-settings" in open(f"/proc/{old}/cmdline").read() and old != os.getpid():
+        os.kill(old, signal.SIGTERM); sys.exit(0)
+except Exception:
+    pass
+open(PID, "w").write(str(os.getpid()))
+signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import rice, themes, settings, widgets as w
+from rice import Gtk, Gdk, GLib
+
+HOME = os.path.expanduser("~")
+S = settings.load()
+panel = rice.Panel(900)
+SIDE = 250
+
+
+def sh(*a):
+    subprocess.Popen(list(a), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, stdin=subprocess.DEVNULL)
+
+
+def out(*a, t=3):
+    try:
+        return subprocess.run(["timeout", str(t), *a], capture_output=True, text=True).stdout.strip()
+    except Exception:
+        return ""
+
+
+def reapply():
+    def work():
+        try:
+            wall = open(f"{themes.CACHE}/wall").read().strip(); name = open(f"{themes.CACHE}/current").read().strip()
+            themes.apply(dict(name=name, wall=wall, colors=None), final=True)
+        except Exception:
+            pass
+        GLib.idle_add(lambda: (panel.restyle(), panel.queue_draw(), root.queue_draw(), False)[3])
+    threading.Thread(target=work, daemon=True).start()
+
+
+def sysset(key, apply_=True):
+    def f(v):
+        settings.sput(key, v)
+        if apply_:
+            sh("rice-apply")
+    return f
+
+
+def setting(key, re_=False):
+    return lambda v: (settings.put(key, v), reapply() if re_ else None)
+
+
+# ------------------------------------------------------------------ layout
+root = Gtk.Box()
+panel.add(root)
+side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+side.set_size_request(SIDE, -1)
+for m, v in (("start", 14), ("end", 8), ("top", 18), ("bottom", 14)):
+    getattr(side, f"set_margin_{m}")(v)
+root.pack_start(side, False, False, 0)
+stack = Gtk.Stack(); stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE); stack.set_transition_duration(160)
+root.pack_start(stack, True, True, 0)
+
+INDEX = []        # (page, label, keywords) for the search box
+NAVS = {}
+
+
+class Nav(w.Anim):
+    def __init__(self, glyph, label, page):
+        super().__init__(0.0, 0.3)
+        self.glyph, self.label, self.page, self.sel = glyph, label, page, False
+        self.set_size_request(SIDE - 22, 40)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("draw", self._d)
+        self.connect("button-press-event", lambda *a: (goto(page), True)[1])
+        self.connect("enter-notify-event", lambda *a: self.go(1.0))
+        self.connect("leave-notify-event", lambda *a: self.go(0.0))
+
+    def _d(self, wd, cr):
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        rice.rounded(cr, 0, 2, W, H - 4, 14)
+        if self.sel:
+            cr.set_source_rgba(*w.col("accent")); cr.fill()
+        else:
+            cr.set_source_rgba(*w.col("fg", 0.09 * self.v)); cr.fill()
+        on = self.sel
+        w.icon(cr, self.glyph, 24, H / 2 + 6, 16, "bg" if on else "accent")
+        w.text(cr, self.label, 46, H / 2 + 4.5, 12.5, on, "bg" if on else "fg")
+        return False
+
+
+def goto(page):
+    stack.set_visible_child_name(page)
+    for k, n in NAVS.items():
+        n.sel = (k == page); n.queue_draw()
+
+
+def page(name, glyph, label, kw=""):
+    sc = Gtk.ScrolledWindow(); sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+    for m, v in (("start", 30), ("end", 30), ("top", 24), ("bottom", 24)):
+        getattr(b, f"set_margin_{m}")(v)
+    sc.add(b)
+    t = Gtk.Label(xalign=0); t.set_markup(f'<span size="19000" weight="bold">{GLib.markup_escape_text(label)}</span>')
+    b.pack_start(t, False, False, 6)
+    stack.add_named(sc, name)
+    n = Nav(glyph, label, name); NAVS[name] = n
+    side.pack_start(n, False, False, 0)
+    INDEX.append((name, label, kw))
+    return b
+
+
+def card(b, title=None):
+    """Grouped block of rows with a soft background."""
+    if title:
+        b.pack_start(w.heading(title), False, False, 4)
+    g = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+    _m3css()
+    g.get_style_context().add_class("m3card")      # Material 3 style: grouped rows sit on a rounded tonal surface
+    b.pack_start(g, False, False, 0)
+    return g
+
+
+_M3 = []
+def _m3css():
+    if _M3: return
+    c = rice.colors()
+    css = Gtk.CssProvider()
+    css.load_from_data(f".m3card {{ background: alpha({c['fg']}, 0.045); border-radius: 22px; padding: 16px 18px; }}".encode())
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+    _M3.append(css)
+
+
+def r(b, page_name, label, ctl, sub=None, kw=""):
+    INDEX.append((page_name, label, kw + " " + (sub or "")))
+    b.pack_start(w.row(label, ctl, sub), False, False, 0)
+
+
+def info(b, k, v):
+    h = Gtk.Box(spacing=10)
+    a = Gtk.Label(xalign=0); a.set_markup(f'<span size="11000" alpha="60%">{GLib.markup_escape_text(k)}</span>'); a.set_size_request(200, -1)
+    c = Gtk.Label(xalign=0); c.set_markup(f'<span size="11500">{GLib.markup_escape_text(v)}</span>'); c.set_ellipsize(3); c.set_selectable(False)
+    h.pack_start(a, False, False, 0); h.pack_start(c, True, True, 0)
+    b.pack_start(h, False, False, 0)
+
+
+def pillbtn(label, cb):
+    b = Gtk.Button(label=label); b.get_style_context().add_class("pill"); b.connect("clicked", lambda *_: cb()); return b
+
+
+def launcher(cmd):
+    return lambda: (panel.quit_anim(), GLib.timeout_add(260, lambda: (sh(*cmd), False)[1]))
+
+
+def radio_list(b, items, current, on_pick):
+    """items [(label, value)] -> column of pill buttons, the current one marked."""
+    btns = []
+
+    def paint():
+        for bt, (l, v) in zip(btns, items):
+            bt.set_label(("●  " if v == state[0] else "○  ") + l)
+    state = [current]
+    for l, v in items:
+        bt = Gtk.Button(); bt.get_style_context().add_class("pill"); bt.get_child() if False else None
+        bt.connect("clicked", lambda _b, v=v: (state.__setitem__(0, v), paint(), on_pick(v)))
+        btns.append(bt); b.pack_start(bt, False, False, 0)
+    paint()
+
+
+# ------------------------------------------------------------------ Appearance
+p = page("home", "", "Home", "overview start welcome")
+_u = os.environ.get("USER", "you")
+try:
+    _up = float(open("/proc/uptime").read().split()[0]); _upt = f"up {int(_up // 3600)}h {int(_up % 3600 // 60)}m"
+except Exception: _upt = ""
+try: _cur = themes.current_item()["name"]
+except Exception: _cur = "-"
+_hl = Gtk.Label(xalign=0); _hl.set_markup(f'<span size="26000" weight="bold">Hi, {GLib.markup_escape_text(_u)}</span>')
+_hs = Gtk.Label(xalign=0); _hs.get_style_context().add_class("dim"); _hs.set_text(f"{os.uname().nodename}   ·   {_upt}   ·   theme {_cur}")
+p.pack_start(_hl, False, False, 2); p.pack_start(_hs, False, False, 0)
+_fb = Gtk.FlowBox(); _fb.set_selection_mode(Gtk.SelectionMode.NONE); _fb.set_max_children_per_line(5); _fb.set_min_children_per_line(3)
+_fb.set_column_spacing(12); _fb.set_row_spacing(12); _fb.set_homogeneous(True)
+def _spawn(*c): return lambda: subprocess.Popen(list(c))
+for _g, _l, _cb in (("", "Look", lambda: goto("look")), ("", "Wallpapers", _spawn("rice-wall")), ("", "Alerts", lambda: goto("island")),
+                    ("", "Sound", lambda: goto("sound")), ("", "Display", lambda: goto("display")), ("", "Input", lambda: goto("input")),
+                    ("", "Bar", lambda: goto("windows")), ("", "Network", lambda: goto("net")), ("", "Game bar", _spawn("rice-gamebar")),
+                    ("", "Control centre", _spawn("rice-center"))):
+    _fb.add(w.Tile(_g, _l, _cb, 112, 96))
+INDEX.append(("home", "Home", "overview tiles quick links"))
+p.pack_start(_fb, False, False, 12)
+p = page("look", "", "Appearance", "theme colors")
+g = card(p, "Surfaces")
+r(g, "look", "Glass mode", w.Switch(S["glass"], setting("glass", True)), "transparent + blurred menus, bar cards and terminal", "glass blur transparent opacity solid")
+SCH = ("auto", "dark", "light")
+r(g, "look", "Solid scheme", w.Seg(["Auto", "Dark", "Light"], SCH.index(S["scheme"]), lambda i: (settings.put("scheme", SCH[i]), reapply()), 210), "used when glass is off; auto follows the wallpaper", "dark light")
+g = card(p, "Motion")
+r(g, "look", "Animations", w.Switch(S["anim"], setting("anim")), "popups and side panels", "animation motion")
+g = card(p, "Effects")
+TO = [("Auto (from wallpaper)", None)] + [(f"{x}%", x / 100) for x in (100, 90, 80, 70, 60, 50, 40, 30)]
+g.pack_start(w.dropdown("Terminal opacity", "glass mode only", TO, settings.sget("term_opacity"), lambda v: (settings.sput("term_opacity", v), reapply())), False, False, 0)
+BL = [("Auto (from wallpaper)", None)] + [(str(x), x) for x in range(2, 9)]
+g.pack_start(w.dropdown("Blur strength", "behind glass menus and terminals", BL, settings.sget("blur"), lambda v: (settings.sput("blur", v), reapply())), False, False, 0)
+r(g, "look", "Window shadows", w.Switch(settings.sget("shadows", True), sysset("shadows")), "soft shadows on cards and menus", "shadow")
+r(g, "look", "Fade in/out", w.Switch(settings.sget("fading", True), sysset("fading")), "picom fading", "fade")
+g = card(p, "Colours")
+sw = w.Anim(); sw.set_size_request(-1, 54)
+def drawsw(wd, cr):
+    c = rice.colors(); keys = ("bg", "bg2", "border", "dim", "fg", "accent", "accent2")
+    W = wd.get_allocated_width(); n = len(keys); gap = 8; ww = (W - gap * (n - 1)) / n
+    for i, k in enumerate(keys):
+        rice.rounded(cr, i * (ww + gap), 0, ww, 40, 12); cr.set_source_rgba(*rice.rgb(c[k])); cr.fill()
+        rice.rounded(cr, i * (ww + gap) + .5, .5, ww - 1, 39, 12); cr.set_source_rgba(*w.col("fg", 0.15)); cr.set_line_width(1); cr.stroke()
+    return False
+sw.connect("draw", drawsw); g.pack_start(sw, False, False, 0)
+cur = ""
+try: cur = open(f"{themes.CACHE}/current").read().strip()
+except OSError: pass
+info(g, "Wallpaper", cur or "-")
+g.pack_start(pillbtn("Open theme switcher", launcher(["theme-switch"])), False, False, 0)
+
+# ------------------------------------------------------------------ Wallpapers
+p = page("walls", "", "Wallpapers", "online offline")
+g = card(p, "Source")
+r(g, "walls", "Online mode", w.Switch(S["online"], setting("online")), "off: only wallpapers on this computer; on: current + downloaded ones", "online offline download")
+SRC = ("mono", "wallhaven", "minimal", "both")
+r(g, "walls", "Source", w.Seg(["Mono", "Wallhaven", "Minimal", "Both"], SRC.index(S["source"]) if S["source"] in SRC else 0, lambda i: settings.put("source", SRC[i]), 270), "where new wallpapers come from", "mono wallhaven minimal")
+r(g, "walls", "Rice mode", w.Switch(S["ricemode"], setting("ricemode")), "confirming a theme opens the showcase scene", "rice scene")
+g = card(p, "Storage")
+def folder(d):
+    n = s = 0
+    try:
+        for f in os.scandir(d):
+            if f.is_file(): n += 1; s += f.stat().st_size
+    except OSError: pass
+    return n, s / 1e6
+ln, ls = folder(themes.WALLS); on, os_ = folder(themes.ONLINE)
+info(g, "On this computer", f"{ln} files, {ls:.0f} MB")
+info(g, "Downloaded", f"{on} files, {os_:.0f} MB (max {themes.MAX_ONLINE})")
+def clear_online():
+    cur_ = os.path.realpath(open(f"{themes.CACHE}/wall").read().strip()) if os.path.exists(f"{themes.CACHE}/wall") else ""
+    for f in os.scandir(themes.ONLINE):
+        if f.is_file() and os.path.realpath(f.path) != cur_:
+            try: os.remove(f.path)
+            except OSError: pass
+    w.toast("Downloaded wallpapers cleared")
+g.pack_start(pillbtn("Clear downloaded wallpapers", clear_online), False, False, 0)
+
+# ------------------------------------------------------------------ Sound
+p = page("island", "", "Island & alerts", "notifications island sound dnd do not disturb hot corner welcome game bar wallpaper")
+_cache = os.path.expanduser("~/.cache/rice")
+_dnd = os.path.join(_cache, "dnd")
+def _dnd_set(on):
+    if on: open(_dnd, "w").close()
+    elif os.path.exists(_dnd): os.remove(_dnd)
+g = card(p, "Notifications")
+r(g, "island", "Do not disturb", w.Switch(os.path.exists(_dnd), _dnd_set), "alerts are logged, only critical ones show", "dnd quiet silence")
+_SFX = ["off", "glass", "droplet", "chime", "bubble", "marimba", "aurora", "ping", "harp", "keys", "ripple"]
+try: _sfx_now = open(os.path.join(_cache, "sfx")).read().strip() or "glass"
+except OSError: _sfx_now = "glass"
+def _sfx_pick(x):
+    open(os.path.join(_cache, "sfx"), "w").write(x)
+    if x != "off": subprocess.Popen(["timeout", "3", "paplay", os.path.expanduser(f"~/.local/share/rice/sounds/{x}.wav")])
+INDEX.append(("island", "Sound", "notification sound sfx pack glass droplet chime bubble marimba aurora ping harp keys ripple"))
+g.pack_start(w.dropdown("Sound", "notification sound, plays when you pick it", [(x.title(), x) for x in _SFX], _sfx_now if _sfx_now in _SFX else "glass", _sfx_pick, 190), False, False, 0)
+r(g, "island", "Test", pillbtn("Send test", lambda: subprocess.Popen(["notify-send", "-a", "Settings", "Island test", "this is how alerts look"])), "shows a toast in the island", "notify test")
+g = card(p, "Island parts")
+_hc = os.path.join(_cache, "hotcorner")
+def _hc_set(on):
+    if on:
+        if os.path.exists(_hc): os.remove(_hc)
+    else: open(_hc, "w").write("off")
+_hc_on = not (os.path.exists(_hc) and open(_hc).read().strip() == "off")
+r(g, "island", "Hot corner", w.Switch(_hc_on, _hc_set), "top-left corner of the primary screen opens the window map", "corner overview map")
+r(g, "island", "Wallpaper picker", pillbtn("Open", lambda: subprocess.Popen(["rice-wall"])), "thumbnail grid, click applies the theme", "wallpaper picker themes")
+r(g, "island", "Game bar", pillbtn("Open", lambda: subprocess.Popen(["rice-gamebar"])), "CPU, GPU, RAM, ping, mic, volume", "game gaming fps")
+r(g, "island", "Welcome intro", pillbtn("Play", lambda: subprocess.Popen(["rice-welcome", "show"])), "the key cheat sheet", "welcome intro tour")
+p = page("sound", "", "Sound", "audio volume output input microphone headphones")
+g = card(p, "Volume")
+def getvol():
+    try: return min(1.0, float(out("wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@", t=2).split()[1]))
+    except Exception: return 0.5
+vt = [None]
+def setvol(v):
+    if vt[0]: GLib.source_remove(vt[0])
+    vt[0] = GLib.timeout_add(50, lambda: (sh("timeout", "2", "wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{v:.2f}"), False)[1])
+r(g, "sound", "Output volume", w.Slider(getvol(), setvol, 300), None, "volume")
+import json
+def pj(*a):
+    try: return json.loads(out("pactl", "-f", "json", *a) or "[]")
+    except Exception: return []
+defsink, defsrc = out("pactl", "get-default-sink", t=2), out("pactl", "get-default-source", t=2)
+g = card(p, "Output device")
+radio_list(g, [(s.get("description", s["name"])[:48], s["name"]) for s in pj("list", "sinks")], defsink, lambda v: sh("pactl", "set-default-sink", v))
+g = card(p, "Input device")
+srcs = [(s.get("description", s["name"])[:48], s["name"]) for s in pj("list", "sources") if not s["name"].endswith(".monitor")]
+if srcs: radio_list(g, srcs, defsrc, lambda v: sh("pactl", "set-default-source", v))
+else: info(g, "Input", "no input device (check the headset profile)")
+g = card(p, "Media card")
+MC = [("Stay open until closed", 0), ("Close after 12 s idle", 12), ("Close after 30 s idle", 30), ("Close after 2 min idle", 120)]
+g.pack_start(w.dropdown("Auto-close", "Esc, q, right click or Mod+Shift+m closes it", MC, int(settings.sget("media_close", 0) or 0), lambda v: settings.sput("media_close", v)), False, False, 0)
+g.pack_start(pillbtn("Open volume mixer card", launcher(["rice-volume"])), False, False, 0)
+
+# ------------------------------------------------------------------ Display
+p = page("display", "\uf108", "Display", "monitor screen resolution refresh rotation brightness night light")
+
+
+def xr_outputs():
+    """{name: {modes: {'1920x1080': [164.83, ...]}, cur: (res, rate), rot}} parsed from xrandr."""
+    res, cur = {}, None
+    for ln_ in out("xrandr", t=4).splitlines():
+        m = re.match(r"^(\S+) connected(?: primary)? (?:(\d+x\d+)\+\d+\+\d+)?\s*(normal|left|right|inverted)?", ln_)
+        if m:
+            cur = m.group(1); res[cur] = dict(modes={}, cur=None, rot=m.group(3) or "normal"); continue
+        if re.match(r"^\S", ln_):
+            cur = None; continue
+        mm = re.match(r"^\s+(\d+x\d+)\s+(.*)$", ln_)
+        if cur and mm:
+            rates = re.findall(r"(\d+\.\d+)([* ]?)([+ ]?)", mm.group(2))
+            for rt, star, plus in rates:
+                res[cur]["modes"].setdefault(mm.group(1), []).append(float(rt))
+                if star == "*":
+                    res[cur]["cur"] = (mm.group(1), float(rt))
+    return res
+
+
+for name, info_ in xr_outputs().items():
+    g = card(p, name)
+    modes = sorted(info_["modes"], key=lambda x: -int(x.split("x")[0]) * int(x.split("x")[1]))
+    cr_ = info_["cur"] or (modes[0], info_["modes"][modes[0]][0]) if modes else None
+    if not cr_:
+        continue
+    pick = dict(res=cr_[0], rate=cr_[1], rot=info_["rot"], out=name)
+    rate_dd = [None]
+    holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+    def build_rates(pk=pick, im=info_, hd=holder):
+        for c in hd.get_children(): hd.remove(c)
+        rs = sorted(set(im["modes"].get(pk["res"], [60.0])), reverse=True)
+        if pk["rate"] not in rs: pk["rate"] = rs[0]
+        hd.pack_start(w.dropdown("Refresh rate", None, [(f"{x:.2f} Hz", x) for x in rs], pk["rate"], lambda v: pk.__setitem__("rate", v), 220), False, False, 0)
+        hd.show_all()
+
+    def set_res(v, pk=pick, br=build_rates):
+        pk["res"] = v; br()
+    g.pack_start(w.dropdown("Resolution", None, [(m_, m_) for m_ in modes], pick["res"], set_res, 220), False, False, 0)
+    build_rates(); g.pack_start(holder, False, False, 0)
+    g.pack_start(w.dropdown("Orientation", None, [("Normal", "normal"), ("Rotated left", "left"), ("Rotated right", "right"), ("Upside down", "inverted")], pick["rot"], lambda v, pk=pick: pk.__setitem__("rot", v)), False, False, 0)
+
+    def apply_mode(pk=pick):
+        sh("xrandr", "--output", pk["out"], "--mode", pk["res"], "--rate", f"{pk['rate']}", "--rotate", pk["rot"])
+        GLib.timeout_add(1200, lambda: (w.toast(f"{pk['out']}: {pk['res']} @ {pk['rate']:.0f} Hz"), False)[1])
+    g.pack_start(pillbtn("Apply to " + name, apply_mode), False, False, 0)
+
+g = card(p, "Brightness and night light")
+g.pack_start(w.vslider("Brightness", "software, all monitors", 30, 100, int(settings.sget("brightness", 1.0) * 100), lambda v: f"{int(v)}%", lambda v: (settings.sput("brightness", v / 100), sh("rice-apply"))), False, False, 0)
+r(g, "display", "Night light", w.Switch(settings.sget("night", False), sysset("night")), "warmer colours, easier on the eyes", "night blue light warm")
+g.pack_start(w.vslider("Colour temperature", None, 2500, 6500, int(settings.sget("night_k", 4000)), lambda v: f"{int(v)} K", sysset("night_k"), 100), False, False, 0)
+g = card(p, "Power saving")
+DP = [("Never", 0), ("After 1 minute", 1), ("After 5 minutes", 5), ("After 10 minutes", 10), ("After 15 minutes", 15), ("After 30 minutes", 30)]
+g.pack_start(w.dropdown("Turn off screens", "idle timeout", DP, settings.sget("dpms_min", 0), sysset("dpms_min")), False, False, 0)
+
+# ------------------------------------------------------------------ Input
+p = page("input", "\uf11c", "Keyboard & Mouse", "keyboard layout repeat caps mouse acceleration speed")
+g = card(p, "Keyboard")
+_m = re.search(r"delay:\s+(\d+)\s+repeat rate:\s+(\d+)", out("xset", "q", t=2))
+XR = (int(_m.group(1)), int(_m.group(2))) if _m else (300, 40)
+lay = []
+try:
+    sec = False
+    for ln_ in open("/usr/share/X11/xkb/rules/evdev.lst", errors="ignore"):
+        if ln_.startswith("!"):
+            sec = ln_.strip() == "! layout"; continue
+        if sec and ln_.strip():
+            k_, d_ = ln_.strip().split(None, 1); lay.append((f"{d_}  ({k_})", k_))
+except OSError:
+    lay = [("English (US)  (us)", "us"), ("Hungarian  (hu)", "hu")]
+curlay = settings.sget("kbd_layout") or (re.search(r"layout:\s+(\S+)", out("setxkbmap", "-query", t=2)) or [0, "us"])[1].split(",")[0]
+g.pack_start(w.dropdown("Layout", "changes immediately", lay, curlay, sysset("kbd_layout"), 260), False, False, 0)
+CAPS = [("Caps Lock (default)", None), ("Caps Lock = Escape", "caps:escape"), ("Caps Lock = Ctrl", "ctrl:nocaps"), ("Swap Caps and Escape", "caps:swapescape")]
+g.pack_start(w.dropdown("Caps Lock key", None, CAPS, settings.sget("caps"), lambda v: (settings.sput("caps", v), sh("rice-apply"))), False, False, 0)
+g.pack_start(w.vslider("Repeat delay", "before a held key repeats", 150, 800, int(settings.sget("kbd_delay", XR[0])), lambda v: f"{int(v)} ms", sysset("kbd_delay"), 10), False, False, 0)
+g.pack_start(w.vslider("Repeat rate", None, 10, 80, int(settings.sget("kbd_rate", XR[1])), lambda v: f"{int(v)} /s", sysset("kbd_rate"), 1), False, False, 0)
+g = card(p, "Mouse")
+g.pack_start(w.dropdown("Acceleration", "flat = raw 1:1 movement, best for games", [("Adaptive (default)", "adaptive"), ("Flat (no acceleration)", "flat")], settings.sget("mouse_profile", "adaptive"), sysset("mouse_profile")), False, False, 0)
+g.pack_start(w.vslider("Pointer speed", None, -100, 100, int(settings.sget("mouse_speed", 0.0) * 100), lambda v: f"{v / 100:+.2f}", lambda v: (settings.sput("mouse_speed", v / 100), sh("rice-apply")), 5), False, False, 0)
+
+# ------------------------------------------------------------------ Windows
+p = page("windows", "\uf2d0", "Windows & Bar", "gaps bar padding tiling dwm")
+g = card(p, "Layout (needs the rebuilt dwm)")
+g.pack_start(w.vslider("Window gaps", "between tiled windows and screen edges", 0, 40, int(settings.sget("gap", 10)), lambda v: f"{int(v)} px", sysset("gap")), False, False, 0)
+g.pack_start(w.vslider("Bar top gap", "space above the floating bar", 0, 30, int(settings.sget("vpad", 10)), lambda v: f"{int(v)} px", sysset("vpad")), False, False, 0)
+g.pack_start(w.vslider("Bar side gap", "space left and right of the bar", 0, 40, int(settings.sget("spad", 12)), lambda v: f"{int(v)} px", sysset("spad")), False, False, 0)
+g = card(p, "Keys")
+info(g, "Gaps", "Mod+-  /  Mod+=  /  Mod+Shift+= (reset)")
+info(g, "Bar", "Mod+b toggles the bar")
+info(g, "Canvas mode", "Mod+Shift+g")
+
+# ------------------------------------------------------------------ Network
+import ipaddress, time
+p = page("net", "", "Network", "ip wifi ethernet dns mtu ping lease gateway")
+RES = Gtk.Label(xalign=0); RES.set_ellipsize(3)
+
+
+def say(t, err=False):
+    RES.set_markup(f'<span size="10500" foreground="{"#ff7a85" if err else rice.CUR["dim"]}">{GLib.markup_escape_text(t)}</span>')
+
+
+def bg(fn, *a):
+    threading.Thread(target=lambda: GLib.idle_add(*fn(*a)), daemon=True).start()
+
+
+def sysfs(i, f):
+    try: return open(f"/sys/class/net/{i}/{f}").read().strip()
+    except OSError: return ""
+
+
+def human(n):
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or u == "TB": return f"{n:.1f} {u}" if u != "B" else f"{int(n)} B"
+        n /= 1024
+
+
+def rate(n):
+    return human(n) + "/s"
+
+
+ifaces = []
+gw = {}
+for ln_ in out("ip", "route").splitlines():
+    m = re.match(r"default via (\S+) dev (\S+)", ln_)
+    if m: gw[m.group(2)] = m.group(1)
+for ln_ in out("ip", "-o", "addr").splitlines():
+    f = ln_.split()
+    if len(f) >= 4 and f[1] != "lo" and f[2] in ("inet", "inet6") and not (f[2] == "inet6" and f[3].startswith("fe80")):
+        ifaces.append((f[1], f[2], f[3]))
+names = []
+for i_, _f, _a in ifaces:
+    if i_ not in names: names.append(i_)
+for i_ in os.listdir("/sys/class/net"):
+    if i_ != "lo" and i_ not in names and not i_.startswith(("veth", "docker", "br-")): names.append(i_)
+live = []
+for i_ in names:
+    g = card(p, f"{i_}")
+    info(g, "State", (sysfs(i_, "operstate") or "?").lower())
+    for n_, fam, ad in ifaces:
+        if n_ == i_: info(g, "IPv4" if fam == "inet" else "IPv6", ad)
+    info(g, "Gateway", gw.get(i_, "-"))
+    info(g, "MAC", sysfs(i_, "address") or "-")
+    sp_ = sysfs(i_, "speed")
+    info(g, "Link speed", (sp_ + " Mb/s") if sp_.lstrip("-").isdigit() and int(sp_) > 0 else "-")
+    info(g, "MTU", sysfs(i_, "mtu") or "-")
+    lb = Gtk.Label(xalign=0); live.append((i_, lb, [None, None]))
+    g.pack_start(lb, False, False, 0)
+
+
+def tick_rates():
+    now = time.time()
+    for i_, lb, st in live:
+        try:
+            rx, tx = int(sysfs(i_, "statistics/rx_bytes")), int(sysfs(i_, "statistics/tx_bytes"))
+        except ValueError:
+            continue
+        txt = f"↓ {human(rx)}   ↑ {human(tx)}"
+        if st[0]:
+            dt = max(now - st[0][2], 0.1)
+            txt += f"      now  ↓ {rate((rx - st[0][0]) / dt)}   ↑ {rate((tx - st[0][1]) / dt)}"
+        st[0] = (rx, tx, now)
+        lb.set_markup(f'<span size="10500" alpha="75%">{GLib.markup_escape_text(txt)}</span>')
+    return True
+
+
+tick_rates(); GLib.timeout_add(1000, tick_rates)
+
+# ---- DNS
+g = card(p, "DNS")
+def cur_dns():
+    try: return [ln_.split()[1] for ln_ in open("/etc/resolv.conf") if ln_.startswith("nameserver")]
+    except OSError: return []
+def dns_custom():
+    try: return "rice-dns" in open("/etc/dhcpcd.conf").read()
+    except OSError: return False
+dns_lbl = Gtk.Label(xalign=0); dns_lbl.set_ellipsize(3); dns_lbl.set_max_width_chars=None
+def show_dns():
+    dns_lbl.set_markup(f'<span size="11500">{GLib.markup_escape_text(", ".join(cur_dns()) or "none")}</span>   <span size="9500" alpha="60%">{"custom" if dns_custom() else "automatic (DHCP)"}</span>')
+show_dns()
+h_ = Gtk.Box(spacing=10); k_ = Gtk.Label(xalign=0); k_.set_markup('<span size="11000" alpha="60%">Servers in use</span>'); k_.set_size_request(200, -1)
+h_.pack_start(k_, False, False, 0); h_.pack_start(dns_lbl, True, True, 0); g.pack_start(h_, False, False, 0)
+PRE = [("Automatic (DHCP)", "auto"), ("Cloudflare", "1.1.1.1 1.0.0.1"), ("Google", "8.8.8.8 8.8.4.4"),
+       ("Quad9", "9.9.9.9 149.112.112.112"), ("AdGuard", "94.140.14.14 94.140.15.15"), ("Custom …", "custom")]
+dsel = ["auto" if not dns_custom() else "custom"]
+c1, c2 = w.entry("primary  e.g. 1.1.1.1", 200), w.entry("secondary (optional)", 200)
+cust = Gtk.Box(spacing=8); cust.pack_start(c1, True, True, 0); cust.pack_start(c2, True, True, 0)
+cust.set_no_show_all(True)
+def pick_dns(v):
+    dsel[0] = v
+    if v == "custom": cust.show_all()
+    else: cust.hide()
+g.pack_start(w.dropdown("Provider", "asks for the admin password", PRE, dsel[0] if dsel[0] == "auto" else "custom", pick_dns, 230), False, False, 0)
+g.pack_start(cust, False, False, 0)
+IFACE = names[0] if names else "eno1"
+
+
+def asroot(script, ok_msg):
+    """Run a shell script as root through pkexec (polkit-agent shows the prompt) and report."""
+    def work():
+        try:
+            r_ = subprocess.run(["pkexec", "sh", "-c", script], capture_output=True, text=True, timeout=120)
+            ok = r_.returncode == 0
+            msg = ok_msg if ok else ("cancelled" if r_.returncode in (126, 127) else (r_.stderr.strip().splitlines() or ["failed"])[-1])
+        except Exception as e:
+            ok, msg = False, str(e)
+        GLib.idle_add(lambda: (say(msg, not ok), show_dns(), False)[2])
+    say("waiting for authorisation …")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def apply_dns():
+    v = dsel[0]
+    if v == "auto":
+        script = f"rm -f /etc/resolv.conf.head; sed -i '/# rice-dns/,+1d' /etc/dhcpcd.conf; dhcpcd -n {IFACE} >/dev/null 2>&1; true"
+        return asroot(script, "DNS is automatic again")
+    if v == "custom":
+        v = " ".join(x.get_text().strip() for x in (c1, c2) if x.get_text().strip())
+    try:
+        servers = [str(ipaddress.ip_address(x)) for x in v.split()]
+    except ValueError:
+        return say("not a valid IP address", True)
+    if not servers:
+        return say("enter at least one server", True)
+    ns = "\\n".join("nameserver " + x for x in servers)
+    script = (f"set -e; printf '# rice-dns\\n{ns}\\n' > /etc/resolv.conf.head; "
+              f"grep -q '# rice-dns' /etc/dhcpcd.conf || printf '\\n# rice-dns\\nnooption domain_name_servers\\n' >> /etc/dhcpcd.conf; "
+              f"dhcpcd -n {IFACE} >/dev/null 2>&1 || true; printf '{ns}\\n' > /etc/resolv.conf")
+    asroot(script, "DNS set: " + ", ".join(servers))
+
+
+g.pack_start(pillbtn("Apply DNS", apply_dns), False, False, 0)
+
+# ---- tests + actions
+g = card(p, "Diagnostics")
+def t_ping():
+    o = out("ping", "-c", "3", "-W", "2", "1.1.1.1", t=8)
+    m = re.search(r"= [\d.]+/([\d.]+)/", o)
+    return (lambda: (say(f"internet: 1.1.1.1 answers in {m.group(1)} ms" if m else "no reply from 1.1.1.1", not m), False)[1],)
+def t_gw():
+    gws = list(gw.values())
+    if not gws: return (lambda: (say("no default gateway", True), False)[1],)
+    o = out("ping", "-c", "3", "-W", "2", gws[0], t=8)
+    m = re.search(r"= [\d.]+/([\d.]+)/", o)
+    return (lambda: (say(f"router {gws[0]}: {m.group(1)} ms" if m else f"router {gws[0]} does not answer", not m), False)[1],)
+def t_dns():
+    t0 = time.time(); o = out("getent", "hosts", "example.com", t=6); dt = (time.time() - t0) * 1000
+    return (lambda: (say(f"DNS ok: example.com -> {o.split()[0]} in {dt:.0f} ms" if o else "DNS lookup failed", not o), False)[1],)
+def t_pub():
+    o = out("curl", "-s", "-m", "6", "https://api.ipify.org", t=8)
+    return (lambda: (say("public IP: " + o if o else "could not reach api.ipify.org", not o), False)[1],)
+def t_conn():
+    o = out("ss", "-Htn", "state", "established", t=3)
+    n = len(o.splitlines())
+    return (lambda: (say(f"{n} established TCP connections"), False)[1],)
+tb = Gtk.Grid(column_spacing=6, row_spacing=6, column_homogeneous=True)
+for ti_, (l_, f_) in enumerate( (("Ping internet", t_ping), ("Ping router", t_gw), ("DNS lookup", t_dns), ("Public IP", t_pub), ("Connections", t_conn))):
+    tb.attach(pillbtn(l_, lambda f_=f_, l_=l_: (say(l_ + " …"), bg(f_))), ti_ % 3, ti_ // 3, 1, 1)
+g.pack_start(tb, False, False, 0)
+g.pack_start(RES, False, False, 0)
+
+g = card(p, "Options")
+g.pack_start(w.dropdown("MTU", "until reboot; 1500 is normal", [(str(x), x) for x in (1500, 1492, 1480, 1400, 9000)], int(sysfs(IFACE, "mtu") or 1500),
+             lambda v: asroot(f"ip link set dev {IFACE} mtu {int(v)}", f"MTU set to {int(v)}")), False, False, 0)
+g.pack_start(pillbtn("Renew DHCP lease", lambda: asroot(f"dhcpcd -n {IFACE} >/dev/null 2>&1; true", "lease renewed")), False, False, 0)
+g = card(p, "Self-hosted")
+curl = open(os.path.expanduser("~/.cache/rice/cobalt_url")).read().strip() if os.path.exists(os.path.expanduser("~/.cache/rice/cobalt_url")) else "https://cobalt.example.org/"
+ce = w.entry("cobalt API url", 220); ce.set_text(curl)
+def save_cobalt(*_):
+    os.makedirs(os.path.expanduser("~/.cache/rice"), exist_ok=True)
+    open(os.path.expanduser("~/.cache/rice/cobalt_url"), "w").write(ce.get_text().strip()); w.toast("cobalt URL saved")
+ce.connect("activate", save_cobalt)
+g.pack_start(w.row("Downloader API", ce, "enter saves"), False, False, 0)
+
+# ------------------------------------------------------------------ Shortcuts (editable)
+p = page("keys", "", "Shortcuts", "keybinds hotkeys keys shortcuts")
+BINDS = os.path.expanduser("~/.config/rice/binds.conf")
+os.makedirs(os.path.dirname(BINDS), exist_ok=True)
+
+
+def seed():
+    for exe in (f"{HOME}/dwm/dwm", "dwm"):
+        o = out(exe, "--dump-binds", t=3)
+        if o.count("=") > 10:
+            open(BINDS, "w").write(o + "\n")
+            return True
+    return False
+
+
+if not os.path.exists(BINDS):
+    seed()
+binds = []
+if os.path.exists(BINDS):
+    for ln_ in open(BINDS):
+        t_ = ln_.split("#")[0].strip()
+        if "=" not in t_: continue
+        c_, a_ = t_.split("=", 1)
+        a_ = a_.strip().split(None, 1)
+        if a_: binds.append(dict(combo=c_.strip(), act=a_[0], arg=a_[1] if len(a_) > 1 else ""))
+NICE = dict(killclient="Close window", focusstack="Focus next / previous", zoom="Make master", setlayout="Toggle layout", cyclelayout="Next layout",
+            resetlayout="Default layout (tile)", togglefloating="Toggle floating", togglebar="Toggle bar", setgaps="Gaps", focusmon="Focus monitor",
+            tagmon="Send to monitor", snapwin="Snap window", movewin="Nudge window", sizewin="Resize window", togglecanvas="Canvas mode",
+            quit="Quit dwm", xrdb="Reload colours", incnmaster="Master count", setmfact="Master size", movestack="Move window in stack",
+            view="Go to workspace", toggleview="Show workspace too", tag="Move to workspace", toggletag="Also on workspace")
+CMDN = {"theme-switch": "Themes", "rice-tools": "Tools", "rice-settings": "Settings", "rice-search": "Search", "clip-pick": "Clipboard", "rice-media": "Media card",
+        "screenshot.sh": "Screenshot", "rice-lock": "Lock screen", "rice-record": "Screen recorder", "konsole": "Terminal", "rofi-launcher": "App launcher",
+        "dwm-volume": "Volume", "rice-media": "Media"}
+DIRN = {"0": "left", "1": "right", "2": "up", "3": "down"}
+
+
+def nice(b):
+    a, g_ = b["act"], b["arg"]
+    if a == "spawn":
+        first = os.path.basename(g_.split()[0]) if g_.split() else ""
+        n = CMDN.get(first, g_[:36])
+        return n + (" " + g_.split(None, 1)[1] if first in ("dwm-volume",) and len(g_.split()) > 1 else "") if first != "rice-media" else ("Media " + g_.split()[-1] if len(g_.split()) > 1 else "Media card")
+    n = NICE.get(a, a)
+    if a in ("snapwin", "movewin", "sizewin"): n += " " + DIRN.get(g_, g_)
+    elif a in ("setgaps",): n += {"0": " reset", "2": " +", "-2": " −"}.get(g_, "")
+    elif a in ("view", "toggleview", "tag", "toggletag"): n += " " + g_
+    elif a in ("focusstack", "movestack", "focusmon", "tagmon", "cyclelayout"): n += " " + ("next" if g_.startswith("1") or g_.startswith("+") else "previous")
+    elif a in ("incnmaster", "setmfact"): n += " " + ("+" if not g_.startswith("-") else "−")
+    return n
+
+
+def group(b):
+    a = b["act"]
+    if a == "spawn": return "Programs"
+    if a in ("view", "toggleview", "tag", "toggletag"): return "Workspaces"
+    if a in ("cyclelayout", "setlayout", "resetlayout", "setmfact", "incnmaster", "setgaps", "togglebar"): return "Layout"
+    if a in ("focusmon", "tagmon"): return "Monitors"
+    if a in ("quit", "xrdb"): return "System"
+    return "Windows"
+
+
+def save_binds():
+    with open(BINDS, "w") as f:
+        f.write("# dwm keybinds: <Mod+Shift+key> = <action> [argument]   (Mod = Alt). Edited by rice-settings.\n")
+        for b in binds:
+            f.write(f"{b['combo']} = {b['act']}" + (f" {b['arg']}" if b["arg"] else "") + "\n")
+    sh("xprop", "-root", "-f", "_RICE_CMD", "32c", "-set", "_RICE_CMD", "5, 0")
+
+
+capture = [None]
+MODS = ((Gdk.ModifierType.MOD1_MASK, "Mod"), (Gdk.ModifierType.SHIFT_MASK, "Shift"), (Gdk.ModifierType.CONTROL_MASK, "Ctrl"), (Gdk.ModifierType.MOD4_MASK, "Super"))
+
+
+def combo_from(e):
+    km = Gdk.Keymap.get_for_display(Gdk.Display.get_default())
+    ok, kv, *_ = km.translate_keyboard_state(e.hardware_keycode, 0, e.group)
+    name = Gdk.keyval_name(kv if ok else e.keyval) or ""
+    if not name or name.endswith(("_L", "_R")) or name in ("Mode_switch", "ISO_Level3_Shift", "Caps_Lock", "Num_Lock"):
+        return None
+    return "+".join([n for m, n in MODS if e.state & m] + [name])
+
+
+class KeyRow(Gtk.Box):
+    def __init__(self, b):
+        super().__init__(spacing=8)
+        self.b = b
+        l = Gtk.Label(xalign=0); l.set_markup(f'<span size="11500">{GLib.markup_escape_text(nice(b))}</span>'); l.set_ellipsize(3)
+        self.pack_start(l, True, True, 0)
+        self.btn = Gtk.Button(); self.btn.get_style_context().add_class("pill"); self.btn.set_size_request(230, -1)
+        self.btn.connect("clicked", lambda *_: self.listen())
+        self.pack_end(self.btn, False, False, 0)
+        if b["act"] == "spawn":
+            x = Gtk.Button(label="✕"); x.get_style_context().add_class("pill"); x.connect("clicked", lambda *_: self.remove_bind())
+            self.pack_end(x, False, False, 0)
+        self.paint()
+
+    def paint(self):
+        self.btn.set_label(self.b["combo"] or "unassigned")
+
+    def listen(self):
+        if capture[0]: capture[0].paint()
+        capture[0] = self
+        self.btn.set_label("press the new keys …   (Esc cancel, Del unbind)")
+
+    def got(self, e):
+        if e.keyval == Gdk.KEY_Escape:
+            pass
+        elif e.keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
+            self.b["combo"] = ""; save_binds()
+        else:
+            c = combo_from(e)
+            if c is None: return False
+            clash = next((o for o in binds if o is not self.b and o["combo"] == c), None)
+            if clash:
+                w.toast(f"{c} is already used by: {nice(clash)}")
+            else:
+                self.b["combo"] = c; save_binds()
+        capture[0] = None; self.paint(); return True
+
+    def remove_bind(self):
+        binds.remove(self.b); save_binds(); self.get_parent().remove(self)
+
+
+if not binds:
+    info(card(p), "No binds file", "build dwm first (needs --dump-binds), then reopen")
+else:
+    order = ["Programs", "Layout", "Windows", "Workspaces", "Monitors", "System"]
+    cards = {k: card(p, k) for k in order}
+    for k_, bx in cards.items(): bx.set_spacing(6)
+    for b in binds:
+        cards[group(b)].pack_start(KeyRow(b), False, False, 0)
+    g = card(p, "Add a shortcut")
+    ne = w.entry("command to run, e.g. firefox-mullvad", 300)
+    def add_bind():
+        cmd_ = ne.get_text().strip()
+        if not cmd_: return w.toast("type a command first")
+        b = dict(combo="", act="spawn", arg=cmd_); binds.append(b)
+        r_ = KeyRow(b); cards["Programs"].pack_start(r_, False, False, 0); r_.show_all(); r_.listen(); ne.set_text("")
+    g.pack_start(ne, False, False, 0)
+    g.pack_start(pillbtn("Add and choose keys", add_bind), False, False, 0)
+    def reset_binds():
+        try: os.remove(BINDS)
+        except OSError: pass
+        sh("xprop", "-root", "-f", "_RICE_CMD", "32c", "-set", "_RICE_CMD", "5, 0"); w.toast("Defaults restored. Reopen settings.")
+    g.pack_start(pillbtn("Reset all shortcuts to defaults", reset_binds), False, False, 0)
+
+# ------------------------------------------------------------------ About
+p = page("about", "", "About", "system info cpu memory kernel")
+g = card(p, "This computer")
+info(g, "Host", out("hostname", t=2))
+info(g, "Kernel", out("uname", "-sr", t=2))
+cpu = next((ln_.split(":", 1)[1].strip() for ln_ in open("/proc/cpuinfo") if ln_.startswith("model name")), "")
+info(g, "CPU", cpu)
+mem = {ln_.split(":")[0]: int(ln_.split()[1]) for ln_ in open("/proc/meminfo") if ":" in ln_}
+info(g, "Memory", f"{(mem['MemTotal'] - mem['MemAvailable']) / 1048576:.1f} / {mem['MemTotal'] / 1048576:.1f} GiB used")
+gpu = out("sh", "-c", "lspci 2>/dev/null | grep -i 'vga\\|3d' | head -1 | cut -d: -f3-", t=2)
+if gpu: info(g, "GPU", gpu.strip())
+info(g, "Uptime", out("uptime", "-p", t=2).replace("up ", ""))
+info(g, "Session", "dwm 6.8 + picom, rice scripts in ~/.local/bin")
+g = card(p, "Power")
+pr = Gtk.Box(spacing=8)
+for l, c in (("Lock", ["rice-lock"]), ("Account / power", ["rice-power"])):
+    pr.pack_start(pillbtn(l, launcher(c)), False, False, 0)
+g.pack_start(pr, False, False, 0)
+
+# ------------------------------------------------------------------ Search results page
+sp = Gtk.ScrolledWindow(); sp.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+sb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+for m_, v in (("start", 30), ("end", 30), ("top", 24), ("bottom", 24)):
+    getattr(sb, f"set_margin_{m_}")(v)
+sp.add(sb); stack.add_named(sp, "search")
+
+ent = w.entry("search settings …")
+side.pack_start(ent, False, False, 8)
+side.reorder_child(ent, 0)
+prev = ["look"]
+
+
+def do_search(e):
+    q = e.get_text().lower().strip()
+    if not q:
+        goto(prev[0]); return
+    if stack.get_visible_child_name() != "search":
+        prev[0] = stack.get_visible_child_name()
+    for c in sb.get_children(): sb.remove(c)
+    t = Gtk.Label(xalign=0); t.set_markup('<span size="19000" weight="bold">Search</span>'); sb.pack_start(t, False, False, 6)
+    hits = [(pg, lb) for pg, lb, kw in INDEX if q in lb.lower() or q in kw.lower()]
+    seen = set()
+    for pg, lb in hits:
+        if (pg, lb) in seen: continue
+        seen.add((pg, lb))
+        bt = Gtk.Button(); bt.get_style_context().add_class("pill")
+        bt.set_label(f"{lb}      ›  {dict((k, n.label) for k, n in NAVS.items())[pg]}"); bt.get_child().set_xalign(0)
+        bt.connect("clicked", lambda _b, pg=pg: (ent.set_text(""), goto(pg)))
+        sb.pack_start(bt, False, False, 0)
+    if not hits:
+        n = Gtk.Label(); n.set_markup('<span alpha="55%">nothing found</span>'); sb.pack_start(n, False, False, 0)
+    sb.show_all()
+    stack.set_visible_child_name("search")
+    for n in NAVS.values(): n.sel = False; n.queue_draw()
+
+
+ent.connect("changed", do_search)
+side.pack_start(Gtk.Box(), True, True, 0)
+side.pack_end(Gtk.Label(label=""), False, False, 0)
+
+# ------------------------------------------------------------------ show
+def on_key(wd, e):
+    if capture[0]:
+        return capture[0].got(e) or True
+    if e.keyval == Gdk.KEY_Escape:
+        if ent.get_text(): ent.set_text("")
+        else: panel.quit_anim()
+        return True
+    return False
+
+
+def on_press(wd, e):
+    a = panel.get_allocation()
+    if e.button == 3 or not (0 <= e.x <= a.width and 0 <= e.y <= a.height):
+        panel.quit_anim(); return True
+    return False
+
+
+def grab():
+    seat = Gdk.Display.get_default().get_default_seat()
+    if seat.grab(panel.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None) == Gdk.GrabStatus.SUCCESS:
+        return False
+    grab.n += 1
+    return grab.n < 30
+
+
+grab.n = 0
+panel.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+panel.connect("key-press-event", on_key)
+panel.connect("button-press-event", on_press)
+panel.show_all()
+goto(sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] in NAVS else "home")
+GLib.timeout_add(120, grab)
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda *a: (panel.quit_anim(), True)[1])
+Gtk.main()
+try: os.remove(PID)
+except OSError: pass

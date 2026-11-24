@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""Universal search: apps, files, settings, commands, calculator, web.   (Mod+Shift+o -> Tools, or run directly)
+   prefixes:  > run in terminal   ? web search   = calculator   / ~ path browse"""
+import os, sys, re, ast, math, glob, threading, subprocess, signal, shutil, operator, configparser, time, json
+# single instance, decided before the heavy imports: a second call closes the open card (toggle)
+import fcntl, time
+_cache = os.path.expanduser("~/.cache/rice"); os.makedirs(_cache, exist_ok=True)
+_lock = open(os.path.join(_cache, "search.lock"), "w")
+_pidf = os.path.join(_cache, "search.pid")
+try:
+    fcntl.flock(_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    try:
+        if time.time() - os.path.getmtime(_pidf) > 1.2:      # key spam within 1.2 s is ignored, a later press closes
+            os.kill(int(open(_pidf).read()), signal.SIGTERM)
+    except Exception:
+        pass
+    sys.exit(0)
+open(_pidf, "w").write(str(os.getpid()))
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import rice, favs, widgets as w
+from rice import Gtk, Gdk, GLib
+
+HOME = os.path.expanduser("~")
+W_, H_, ROWS = 720, 560, 8
+
+
+def sh(*a, **k):
+    subprocess.Popen(list(a), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True, **k)
+
+
+# ------------------------------------------------------------------ sources
+def load_apps():
+    out = []
+    seen = set()
+    dirs = ["/usr/share/applications", "/usr/local/share/applications", f"{HOME}/.local/share/applications"]
+    for d in dirs:
+        for f in glob.glob(d + "/*.desktop"):
+            try:
+                cp = configparser.RawConfigParser(strict=False, interpolation=None)
+                cp.optionxform = str
+                cp.read(f, encoding="utf8")
+                e = cp["Desktop Entry"]
+                if e.get("NoDisplay", "").lower() == "true" or e.get("Hidden", "").lower() == "true" or e.get("Type") != "Application":
+                    continue
+                nm = e.get("Name", "")
+                if not nm or nm in seen:
+                    continue
+                seen.add(nm)
+                ex = re.sub(r"\s%[fFuUdDnNickvm]", "", e.get("Exec", "")).replace("%%", "%")
+                out.append(dict(kind="app", title=nm, sub=e.get("Comment", e.get("GenericName", "")), icon=e.get("Icon", ""),
+                                key=(nm + " " + e.get("GenericName", "") + " " + e.get("Keywords", "")).lower(), run=ex,
+                                term=e.get("Terminal", "").lower() == "true"))
+            except Exception:
+                pass
+    return out
+
+
+def load_cmds():
+    seen, out = set(), []
+    for d in os.environ.get("PATH", "").split(":"):
+        try:
+            for n in os.listdir(d):
+                if n not in seen and os.access(os.path.join(d, n), os.X_OK) and not os.path.isdir(os.path.join(d, n)):
+                    seen.add(n); out.append(n)
+        except OSError:
+            pass
+    return sorted(out)
+
+
+def tool(cmd):
+    return lambda: sh(cmd)
+
+
+def toggle_setting(k):
+    def f():
+        import settings, themes
+        settings.put(k, not settings.get(k))
+        if k in ("glass",):
+            wall = open(f"{themes.CACHE}/wall").read().strip(); name = open(f"{themes.CACHE}/current").read().strip()
+            themes.apply(dict(name=name, wall=wall, colors=None))
+    return f
+
+
+ACTIONS = [
+    ("Settings", "open the settings panel", "", "settings panel preferences options", tool("rice-settings")),
+    ("Toggle glass mode", "transparent + blurred vs solid menus", "", "glass transparent blur solid opaque", toggle_setting("glass")),
+    ("Toggle online wallpapers", "online vs offline theme switcher", "", "online offline wallpapers", toggle_setting("online")),
+    ("Toggle animations", "popup and panel animations", "", "animations motion", toggle_setting("anim")),
+    ("Themes", "wallpaper + colour theme switcher", "", "theme wallpaper colors switcher", tool("theme-switch")),
+    ("Tools", "converter, downloader, picker …", "", "tools utilities", tool("rice-tools")),
+    ("Convert files", "anything to anything", "", "convert converter ffmpeg image video audio", tool("rice-convert")),
+    ("Download video / music", "self-hosted cobalt", "", "download video music youtube soundcloud cobalt yt", tool("rice-dl")),
+    ("Screen recorder", "desktop / monitor / region, pick audio", "", "record recorder screencast video", tool("rice-record")),
+    ("Screenshot", "capture + annotate", "", "screenshot capture print", tool("rice-shot")),
+    ("Clipboard history", "", "", "clipboard history paste", tool("clip-pick")),
+    ("Media player", "now playing card", "", "media music player spotify mpris", tool("rice-media")),
+    ("Volume", "volume + devices", "", "volume sound audio mixer", tool("rice-volume")),
+    ("Lock screen", "", "", "lock screen", tool("rice-lock")),
+    ("Account / power", "logout, reboot, poweroff", "", "power logout reboot shutdown poweroff account", tool("rice-power")),
+]
+
+USAGE_F = f"{HOME}/.cache/rice/usage.json"
+APPS_F = f"{HOME}/.cache/rice/apps.json"
+try:
+    USAGE = json.load(open(USAGE_F))
+except Exception:
+    USAGE = {}
+
+
+def bump(title):
+    e = USAGE.get(title, [0, 0])
+    USAGE[title] = [e[0] + 1, time.time()]
+    try:
+        json.dump(USAGE, open(USAGE_F + ".tmp", "w")); os.replace(USAGE_F + ".tmp", USAGE_F)
+    except Exception:
+        pass
+
+
+FAVS = set(favs.load().get("apps", []))
+
+
+def boost(title):
+    """frecency: use count, decaying with age (half-life about 2 weeks)"""
+    fav = 60 if title in FAVS else 0
+    e = USAGE.get(title)
+    if not e:
+        return fav
+    return fav + min(40, 8 * math.log2(1 + e[0]) * 0.5 ** ((time.time() - e[1]) / 1209600))
+
+
+def rk(r):
+    """usage/favorite key of a result"""
+    if r["kind"] == "app": return r["title"]
+    return r["kind"] + ":" + (r.get("path") or r["title"])
+
+
+def counted(key, fn):
+    def f():
+        bump(key); fn()
+    return f
+
+
+def app_go(a):
+    def f():
+        bump(a["title"])
+        sh("konsole", "-e", a["run"]) if a["term"] else sh("sh", "-c", a["run"])
+    return f
+
+
+def _dirs_mtime():
+    m = 0
+    for d in ("/usr/share/applications", "/usr/local/share/applications", f"{HOME}/.local/share/applications"):
+        try: m = max(m, os.stat(d).st_mtime)
+        except OSError: pass
+    return m
+
+
+APPS = []
+CMDS = []
+def _load_apps():
+    try:
+        c = json.load(open(APPS_F))
+        if c["m"] >= _dirs_mtime():
+            APPS.extend(c["apps"])
+            GLib.idle_add(lambda: (run_query() if not ent.get_text().strip() else None, False)[1])
+            return
+    except Exception:
+        pass
+    APPS.extend(load_apps())
+    try:
+        json.dump(dict(m=_dirs_mtime(), apps=APPS), open(APPS_F, "w"))
+    except Exception:
+        pass
+    try:
+        GLib.idle_add(lambda: (run_query() if not ent.get_text().strip() else None, False)[1])
+    except Exception:
+        pass
+threading.Thread(target=_load_apps, daemon=True).start()
+threading.Thread(target=lambda: CMDS.extend(load_cmds()), daemon=True).start()
+
+_ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+        ast.Pow: operator.pow, ast.Mod: operator.mod, ast.USub: operator.neg, ast.UAdd: operator.pos, ast.FloorDiv: operator.floordiv}
+_fn = {k: getattr(math, k) for k in ("sqrt", "sin", "cos", "tan", "log", "log2", "log10", "exp", "floor", "ceil")}
+_fn.update(abs=abs, round=round)
+_cn = dict(pi=math.pi, e=math.e)
+
+
+def _ev(n):
+    if isinstance(n, ast.Expression): return _ev(n.body)
+    if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)): return n.value
+    if isinstance(n, ast.BinOp) and type(n.op) in _ops:
+        a, b = _ev(n.left), _ev(n.right)
+        if isinstance(n.op, ast.Pow) and abs(b) > 1000: raise ValueError
+        return _ops[type(n.op)](a, b)
+    if isinstance(n, ast.UnaryOp) and type(n.op) in _ops: return _ops[type(n.op)](_ev(n.operand))
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in _fn: return _fn[n.func.id](*[_ev(a) for a in n.args])
+    if isinstance(n, ast.Name) and n.id in _cn: return _cn[n.id]
+    raise ValueError
+
+
+def calc(q):
+    q = q.strip().lstrip("=").replace("^", "**").replace("×", "*").replace("÷", "/")
+    if not re.search(r"\d", q) or not re.fullmatch(r"[\d\s+\-*/().,%a-z]+", q):
+        return None
+    try:
+        v = _ev(ast.parse(q.replace(",", "."), mode="eval"))
+        return ("%.10g" % v) if isinstance(v, float) else str(v)
+    except Exception:
+        return None
+
+
+def fuzzy(q, s):
+    """score 0 = no match; prefix > word start > substring > subsequence."""
+    if s.startswith(q): return 100 - min(len(s), 50) * 0.1
+    if (" " + q) in s: return 80
+    if q in s: return 60
+    it = iter(s)
+    if len(q) > 3 and len(s) < 40 and all(ch in it for ch in q): return 20
+    return 0
+
+
+def instant(q):
+    ql = q.lower().strip()
+    res = []
+    if not ql:
+        for a in sorted(APPS, key=lambda a: (-boost(a["title"]), a["title"].lower()))[:ROWS]:
+            res.append(dict(kind="app", title=a["title"], sub=a["sub"], icon=a["icon"], glyph="", go=app_go(a)))
+        return res
+    if q.startswith(">"):
+        c = q[1:].strip()
+        if c:
+            res.append(dict(kind="run", title="Run in terminal:  " + c, sub="konsole -e", glyph="", go=lambda: sh("konsole", "-e", "sh", "-c", c + "; exec $SHELL")))
+        return res
+    if q.startswith("?"):
+        c = q[1:].strip()
+        if c:
+            res.append(dict(kind="web", title="Search the web:  " + c, sub="duckduckgo", glyph="", go=lambda: sh("xdg-open", "https://duckduckgo.com/?q=" + subprocess.list2cmdline([c]).replace(" ", "+"))))
+        return res
+    r = calc(ql)
+    if r is not None:
+        res.append(dict(kind="calc", title="= " + r, sub="calculator  ·  enter copies", glyph="", go=lambda: subprocess.run(["xclip", "-selection", "clipboard"], input=r.encode())))
+    sc = []
+    for a in ACTIONS:
+        s = fuzzy(ql, (a[0] + " " + a[3]).lower())
+        if s: sc.append((s + 5 + boost("setting:" + a[0]), dict(kind="setting", title=a[0], sub=a[1], glyph=a[2], go=counted("setting:" + a[0], a[4]))))
+    for a in APPS:
+        s = fuzzy(ql, a["key"])
+        if s:
+            sc.append((s + 10, dict(kind="app", title=a["title"], sub=a["sub"], icon=a["icon"], glyph="",
+                                    go=(lambda a=a: sh("konsole", "-e", a["run"]) if a["term"] else sh("sh", "-c", a["run"])))))
+    if len(ql) >= 2:
+        for c in CMDS:
+            s = fuzzy(ql, c)
+            if s and s >= 60: sc.append((s - 15 + boost("cmd:" + c), dict(kind="cmd", title=c, sub="command", glyph="", go=counted("cmd:" + c, lambda c=c: sh("konsole", "-e", "sh", "-c", c + "; exec $SHELL")))))
+            if len(sc) > 400: break
+    sc.sort(key=lambda x: -x[0])
+    res += [x[1] for x in sc[:10]]
+    return res
+
+
+def files_search(q, token, cb):
+    ql = q.strip()
+    if ql.startswith(("/", "~")):
+        base = os.path.expanduser(ql)
+        d, part = (base, "") if os.path.isdir(base) else (os.path.dirname(base), os.path.basename(base).lower())
+        out = []
+        try:
+            for e in sorted(os.scandir(d), key=lambda e: (not e.is_dir(), e.name.lower())):
+                if part in e.name.lower() and not (e.name.startswith(".") and not part.startswith(".")):
+                    out.append(e.path)
+        except OSError:
+            pass
+        GLib.idle_add(cb, token, out[:30]); return
+    if len(ql) < 2 or not shutil.which("fd"):
+        GLib.idle_add(cb, token, []); return
+    try:
+        o = subprocess.run(["fd", "-i", "--max-results", "40", "--exclude", ".cache", "--exclude", "node_modules", "--exclude", ".local/share/Trash",
+                            "--exclude", "target", "--exclude", ".git", "--", ql, HOME], capture_output=True, text=True, timeout=4).stdout.split("\n")
+    except Exception:
+        o = []
+    paths = [p for p in o if p]
+    paths.sort(key=lambda p: (len(os.path.basename(p.rstrip("/"))), p))
+    GLib.idle_add(cb, token, paths[:12])
+
+
+# ------------------------------------------------------------------ UI
+card = rice.Card(W_, H_, radius=26)
+card.grow_dur = 0.34
+box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+for m in ("start", "end", "top", "bottom"):
+    getattr(box, f"set_margin_{m}")(18)
+card.add(box)
+ibar = Gtk.Box(spacing=10)
+ico = Gtk.Label(); ico.set_markup(f'<span font_family="{rice.ICON_FONT}" size="17000" foreground="{rice.CUR["accent"]}"></span>')
+ent = Gtk.Entry(); ent.set_has_frame(False); ent.set_placeholder_text("search apps, files, settings, commands …   (> run   ? web   = math)")
+ent.set_size_request(-1, 44)
+ibar.pack_start(ico, False, False, 8); ibar.pack_start(ent, True, True, 0)
+box.pack_start(ibar, False, False, 0)
+sc = Gtk.ScrolledWindow(); sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
+lst = Gtk.ListBox(); lst.set_selection_mode(Gtk.SelectionMode.SINGLE); lst.set_activate_on_single_click(True)
+sc.add(lst)
+box.pack_start(sc, True, True, 0)
+hint = Gtk.Label(xalign=0.5)
+hint.set_markup('<span size="9000" alpha="50%">↑↓ select   ⏎ open   tab: reveal in folder   ctrl+f: ★ favorite   esc close</span>')
+box.pack_end(hint, False, False, 0)
+
+results = []
+cur_q = [""]
+token = [0]
+timer = [None]
+sel = [0]
+EMPTY = Gtk.Label()
+EMPTY.set_markup('<span size="11500" alpha="55%">type to search</span>')
+
+
+def kind_label(k):
+    return {"app": "app", "setting": "action", "file": "file", "dir": "folder", "calc": "math", "cmd": "cmd", "run": "run", "web": "web"}.get(k, "")
+
+
+def mkrow(r):
+    row = Gtk.ListBoxRow()
+    b = Gtk.Box(spacing=12)
+    b.set_margin_top(7); b.set_margin_bottom(7); b.set_margin_start(10); b.set_margin_end(12)
+    img = None
+    if r.get("icon"):
+        try:
+            th = Gtk.IconTheme.get_default()
+            if os.path.isabs(r["icon"]) and os.path.exists(r["icon"]):
+                from gi.repository import GdkPixbuf
+                img = Gtk.Image.new_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_size(r["icon"], 30, 30))
+            elif th.has_icon(r["icon"]):
+                img = Gtk.Image.new_from_icon_name(r["icon"], Gtk.IconSize.LARGE_TOOLBAR); img.set_pixel_size(30)
+        except Exception:
+            img = None
+    if img is None:
+        img = Gtk.Label(); img.set_markup(f'<span font_family="{rice.ICON_FONT}" size="16000">{r.get("glyph", chr(0xf15b))}</span>')
+        img.set_size_request(30, 30)
+    b.pack_start(img, False, False, 0)
+    v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    t = Gtk.Label(xalign=0); t.set_ellipsize(3)
+    star = "★ " if rk(r) in FAVS else ""
+    t.set_markup(f'<span size="12500" weight="bold">{GLib.markup_escape_text(r["title"])}</span>' + (f' <span foreground="{rice.CUR["accent"]}" size="11000">★</span>' if star else ""))
+    v.pack_start(t, False, False, 0)
+    if r.get("sub"):
+        s = Gtk.Label(xalign=0); s.set_ellipsize(1)
+        s.set_markup(f'<span size="9500" alpha="60%">{GLib.markup_escape_text(r["sub"])}</span>')
+        v.pack_start(s, False, False, 0)
+    b.pack_start(v, True, True, 0)
+    k = Gtk.Label(); k.set_markup(f'<span size="9000" alpha="45%">{kind_label(r["kind"])}</span>')
+    b.pack_end(k, False, False, 0)
+    row.add(b)
+    return row
+
+
+def show(rs):
+    global results
+    results = rs[:ROWS]
+    for c in lst.get_children():
+        lst.remove(c)
+    cur_q[0] = ent.get_text()
+    for r in results:
+        lst.add(mkrow(r))
+    lst.show_all()
+    if results:
+        sel[0] = 0
+        lst.select_row(lst.get_row_at_index(0))
+
+
+def file_result(p):
+    isd = os.path.isdir(p)
+    p = p.rstrip("/")
+    return dict(kind="dir" if isd else "file", title=os.path.basename(p) or p, sub=os.path.dirname(p).replace(HOME, "~"), glyph="" if isd else "",
+                path=p, go=counted(("dir:" if isd else "file:") + p, lambda p=p: sh("xdg-open", p)))
+
+
+def files_cb(tk, paths):
+    if tk != token[0]:
+        return False
+    cur = [r for r in results if r["kind"] not in ("file", "dir")]
+    fr = [file_result(p) for p in paths]
+    fr.sort(key=lambda r: -boost(rk(r)))          # stable: used / favorite files first, rest keep their order
+    show(cur + fr)
+    return False
+
+
+def run_query():
+    timer[0] = None
+    q = ent.get_text()
+    token[0] += 1
+    inst = instant(q)
+    show(inst)
+    if q.strip() and not q.startswith((">", "?", "=")):
+        threading.Thread(target=files_search, args=(q, token[0], files_cb), daemon=True).start()
+    return False
+
+
+def changed(*_):
+    if timer[0]:
+        GLib.source_remove(timer[0])
+    timer[0] = GLib.timeout_add(35, run_query)
+
+
+def activate(*_):
+    if not results:
+        return
+    r = results[max(0, min(sel[0], len(results) - 1))]
+    r["go"]()
+    card.quit_anim()
+
+
+def move(d):
+    if not results:
+        return
+    sel[0] = (sel[0] + d) % len(results)
+    lst.select_row(lst.get_row_at_index(sel[0]))
+
+
+def on_key(wd, e):
+    k = e.keyval
+    if k == Gdk.KEY_Escape:
+        card.quit_anim(); return True
+    if k in (Gdk.KEY_Down,) or (k == Gdk.KEY_n and e.state & Gdk.ModifierType.CONTROL_MASK):
+        move(1); return True
+    if k in (Gdk.KEY_Up,) or (k == Gdk.KEY_p and e.state & Gdk.ModifierType.CONTROL_MASK):
+        move(-1); return True
+    if k == Gdk.KEY_f and e.state & Gdk.ModifierType.CONTROL_MASK:
+        r = results[sel[0]] if results else None
+        if r and r["kind"] in ("app", "setting", "file", "dir", "cmd"):
+            favs.toggle("apps", rk(r))
+            FAVS.clear(); FAVS.update(favs.load().get("apps", []))
+            i = sel[0]; run_query()
+            sel[0] = min(i, len(results) - 1)
+            if results: lst.select_row(lst.get_row_at_index(sel[0]))
+        return True
+    if k == Gdk.KEY_Tab:
+        r = results[sel[0]] if results else None
+        if r and r.get("path"):
+            card.quit_anim(); GLib.timeout_add(230, lambda: (sh("xdg-open", os.path.dirname(r["path"])), False)[1])
+        return True
+    return False
+
+
+def on_press(wd, e):
+    a = card.get_allocation()
+    if e.button == 3 or not (0 <= e.x <= a.width and 0 <= e.y <= a.height):
+        card.quit_anim(); return True
+    return False
+
+
+def row_click(lb, row):
+    sel[0] = row.get_index(); activate()
+
+
+ent.connect("changed", changed)
+ent.connect("activate", activate)
+lst.connect("row-activated", row_click)
+card.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+card.connect("key-press-event", on_key)
+card.connect("button-press-event", on_press)
+card.show_all()
+x, y, g = w.mon_center(W_, H_)
+card.move(x, g.y + int(g.height * 0.14))
+w.grab_keys(card)
+ent.grab_focus()
+GLib.idle_add(lambda: (run_query(), False)[1])
+if len(sys.argv) > 1:
+    ent.set_text(" ".join(sys.argv[1:]))
+signal.signal(signal.SIGTERM, lambda *a: GLib.idle_add(card.quit_anim))
+Gtk.main()

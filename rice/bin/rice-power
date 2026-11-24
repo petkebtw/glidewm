@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Account card: rice-power [--at X Y]. Lock / log out / restart / shut down.
+Restart, shut down and log out ask for a second click."""
+import os, sys, signal, math, subprocess, socket, fcntl
+
+CACHE = os.path.expanduser("~/.cache/rice")
+os.makedirs(CACHE, exist_ok=True)
+lockf = open(os.path.join(CACHE, "power.lock"), "w")
+PIDF = os.path.join(CACHE, "power.pid")
+try:
+    fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:  # already open: toggle it off
+    try:
+        os.kill(int(open(PIDF).read()), signal.SIGTERM)
+    except Exception:
+        pass
+    sys.exit(0)
+open(PIDF, "w").write(str(os.getpid()))
+
+AT = None
+if "--at" in sys.argv:
+    try:
+        i = sys.argv.index("--at"); AT = (int(sys.argv[i + 1]), int(sys.argv[i + 2]))
+    except (ValueError, IndexError):
+        pass
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import rice
+from rice import Gtk, Gdk, GLib
+import cairo
+
+TAU = 2 * math.pi
+W, H = 336, 168
+win = rice.Card(W, H, radius=26)
+c = win.c
+user = os.environ.get("USER", "user")
+host = socket.gethostname()
+
+root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+root.set_margin_start(20); root.set_margin_end(20); root.set_margin_top(18); root.set_margin_bottom(12)
+win.add(root)
+
+# ---- header: avatar + name ---------------------------------------------------
+head = Gtk.Box(spacing=14)
+av = Gtk.DrawingArea(); av.set_size_request(46, 46)
+
+
+def draw_av(w, cr):
+    cx = cy = 23
+    cr.arc(cx, cy, 23, 0, TAU); cr.set_source_rgba(*rice.rgb(c["accent"])); cr.fill()
+    cr.set_source_rgba(*rice.rgb(c["bg"]))
+    cr.arc(cx, cy - 4.5, 7.5, 0, TAU); cr.fill()
+    cr.save(); cr.arc(cx, cy, 23, 0, TAU); cr.clip()
+    cr.arc(cx, cy + 20, 14, 0, TAU); cr.fill(); cr.restore()
+
+
+av.connect("draw", draw_av)
+names = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2); names.set_valign(Gtk.Align.CENTER)
+n1 = Gtk.Label(xalign=0); n1.set_markup(f'<span size="14000" weight="bold">{user}@{host}</span>')
+try:
+    up = float(open("/proc/uptime").read().split()[0])
+    uptxt = f"up {int(up // 3600)}h {int(up % 3600 // 60)}m"
+except Exception:
+    uptxt = ""
+n2 = Gtk.Label(xalign=0); n2.get_style_context().add_class("dim"); n2.set_text(uptxt)
+names.pack_start(n1, False, False, 0); names.pack_start(n2, False, False, 0)
+head.pack_start(av, False, False, 0); head.pack_start(names, True, True, 0)
+root.pack_start(head, False, False, 0)
+
+
+# ---- icons ---------------------------------------------------------------------
+def ic_lock(cr, cx, cy):
+    rice.rounded(cr, cx - 8, cy - 2, 16, 12, 3); cr.stroke()
+    cr.new_sub_path(); cr.arc(cx, cy - 2, 5.5, math.pi, TAU); cr.stroke()
+    cr.arc(cx, cy + 4, 1.3, 0, TAU); cr.fill()
+
+
+def ic_logout(cr, cx, cy):
+    cr.move_to(cx - 1, cy - 9); cr.line_to(cx - 9, cy - 9); cr.line_to(cx - 9, cy + 9); cr.line_to(cx - 1, cy + 9); cr.stroke()
+    cr.move_to(cx - 3, cy); cr.line_to(cx + 9, cy); cr.stroke()
+    cr.move_to(cx + 5, cy - 4); cr.line_to(cx + 9, cy); cr.line_to(cx + 5, cy + 4); cr.stroke()
+
+
+def ic_restart(cr, cx, cy):
+    r = 8.5
+    a0, a1 = math.radians(-50), math.radians(230)           # open at the top, runs clockwise
+    cr.new_sub_path(); cr.arc(cx, cy, r, a0, a1); cr.stroke()
+    px, py = cx + r * math.cos(a1), cy + r * math.sin(a1)   # arrowhead at the end of the arc
+    tx, ty = -math.sin(a1), math.cos(a1)                     # clockwise tangent
+    nx, ny = math.cos(a1), math.sin(a1)                      # outward normal
+    tip = (px + tx * 3.5, py + ty * 3.5)
+    cr.move_to(px - tx * 1.5 + nx * 4.2, py - ty * 1.5 + ny * 4.2); cr.line_to(*tip)
+    cr.line_to(px - tx * 1.5 - nx * 4.2, py - ty * 1.5 - ny * 4.2); cr.stroke()
+
+
+def ic_power(cr, cx, cy):
+    cr.new_sub_path(); cr.arc(cx, cy + 1, 8.5, -TAU / 4 + 0.55, -TAU / 4 - 0.55 + TAU); cr.stroke()
+    cr.move_to(cx, cy - 10); cr.line_to(cx, cy - 1); cr.stroke()
+
+
+STATE = dict(busy=False, after=None)
+BTNS = []
+
+ACTIONS = [("Lock", ic_lock, ["rice-session", "lock"], False),
+           ("Log out", ic_logout, ["rice-session", "logout"], True),
+           ("Restart", ic_restart, ["rice-session", "reboot"], True),
+           ("Shut down", ic_power, ["rice-session", "poweroff"], True)]
+
+
+class Btn(Gtk.DrawingArea):
+    def __init__(self, label, icon, cmd, confirm):
+        super().__init__()
+        self.label, self.icon, self.cmd, self.confirm = label, icon, cmd, confirm
+        self.armed = False; self.hover = 0.0; self.target = 0.0; self.tick = None; self.gen = 0
+        BTNS.append(self)
+        self.set_size_request(70, 78)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("draw", self.on_draw)
+        self.connect("enter-notify-event", lambda *_: self.go(1.0))
+        self.connect("leave-notify-event", lambda *_: self.go(0.0))
+        self.connect("button-press-event", self.on_press)
+
+    def go(self, t):
+        self.target = t
+        if self.tick is None:
+            self.tick = self.add_tick_callback(self.step)
+
+    def step(self, w, clock):
+        d = self.target - self.hover
+        self.hover += d * 0.28
+        self.queue_draw()
+        if abs(d) < 0.01:
+            self.hover = self.target; self.tick = None
+            return False
+        return True
+
+    def on_press(self, w, e):
+        if e.button != 1 or STATE["busy"]:
+            return e.button == 1
+        if self.confirm and not self.armed:
+            for b in BTNS:
+                b.disarm()
+            self.armed = True
+            self.queue_draw()
+            g = self.gen
+            GLib.timeout_add(4000, lambda: (self.disarm() if self.gen == g else None, False)[1])
+            return True
+        self.fire()
+        return True
+
+    def fire(self):
+        STATE["busy"] = True
+        if self.confirm:
+            # the card stays up with a status line until the session goes away, so the click is never "lost"
+            busy_view(self.label)
+            p = subprocess.Popen(self.cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            GLib.child_watch_add(GLib.PRIORITY_DEFAULT, p.pid, lambda pid, st: failed() if st != 0 else None)
+            GLib.timeout_add(25000, close)
+        else:
+            # run only after the card is really gone, so the lock screen's snapshot does not contain it
+            STATE["after"] = self.cmd
+            close()
+
+    def disarm(self):
+        self.gen += 1
+        if self.armed:
+            self.armed = False
+            self.queue_draw()
+        return False
+
+    def on_draw(self, w, cr):
+        a = self.get_allocation()
+        cx, cy, r = a.width / 2, 30, 26
+        red = (0.93, 0.36, 0.40)
+        base = red if self.armed else rice.rgb(c["accent"])[:3]
+        cr.arc(cx, cy, r, 0, TAU)
+        cr.set_source_rgba(*base, 0.14 + 0.16 * self.hover + (0.55 if self.armed else 0))
+        cr.fill()
+        cr.set_line_width(2); cr.set_line_cap(cairo.LINE_CAP_ROUND); cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        cr.set_source_rgba(*(rice.rgb(c["bg"])[:3] if self.armed else rice.rgb(c["fg"])[:3]), 1)
+        self.icon(cr, cx, cy)
+        lab = "Sure?" if self.armed else self.label
+        cr.set_source_rgba(*(red if self.armed else rice.rgb(c["dim"])[:3]), 1)
+        cr.select_font_face("JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(11)
+        ext = cr.text_extents(lab)
+        cr.move_to(cx - ext.width / 2 - ext.x_bearing, 74); cr.show_text(lab)
+        return False
+
+
+row = Gtk.Box(spacing=4, homogeneous=True)
+for a in ACTIONS:
+    row.pack_start(Btn(*a), True, True, 0)
+root.pack_start(row, False, False, 0)
+
+status = Gtk.Label(); status.set_size_request(-1, 78); status.set_no_show_all(True)
+root.pack_start(status, False, False, 0)
+VERBS = {"Log out": "Logging out", "Restart": "Restarting", "Shut down": "Shutting down"}
+
+
+def busy_view(label):
+    row.hide(); status.show()
+    n = [0]
+
+    def tick():
+        status.set_markup(f'<span size="13000" weight="bold">{VERBS.get(label, label)}{"." * (n[0] % 4)}</span>')
+        n[0] += 1
+        return not state["closing"]
+    tick()
+    GLib.timeout_add(350, tick)
+
+
+def failed():
+    """The command exited with an error: show the buttons again instead of hanging."""
+    STATE["busy"] = False
+    status.set_markup('<span size="12000" weight="bold" foreground="#ee5d66">Failed</span>')
+    GLib.timeout_add(1500, lambda: (status.hide(), row.show(), False)[2])
+
+# ---- closing / grab / placement -----------------------------------------------
+state = dict(closing=False)
+
+
+def close(*_):
+    if not state["closing"]:
+        state["closing"] = True
+        win.quit_anim()
+    return False
+
+
+def on_key(w, e):
+    if e.keyval == Gdk.KEY_Escape:
+        close()
+    return True
+
+
+def on_press(w, e):
+    a = win.get_allocation()
+    if e.button == 3 or not (0 <= e.x <= a.width and 0 <= e.y <= a.height):
+        close()
+        return True
+    return False
+
+
+def grab():
+    seat = Gdk.Display.get_default().get_default_seat()
+    if seat.grab(win.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None) == Gdk.GrabStatus.SUCCESS:
+        return False
+    grab.n += 1
+    return grab.n < 30
+
+
+grab.n = 0
+win.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+win.connect("key-press-event", on_key)
+win.connect("button-press-event", on_press)
+
+disp = Gdk.Display.get_default()
+if AT:
+    mon = disp.get_monitor_at_point(*AT) or disp.get_primary_monitor()
+    g = mon.get_geometry()
+    x = min(max(AT[0] + 22 - W, g.x + 12), g.x + g.width - W - 12)   # right edge under the avatar
+    y = AT[1] + 8
+else:
+    g = rice.primary_geometry(); x = g.x + g.width - W - 14; y = g.y + 64
+if AT:
+    win.origin = AT        # pops out of the avatar that was clicked
+win.move(x, y)
+win.show_all()
+status.hide()
+GLib.timeout_add(60, grab)
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (close(), True)[1])
+Gtk.main()
+try:
+    os.remove(PIDF)
+except OSError:
+    pass
+if STATE["after"]:
+    import time
+    time.sleep(0.4)          # let picom finish fading the card out
+    subprocess.Popen(STATE["after"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

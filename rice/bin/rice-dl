@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Download video / music through the self-hosted cobalt API.  rice-dl [URL]
+   API: ~/.cache/rice/cobalt_url (default https://cobalt.example.org/). Video -> ~/Videos, audio -> ~/Music, unless a folder is chosen (Save to)."""
+import os, sys, json, threading, subprocess, urllib.request, urllib.error, re
+# single instance (spam-safe): decided before the heavy imports
+import fcntl as _fc, signal as _sg
+_cd = os.path.expanduser("~/.cache/rice"); os.makedirs(_cd, exist_ok=True)
+_lk = open(os.path.join(_cd, "once-rice-dl.lock"), "w")
+try:
+    _fc.flock(_lk, _fc.LOCK_EX | _fc.LOCK_NB)
+except OSError:
+    if False:
+        try: os.kill(int(open(os.path.join(_cd, "once-rice-dl.pid")).read()), _sg.SIGTERM)
+        except Exception: pass
+    sys.exit(0)
+open(os.path.join(_cd, "once-rice-dl.pid"), "w").write(str(os.getpid()))
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import rice, widgets as w, outdir
+from rice import Gtk, Gdk, GLib
+
+API = "https://cobalt.example.org/"
+try:
+    API = open(os.path.expanduser("~/.cache/rice/cobalt_url")).read().strip() or API
+except OSError:
+    pass
+UA = "Mozilla/5.0 (X11; Linux x86_64) rice-dl/1.0"
+opt = dict(mode="auto", q="1080", af="mp3")
+QS, AFS = ("max", "1080", "720", "480"), ("mp3", "ogg", "opus", "wav")
+
+W_, H_ = 560, 380
+card = rice.Card(W_, H_, radius=26)
+box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+for m in ("start", "end"):
+    getattr(box, f"set_margin_{m}")(24)
+box.set_margin_top(22); box.set_margin_bottom(20)
+card.add(box)
+t = Gtk.Label(xalign=0); t.set_markup('<span size="15000" weight="bold">Download</span>  <span size="9500" alpha="55%">cobalt</span>')
+box.pack_start(t, False, False, 0)
+url = w.entry("paste a link: youtube, soundcloud, tiktok, twitter, reddit …")
+box.pack_start(url, False, False, 0)
+try:
+    clip = subprocess.run(["timeout", "1", "xclip", "-o", "-selection", "clipboard"], capture_output=True, text=True).stdout.strip()
+except Exception:
+    clip = ""
+pre = sys.argv[1] if len(sys.argv) > 1 else clip
+if re.match(r"https?://\S+$", pre or ""):
+    url.set_text(pre)
+
+mode = w.Seg(["Video", "Audio", "Mute video"], 0, lambda i: (opt.update(mode=("auto", "audio", "mute")[i]), sub()), 330)
+box.pack_start(w.row("Type", mode), False, False, 0)
+qseg = w.Seg(["Best", "1080p", "720p", "480p"], 1, lambda i: opt.update(q=QS[i]), 330)
+aseg = w.Seg(["mp3", "ogg", "opus", "wav"], 0, lambda i: opt.update(af=AFS[i]), 330)
+qrow = w.row("Quality", qseg)
+arow = w.row("Format", aseg)
+box.pack_start(qrow, False, False, 0)
+box.pack_start(arow, False, False, 0)
+fbtn = w.Btn("", lambda: pickdir(), False, 300, 32)
+box.pack_start(w.row("Save to", fbtn), False, False, 0)
+bar = w.Bar(); bar.val = 0.0
+status = Gtk.Label(xalign=0); status.set_ellipsize(3)
+box.pack_start(bar, False, False, 6)
+box.pack_start(status, False, False, 0)
+btns = Gtk.Box(spacing=8)
+go_btn = w.Btn("Download", lambda: start(), True, 140)
+btns.pack_end(go_btn, False, False, 0)
+btns.pack_end(w.Btn("Close", lambda: card.quit_anim(), False, 90), False, False, 0)
+box.pack_end(btns, False, False, 0)
+
+
+def showdir():
+    fbtn.label = outdir.show(outdir.get("dl"), "default (Videos / Music)"); fbtn.queue_draw()
+
+
+def pickdir():
+    def cb(r):
+        if r is not False:
+            showdir()
+    outdir.choose("dl", None, cb, none="Default", title="Download to",
+                  before=lambda: Gdk.Display.get_default().get_default_seat().ungrab(),
+                  after=lambda: w.grab_keys(card))
+
+
+def sub():
+    qrow.set_visible(opt["mode"] != "audio")
+    arow.set_visible(opt["mode"] == "audio")
+
+
+def say(s, err=False):
+    status.set_markup(f'<span size="10500" foreground="{"#ff7a85" if err else rice.CUR["dim"]}">{GLib.markup_escape_text(s)}</span>')
+
+
+def human(n):
+    return f"{n / 1e6:.1f} MB" if n < 1e9 else f"{n / 1e9:.2f} GB"
+
+
+busy = [False]
+
+
+def start():
+    u = url.get_text().strip()
+    if busy[0] or not re.match(r"https?://", u):
+        say("enter a valid link first", True); return
+    busy[0] = True; go_btn.enabled = False; go_btn.queue_draw()
+    bar.val = None; say("asking cobalt …")
+    threading.Thread(target=work, args=(u, dict(opt)), daemon=True).start()
+
+
+def post(u, o):
+    body = dict(url=u, filenameStyle="pretty", downloadMode=o["mode"], videoQuality=o["q"], audioFormat=o["af"],
+                youtubeVideoCodec="h264", tiktokFullAudio=True)
+    rq = urllib.request.Request(API, json.dumps(body).encode(), {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(rq, timeout=40) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except Exception:
+            return dict(status="error", error=dict(code=f"http {e.code}"))
+
+
+def fetch(link, name, dest):
+    os.makedirs(dest, exist_ok=True)
+    path = os.path.join(dest, re.sub(r'[\\/:*?"<>|]', "_", name))
+    base, ext = os.path.splitext(path); n = 1
+    while os.path.exists(path):
+        path = f"{base} ({n}){ext}"; n += 1
+    rq = urllib.request.Request(link, headers={"User-Agent": UA})
+    with urllib.request.urlopen(rq, timeout=60) as r, open(path + ".part", "wb") as f:
+        total = int(r.headers.get("Content-Length") or r.headers.get("Estimated-Content-Length") or 0)
+        got = 0
+        while True:
+            b = r.read(1 << 17)
+            if not b:
+                break
+            f.write(b); got += len(b)
+            GLib.idle_add(prog, got, total)
+    os.replace(path + ".part", path)
+    return path
+
+
+def prog(got, total):
+    bar.val = (got / total) if total else None
+    say(f"downloading  {human(got)}" + (f" / {human(total)}" if total else ""))
+    return False
+
+
+def finished(path, err=None):
+    busy[0] = False; go_btn.enabled = True; go_btn.queue_draw()
+    bar.val = 1.0 if path else 0.0
+    if err:
+        say(err, True); return False
+    say("saved  " + path.replace(os.path.expanduser("~"), "~"))
+    subprocess.Popen(["notify-send", "-a", "rice-dl", "Download finished", os.path.basename(path)])
+    return False
+
+
+def work(u, o):
+    try:
+        r = post(u, o)
+        st = r.get("status")
+        if st == "error":
+            code = (r.get("error") or {}).get("code", "unknown")
+            GLib.idle_add(finished, None, "cobalt: " + code.replace("error.api.", "")); return
+        dest = os.path.expanduser("~/Music" if (o["mode"] == "audio") else "~/Videos")
+        if st in ("tunnel", "redirect"):
+            files = [(r["url"], r.get("filename") or "download")]
+        elif st == "picker":
+            files = [(x["url"], f"item{i + 1}" + os.path.splitext(x["url"].split("?")[0])[1]) for i, x in enumerate(r.get("picker", []))]
+            if r.get("audio"):
+                files.append((r["audio"], r.get("audioFilename") or "audio.mp3"))
+            dest = os.path.expanduser("~/Pictures")
+        else:
+            GLib.idle_add(finished, None, "unexpected reply: " + str(st)); return
+        dest = outdir.get("dl") or dest
+        last = None
+        for i, (lk, nm) in enumerate(files):
+            GLib.idle_add(say, f"downloading {i + 1}/{len(files)} …")
+            last = fetch(lk, nm, dest)
+        GLib.idle_add(finished, last)
+    except Exception as e:
+        GLib.idle_add(finished, None, f"failed: {e}")
+
+
+url.connect("activate", lambda *_: start())
+card.show_all()
+showdir()
+sub()
+x, y, _g = w.mon_center(W_, H_)
+card.move(x, y - 60)
+w.close_on_outside(card)
+w.grab_keys(card)
+GLib.timeout_add(150, lambda: (url.grab_focus(), url.set_position(-1), False)[2])
+import signal
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda *a: (card.quit_anim(), True)[1])
+Gtk.main()

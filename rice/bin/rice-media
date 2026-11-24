@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""MPRIS media control. rice-media [toggle|play-pause|next|prev]"""
+import os, sys, signal, urllib.request, hashlib
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import crashlog
+import gi
+from gi.repository import Gio, GLib
+
+BUS = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+IFACE = "org.mpris.MediaPlayer2.Player"
+
+
+def players():
+    r = BUS.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames",
+                      None, GLib.VariantType("(as)"), 0, -1, None)
+    return [n for n in r[0] if n.startswith("org.mpris.MediaPlayer2.")]
+
+
+def get(name, prop):
+    r = BUS.call_sync(name, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "Get",
+                      GLib.Variant("(ss)", (IFACE, prop)), GLib.VariantType("(v)"), 0, 500, None)
+    return r[0]
+
+
+def call(name, method):
+    BUS.call_sync(name, "/org/mpris/MediaPlayer2", IFACE, method, None, None, 0, 500, None)
+
+
+def active():
+    ps = players()
+    for p in ps:
+        try:
+            if get(p, "PlaybackStatus") == "Playing":
+                return p
+        except Exception:
+            pass
+    return ps[0] if ps else None
+
+
+def cmd(m):
+    """Media key -> MPRIS. Debounced (a headset can send duplicate/bounced keys) and logged."""
+    import time, fcntl
+    d = os.path.expanduser("~/.cache/rice")
+    os.makedirs(d, exist_ok=True)
+    stamp = os.path.join(d, "media.last")
+    lock = open(os.path.join(d, "media.lock"), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    now = time.time()
+    try:
+        prev_m, prev_t = open(stamp).read().split()
+        dup = prev_m == m and now - float(prev_t) < 0.4
+    except Exception:
+        dup = False
+    open(stamp, "w").write(f"{m} {now}")
+    p = None if dup else active()
+    try:  # skip/prev only act on a player that is really playing
+        if p and m != "PlayPause" and get(p, "PlaybackStatus") != "Playing":
+            p = None
+    except Exception:
+        p = None
+    with open(os.path.join(d, "media.log"), "a") as f:
+        f.write(f"{time.strftime('%H:%M:%S')} {m} -> {'DROPPED(dup)' if dup else p}\n")
+    if p:
+        try:
+            call(p, m)
+        except Exception:
+            pass
+
+
+if len(sys.argv) > 1 and sys.argv[1] in ("play-pause", "next", "prev"):
+    cmd({"play-pause": "PlayPause", "next": "Next", "prev": "Previous"}[sys.argv[1]])
+    sys.exit(0)
+
+# ---- popup card ----
+import time, bisect, colorsys, threading, math
+import rice, mpris, lyrics
+from rice import Gtk, cairo, Gdk
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import GdkPixbuf, Pango, PangoCairo
+
+PID = os.path.expanduser("~/.cache/rice/media.pid")
+try:
+    old = int(open(PID).read())
+    if "rice-media" in open(f"/proc/{old}/cmdline").read():
+        os.kill(old, signal.SIGTERM)
+        sys.exit(0)  # toggle off
+except Exception:
+    pass
+open(PID, "w").write(str(os.getpid()))
+
+player = active()
+W, PAD, ART = 440, 22, 112
+SX0, SX1, SY = PAD, W - PAD, 160          # slider span and centre line
+LY = 206                                  # lyrics block top
+S = dict(title="Nothing playing", artist="", length=1, pos=0, t0=time.monotonic(), playing=False,
+         art=None, color=None, key=None, tid=None, lines=None, hover=False, drag=None, hot=None, kn=0.0, hl=False, art_src=None)
+c = rice.colors()
+ACC = rice.rgb(c["accent"])[:3]
+FG, DIM = rice.rgb(c["fg"])[:3], rice.rgb(c["dim"])[:3]
+
+
+def dominant(pb):
+    """Vivid dominant colour of a pixbuf, lifted so it reads on a dark card. Picks the strongest hue family
+       (pixels weighted by saturation^2 * value) and averages only that family: averaging every pixel turned
+       a red + blue cover into a purple that is not on it."""
+    sm = pb.scale_simple(24, 24, GdkPixbuf.InterpType.BILINEAR)
+    px, n, rs = sm.get_pixels(), sm.get_n_channels(), sm.get_rowstride()
+    pts = []
+    hist = [0.0] * 36
+    for y in range(24):
+        for x in range(24):
+            o = y * rs + x * n
+            r, g, b = px[o] / 255, px[o + 1] / 255, px[o + 2] / 255
+            h, s, v = colorsys.rgb_to_hsv(r, g, b)
+            w = s * s * v
+            pts.append((r, g, b, h, w))
+            hist[int(h * 36) % 36] += w
+    sm3 = [hist[i - 1] + hist[i] + hist[(i + 1) % 36] for i in range(36)]
+    peak = max(range(36), key=lambda i: sm3[i])
+    if sm3[peak] < 0.5:                        # grey / black-and-white cover: plain neutral
+        R = G = B = 0.0; Wt = 0.0
+        for r, g, b, h, w in pts:
+            R += r; G += g; B += b; Wt += 1
+    else:
+        hc = (peak + 0.5) / 36
+        R = G = B = 0.0; Wt = 0.0
+        for r, g, b, h, w in pts:
+            d = abs(h - hc) % 1.0
+            if min(d, 1 - d) < 0.07:           # +-25 deg around the peak
+                R += r * w; G += g * w; B += b * w; Wt += w
+    h, s, v = colorsys.rgb_to_hsv(R / Wt, G / Wt, B / Wt)
+    if s > 0.12:
+        s = max(s, 0.5)
+    r, g, b = colorsys.hsv_to_rgb(h, min(s, 0.9), max(v, 0.82))
+    # HSV value alone leaves blue and purple too dark on the card: mix toward white until it reads
+    def lum(r, g, b):
+        f = lambda c: c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+        return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+    t = 0.0
+    while lum(r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t) < 0.22 and t < 0.6:
+        t += 0.04
+    return r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t
+
+
+def load_art(p):
+    if not p:
+        return None, None
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file(p)
+        col = dominant(pb)
+        side = min(pb.get_width(), pb.get_height())
+        pb = pb.new_subpixbuf((pb.get_width() - side) // 2, (pb.get_height() - side) // 2, side, side)
+        pb = pb.scale_simple(ART * 2, ART * 2, GdkPixbuf.InterpType.BILINEAR)   # 2x for crisp edges
+        surf = Gdk.cairo_surface_create_from_pixbuf(pb, 2, None)
+        return surf, col
+    except Exception:
+        return None, None
+
+
+def position():
+    p = S["pos"] + ((time.monotonic() - S["t0"]) * 1e6 if S["playing"] else 0)
+    return max(0.0, min(p, S["length"]))
+
+
+def fetch_lyrics(key, artist, title, secs):
+    ln = lyrics.get(artist, title, secs)
+    GLib.idle_add(lambda: (S["key"] == key and S["hl"] and S.update(lines=ln or []), False)[1])
+
+
+_busy = [False]
+
+
+def _read(net=True):
+    """All D-Bus + art download work. Only ever runs off the main thread, so a hung player or a dead DNS
+       server can make the card stale but never freeze it."""
+    global player
+    try:
+        if not player or player not in mpris.players():
+            player = active()          # the player came or went (browser restart): pick again
+        if not player:
+            return None
+        md = get(player, "Metadata")
+        st = get(player, "PlaybackStatus")
+        pos = int(get(player, "Position"))
+    except Exception:
+        return None
+    return dict(md=md, st=st, pos=pos, art=mpris.art_path(str(md.get("mpris:artUrl", "")), net))
+
+
+def apply_state(d, first=False):
+    if not d:
+        return False
+    md = d["md"]
+    ar = md.get("xesam:artist", [])
+    title_ = str(md.get("xesam:title", "Unknown"))
+    artist_ = ", ".join(ar) if isinstance(ar, list) else str(ar)
+    key = (title_, artist_, str(md.get("mpris:artUrl", "")))
+    S.update(playing=(d["st"] == "Playing"), pos=d["pos"], t0=time.monotonic(), tid=str(md.get("mpris:trackid", "")) or None,
+             length=max(int(md.get("mpris:length", 1)), 1))
+    if key != S["key"]:
+        S.update(key=key, title=title_, artist=artist_, lines=None, art_src=d["art"])
+        S["art"], S["color"] = load_art(d["art"])
+        threading.Thread(target=fetch_lyrics, args=(key, artist_, title_, S["length"] / 1e6), daemon=True).start()
+    elif d["art"] and d["art"] != S.get("art_src"):      # cover finished downloading after the card opened
+        S["art_src"] = d["art"]
+        S["art"], S["color"] = load_art(d["art"])
+    return False
+
+
+def refresh(first=False):
+    """Poll the player without ever blocking the UI."""
+    if first:                                            # startup: wait at most 1.5 s for the player
+        box = [None]
+        th = threading.Thread(target=lambda: box.__setitem__(0, _read(False)), daemon=True)
+        th.start(); th.join(1.5)
+        apply_state(box[0], True)
+        return False
+    if _busy[0]:
+        return False
+    _busy[0] = True
+
+    def work():
+        d = None
+        try:
+            d = _read(True)
+        finally:
+            GLib.idle_add(lambda: (_busy.__setitem__(0, False), apply_state(d), False)[2])
+    threading.Thread(target=work, daemon=True).start()
+    return False
+
+
+def seek(frac):
+    S["pos"], S["t0"] = frac * S["length"], time.monotonic()
+    if S["tid"]:
+        try:
+            BUS.call_sync(player, "/org/mpris/MediaPlayer2", IFACE, "SetPosition",
+                          GLib.Variant("(ox)", (S["tid"], int(frac * S["length"]))), None, 0, 500, None)
+        except Exception:
+            pass
+
+
+def act(m):
+    if not player:
+        return
+    try:
+        call(player, m)
+    except Exception:
+        pass
+    if m == "PlayPause":
+        S["pos"], S["t0"], S["playing"] = position(), time.monotonic(), not S["playing"]
+    GLib.timeout_add(250, refresh)
+
+
+# ---- drawing ----
+def text(cr, s, x, y, px, col, a=1.0, bold=False, w=None, lines=1, align=Pango.Alignment.LEFT):
+    lay = PangoCairo.create_layout(cr)
+    lay.set_font_description(Pango.FontDescription(("JetBrains Mono Bold" if bold else "JetBrains Mono")))
+    fd = lay.get_font_description(); fd.set_absolute_size(px * Pango.SCALE); lay.set_font_description(fd)
+    lay.set_text(s, -1)
+    if w:
+        lay.set_width(int(w * Pango.SCALE)); lay.set_ellipsize(Pango.EllipsizeMode.END); lay.set_alignment(align)
+        if lines > 1:
+            lay.set_wrap(Pango.WrapMode.WORD_CHAR)
+        lay.set_height(-lines)
+    cr.set_source_rgba(*col, a)
+    cr.move_to(x, y)
+    PangoCairo.show_layout(cr, lay)
+    return lay.get_pixel_size()
+
+
+def icon_prev(cr, cx, cy, r, col, a):
+    cr.set_source_rgba(*col, a)
+    cr.rectangle(cx - r, cy - r * 0.8, r * 0.3, r * 1.6); cr.fill()
+    cr.move_to(cx + r, cy - r * 0.85); cr.line_to(cx + r, cy + r * 0.85); cr.line_to(cx - r * 0.55, cy); cr.close_path(); cr.fill()
+
+
+def icon_next(cr, cx, cy, r, col, a):
+    cr.save(); cr.translate(cx * 2, 0); cr.scale(-1, 1); icon_prev(cr, cx, cy, r, col, a); cr.restore()
+
+
+def icon_play(cr, cx, cy, r, col, playing):
+    cr.set_source_rgba(*col, 1)
+    if playing:
+        for dx in (-r * 0.55, r * 0.15):
+            rice.rounded(cr, cx + dx, cy - r * 0.8, r * 0.4, r * 1.6, r * 0.12); cr.fill()
+    else:
+        cr.move_to(cx - r * 0.55, cy - r * 0.9); cr.line_to(cx + r * 0.85, cy); cr.line_to(cx - r * 0.55, cy + r * 0.9); cr.close_path(); cr.fill()
+
+
+BTN = dict(prev=(ART + PAD + 24 + 14, 112, 18), play=(ART + PAD + 24 + 14 + 58, 112, 24), next=(ART + PAD + 24 + 14 + 116, 112, 18))
+lyr = dict(i=-2, t=0.0)
+
+
+def current_line(p):
+    ln = S["lines"]
+    if not ln:
+        return -1
+    return bisect.bisect_right([t for t, _ in ln], p / 1e6 + 0.12) - 1
+
+
+def draw(wd, cr):
+    col = S["color"] or ACC
+    now = time.monotonic()
+    a = wd.get_allocation()
+    # cover tinted wash, top-left
+    cr.save()
+    rice.rounded(cr, 0.5, 0.5, a.width - 1, a.height - 1, 26); cr.clip()
+    g = cairo.RadialGradient(PAD + ART / 2, PAD + ART / 2, 10, PAD + ART / 2, PAD + ART / 2, 300)
+    g.add_color_stop_rgba(0, *col, 0.30); g.add_color_stop_rgba(1, *col, 0.0)
+    cr.set_source(g); cr.paint()
+    cr.restore()
+    # art with soft coloured glow
+    ax, ay = PAD, PAD
+    for i in range(6, 0, -1):
+        rice.rounded(cr, ax - i * 1.5, ay - i * 1.5 + 4, ART + i * 3, ART + i * 3, 18 + i * 1.5)
+        cr.set_source_rgba(*col, 0.035); cr.fill()
+    cr.save()
+    rice.rounded(cr, ax, ay, ART, ART, 18); cr.clip()
+    if S["art"]:
+        cr.scale(1, 1); cr.set_source_surface(S["art"], ax, ay); cr.paint()
+    else:
+        cr.set_source_rgba(*col, 0.25); cr.paint()
+        text(cr, "♪", ax + ART / 2 - 12, ay + ART / 2 - 22, 40, col)
+    cr.restore()
+    # title + artist
+    tx = ART + PAD + 24
+    tw = W - tx - PAD
+    text(cr, S["title"], tx, 26, 17, FG, 1, True, tw)
+    text(cr, S["artist"], tx, 52, 13, DIM, 1, False, tw)
+    # controls
+    for name, (bx, by, r) in BTN.items():
+        hot = S["hot"] == name
+        if name == "play":
+            rr = r + (1.5 if hot else 0)
+            cr.arc(bx, by, rr, 0, 2 * math.pi); cr.set_source_rgba(*col, 1); cr.fill()
+            icon_play(cr, bx, by, 9, (0.08, 0.08, 0.1), S["playing"])
+        else:
+            (icon_prev if name == "prev" else icon_next)(cr, bx, by, 8, FG, 1.0 if hot else 0.75)
+    # slider
+    frac = position() / S["length"]
+    want = 1.0 if (S["hover"] or S["drag"] is not None) else 0.0
+    S["kn"] += (want - S["kn"]) * 0.25
+    if S["drag"] is not None:
+        frac = S["drag"]
+    th = 5 + 2 * S["kn"]
+    x = SX0 + (SX1 - SX0) * frac
+    rice.rounded(cr, SX0, SY - th / 2, SX1 - SX0, th, th / 2); cr.set_source_rgba(*FG, 0.14); cr.fill()
+    if x - SX0 > 1:
+        rice.rounded(cr, SX0, SY - th / 2, max(x - SX0, th), th, th / 2); cr.set_source_rgba(*col, 1); cr.fill()
+    if S["kn"] > 0.02:
+        r = 3 + 4.5 * S["kn"]
+        cr.arc(x, SY, r + 4 * S["kn"], 0, 2 * math.pi); cr.set_source_rgba(*col, 0.25 * S["kn"]); cr.fill()
+        cr.arc(x, SY, r, 0, 2 * math.pi); cr.set_source_rgba(1, 1, 1, S["kn"]); cr.fill()
+    p = (frac * S["length"]) / 1e6
+    tl = S["length"] / 1e6
+    text(cr, f"{int(p // 60)}:{int(p % 60):02d}", SX0, SY + 12, 11, DIM)
+    s2 = f"-{int((tl - p) // 60)}:{int((tl - p) % 60):02d}"
+    lw, _ = text(cr, s2, 0, -100, 11, DIM)
+    text(cr, s2, SX1 - lw, SY + 12, 11, DIM)
+    # lyrics
+    if S["lines"]:
+        i = current_line(position())
+        if i != lyr["i"]:
+            lyr["i"], lyr["t"] = i, now
+        e = min((now - lyr["t"]) / 0.35, 1.0)
+        e = 1 - (1 - e) ** 3
+        ln = S["lines"]
+        cur = ln[i][1] if i >= 0 else ""
+        nxt = ln[i + 1][1] if i + 1 < len(ln) else ""
+        if i < 0:
+            nxt = ln[0][1]
+        cr.save()
+        cr.rectangle(PAD - 4, LY - 6, W - 2 * PAD + 8, 90); cr.clip()
+        if cur:
+            h = text(cr, cur, PAD, LY + (1 - e) * 10, 17, col, e, True, W - 2 * PAD, 2)[1]
+        else:
+            h = 22
+            text(cr, "♪ ♪ ♪", PAD, LY, 17, col, 0.6 + 0.4 * math.sin(now * 3) ** 2, True)
+        if nxt:
+            text(cr, nxt, PAD, LY + h + 10 + (1 - e) * 10, 13, FG, 0.38 * e, False, W - 2 * PAD, 1)
+        cr.restore()
+    return False
+
+
+# ---- window ----
+# decide card height up front (the real window must never resize): lyrics area only when lyrics exist
+refresh(first=True)
+if S["lines"] is None and S["key"]:
+    _b = [None]
+    _t = threading.Thread(target=lambda: _b.__setitem__(0, lyrics.get(S["artist"], S["title"], S["length"] / 1e6, timeout=1.5)), daemon=True)
+    _t.start(); _t.join(1.6)                              # never wait longer, even if DNS hangs
+    S["lines"] = _b[0]
+HAS_LYR = bool(S["lines"])
+S["hl"] = HAS_LYR
+S["lines"] = S["lines"] if HAS_LYR else None
+H = LY + 104 if HAS_LYR else LY - 14
+win = rice.Card(W, H, radius=26)
+if S["color"]:
+    win.c["accent"] = "#%02x%02x%02x" % tuple(int(v * 255) for v in S["color"])
+area = Gtk.DrawingArea()
+area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+area.connect("draw", draw)
+win.add(area)
+timer = [None]
+
+
+def reset():
+    """Auto-close after N idle seconds (Settings > Sound > Media card); 0 = stay until closed."""
+    import settings
+    if timer[0]: GLib.source_remove(timer[0]); timer[0] = None
+    n = int(settings.sget("media_close", 0) or 0)
+    if n > 0:
+        timer[0] = GLib.timeout_add_seconds(n, win.quit_anim)
+
+
+def hit(x, y):
+    for n, (bx, by, r) in BTN.items():
+        if (x - bx) ** 2 + (y - by) ** 2 <= (r + 8) ** 2:
+            return n
+    return None
+
+
+def in_slider(x, y):
+    return SX0 - 8 <= x <= SX1 + 8 and abs(y - SY) <= 14
+
+
+def on_press(w, e):
+    reset()
+    if e.button == 3:
+        win.quit_anim(); return True
+    if e.button == 1:
+        if in_slider(e.x, e.y):
+            S["drag"] = max(0.0, min((e.x - SX0) / (SX1 - SX0), 1.0))
+        else:
+            n = hit(e.x, e.y)
+            if n:
+                act({"prev": "Previous", "play": "PlayPause", "next": "Next"}[n])
+    return True
+
+
+def on_release(w, e):
+    if S["drag"] is not None:
+        seek(S["drag"]); S["drag"] = None
+        GLib.timeout_add(300, refresh)
+    return True
+
+
+def on_motion(w, e):
+    reset()
+    S["hover"] = in_slider(e.x, e.y)
+    S["hot"] = hit(e.x, e.y)
+    if S["drag"] is not None:
+        S["drag"] = max(0.0, min((e.x - SX0) / (SX1 - SX0), 1.0))
+    return True
+
+
+area.connect("button-press-event", on_press)
+area.connect("button-release-event", on_release)
+area.connect("motion-notify-event", on_motion)
+area.connect("leave-notify-event", lambda *_: S.update(hover=False, hot=None))
+area.add_tick_callback(lambda w, clk: (w.queue_draw(), True)[1])
+
+
+def on_key(w, e):
+    k = e.keyval
+    if k in (Gdk.KEY_Escape, Gdk.KEY_q):
+        win.quit_anim()
+    elif k == Gdk.KEY_space:
+        act("PlayPause")
+    elif k in (Gdk.KEY_Left, Gdk.KEY_Right):
+        seek(max(0.0, min(position() / S["length"] + (5e6 / S["length"]) * (1 if k == Gdk.KEY_Right else -1), 1.0)))
+    elif k in (Gdk.KEY_n, Gdk.KEY_Down):
+        act("Next")
+    elif k in (Gdk.KEY_p, Gdk.KEY_Up):
+        act("Previous")
+    reset()
+    return True
+
+
+def grab():
+    seat = Gdk.Display.get_default().get_default_seat()
+    if seat.grab(win.get_window(), Gdk.SeatCapabilities.KEYBOARD, False, None, None, None) == Gdk.GrabStatus.SUCCESS:
+        return False
+    grab.n += 1
+    return grab.n < 30
+
+
+grab.n = 0
+win.add_events(Gdk.EventMask.KEY_PRESS_MASK)
+win.connect("key-press-event", on_key)
+win.top_center(70)
+win.show_all()
+GLib.timeout_add(60, grab)
+reset()
+GLib.timeout_add(1000, lambda: (refresh(), True)[1])
+signal.signal(signal.SIGTERM, lambda *a: GLib.idle_add(win.quit_anim))
+Gtk.main()
+try: os.remove(PID)
+except OSError: pass

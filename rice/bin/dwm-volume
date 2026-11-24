@@ -1,0 +1,20 @@
+#!/bin/sh
+# usage: dwm-volume up|down|mute|set N  (wpctl + OSD + status refresh; self-heals dead PipeWire)
+# Every wpctl call is time-boxed and serialized: a hung PipeWire must never pile up processes.
+S=@DEFAULT_AUDIO_SINK@
+RT=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+exec 9>"$RT/dwm-volume.lock"
+flock -w 3 9 || exit 0
+if ! timeout 2 wpctl get-volume $S >/dev/null 2>&1; then
+	timeout 40 audio-fix >/dev/null 2>&1
+	timeout 2 wpctl get-volume $S >/dev/null 2>&1 || exit 1
+fi
+case "$1" in
+	up)   timeout 2 wpctl set-mute $S 0; timeout 2 wpctl set-volume -l 1.0 $S 5%+ ;;
+	down) timeout 2 wpctl set-volume $S 5%- ;;
+	mute) timeout 2 wpctl set-mute $S toggle ;;
+	set)  timeout 2 wpctl set-mute $S 0; timeout 2 wpctl set-volume -l 1.0 $S "$2%" ;;
+esac
+pkill -RTMIN+10 -x dwm-status 2>/dev/null
+[ "$1" = set ] || { rice-volume --osd >/dev/null 2>&1 9>&- & }
+exit 0

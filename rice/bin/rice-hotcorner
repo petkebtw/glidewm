@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Hot corner: pointer parked in the top-left corner of the primary monitor for 0.25 s runs the command in
+~/.cache/rice/hotcorner (default: rice-map). Write 'off' there to disable. Polls the pointer at 8 Hz."""
+import os, sys, subprocess, signal, fcntl
+CACHE = os.path.expanduser("~/.cache/rice")
+os.makedirs(CACHE, exist_ok=True)
+lockf = open(os.path.join(CACHE, "hotcorner.lock"), "w")
+try:
+    fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(0)
+import gi
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib
+d = Gdk.Display.get_default()
+pointer = d.get_default_seat().get_pointer()
+S = dict(in_since=0, fired=False)
+N = [0]
+
+
+def cmd():
+    try:
+        return open(os.path.join(CACHE, "hotcorner")).read().strip() or "rice-map"
+    except OSError:
+        return "rice-map"
+
+
+def tick():
+    m = d.get_primary_monitor() or d.get_monitor(0)
+    g = m.get_geometry()
+    _, x, y = pointer.get_position()
+    inside = x - g.x <= 1 and y - g.y <= 1
+    if inside:
+        N[0] += 1
+        if N[0] >= 2 and not S["fired"]:
+            S["fired"] = True
+            c = cmd()
+            if c != "off":
+                subprocess.Popen(c, shell=True, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        N[0] = 0
+        S["fired"] = False
+    return True
+
+
+GLib.timeout_add(125, tick)
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (sys.exit(0), False)[1])
+GLib.MainLoop().run()

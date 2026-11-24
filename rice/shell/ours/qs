@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# qs with the X11 shim modules (Quickshell.Wayland/Hyprland), for apps started from dwm keys (no QML_IMPORT_PATH there)
+export QML_IMPORT_PATH="$HOME/.local/share/dss/qml${QML_IMPORT_PATH:+:$QML_IMPORT_PATH}"
+export PATH="$HOME/.local/share/dss/bin:$PATH"
+exec /usr/bin/qs "$@"

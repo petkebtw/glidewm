@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Welcome intro: rice-welcome [show]. Full-screen overlay on the primary monitor: the screen darkens, the
+greeting types itself, then the key cheat sheet fades in line by line. Any key / click closes it.
+Runs once automatically (marker ~/.cache/rice/welcomed); `rice-welcome show` plays it again."""
+import os, sys, time, math, signal
+CACHE = os.path.expanduser("~/.cache/rice")
+os.makedirs(CACHE, exist_ok=True)
+MARK = os.path.join(CACHE, "welcomed")
+if "show" not in sys.argv and os.path.exists(MARK):
+    sys.exit(0)
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import rice
+from rice import Gtk, Gdk, GLib
+import cairo
+
+C = rice.colors()
+user = os.environ.get("USER", "you")
+GREET = f"Hi, {user}."
+LINES = [("Alt + p", "launcher"), ("Alt + n", "control centre"), ("Alt + g", "game bar"), ("Alt + z", "map of all windows"),
+         ("Alt + e", "edit desktop widgets"), ("Alt + Enter", "terminal"), ("Print", "screenshot")]
+g = rice.primary_geometry()
+win = Gtk.Window(type=Gtk.WindowType.POPUP)
+win.set_wmclass("rice-welcome", "RiceWelcome")
+win.set_app_paintable(True)
+vis = win.get_screen().get_rgba_visual()
+if vis:
+    win.set_visual(vis)
+win.set_default_size(g.width, g.height)
+win.move(g.x, g.y)
+win.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+t0 = time.monotonic()
+done = [False]
+
+
+def draw(w, cr):
+    t = time.monotonic() - t0
+    cr.set_operator(cairo.OPERATOR_SOURCE)
+    bg = rice.rgb(C["bg"], 0.88 * min(1, t / 0.8))
+    cr.set_source_rgba(*bg)
+    cr.paint()
+    cr.set_operator(cairo.OPERATOR_OVER)
+    cx, cy = g.width / 2, g.height / 2 - 120
+    cr.select_font_face(rice.SANS_FONT, 0, 1)
+    cr.set_font_size(76)
+    n = int(max(0, (t - 0.8) * 14))
+    txt = GREET[:n]
+    e = cr.text_extents(GREET)
+    cr.set_source_rgba(*rice.rgb(C["fg"]))
+    cr.move_to(cx - e.x_advance / 2, cy)
+    cr.show_text(txt)
+    cr.set_font_size(20)
+    a = max(0, min(1, (t - 2.2) / 0.6))
+    sub = "Here is your desktop. A few keys to start with:"
+    e = cr.text_extents(sub)
+    cr.set_source_rgba(*rice.rgb(C["dim"], a))
+    cr.move_to(cx - e.x_advance / 2, cy + 56)
+    cr.show_text(sub)
+    for i, (k, d) in enumerate(LINES):
+        a = max(0, min(1, (t - 3.0 - i * 0.25) / 0.5))
+        y = cy + 120 + i * 40 + (1 - a) * 12
+        cr.select_font_face(rice.FONT, 0, 1)
+        cr.set_font_size(20)
+        cr.set_source_rgba(*rice.rgb(C["accent"], a))
+        ke = cr.text_extents(k)
+        cr.move_to(cx - 30 - ke.x_advance, y)
+        cr.show_text(k)
+        cr.select_font_face(rice.SANS_FONT, 0, 0)
+        cr.set_source_rgba(*rice.rgb(C["fg"], a))
+        cr.move_to(cx + 30, y)
+        cr.show_text(d)
+    a = max(0, min(1, (t - 5.2) / 0.6)) * (0.6 + 0.4 * math.sin(t * 3))
+    cr.set_font_size(15)
+    s = "press any key"
+    e = cr.text_extents(s)
+    cr.set_source_rgba(*rice.rgb(C["dim"], a))
+    cr.move_to(cx - e.x_advance / 2, g.height - 80)
+    cr.show_text(s)
+
+
+def tick():
+    win.queue_draw()
+    return not done[0]
+
+
+def close(*_):
+    if done[0]:
+        return True
+    done[0] = True
+    open(MARK, "w").close()
+    t1 = time.monotonic()
+
+    def fade():
+        k = 1 - (time.monotonic() - t1) / 0.35
+        win.set_opacity(max(0, k))
+        if k <= 0:
+            Gtk.main_quit()
+            return False
+        return True
+    GLib.timeout_add(16, fade)
+    return True
+
+
+win.connect("draw", draw)
+win.connect("key-press-event", close)
+win.connect("button-press-event", close)
+win.show_all()
+win.get_window().raise_()
+GLib.timeout_add(16, tick)
+GLib.timeout_add(150, lambda: (win.get_window().get_display().get_default_seat().grab(win.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None, None), False)[1])
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, close)
+Gtk.main()

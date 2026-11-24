@@ -1,0 +1,5 @@
+#!/bin/sh
+# run a Qt/KDE program with the wallpaper-derived dark stylesheet (hooks.qt writes it)
+Q="$HOME/.cache/theme/dolphin.qss"; P="$1"; shift
+[ -f "$Q" ] && exec "$P" -stylesheet "$Q" "$@"
+exec "$P" "$@"

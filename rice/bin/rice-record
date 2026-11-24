@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""Screen recorder. rice-record: pick what to record (desktop / one monitor / region), then a small pill shows
+the timer; run rice-record again (or click the pill) to stop. Files go to ~/Videos/rice-DATE.mp4.
+Audio: system sound is on by default, the microphone is a toggle."""
+import os, sys, signal, subprocess, time, fcntl, math, json, threading
+
+CACHE = os.path.expanduser("~/.cache/rice")
+os.makedirs(CACHE, exist_ok=True)
+lockf = open(os.path.join(CACHE, "record.lock"), "w")
+PIDF = os.path.join(CACHE, "record.pid")
+try:
+    fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:  # a recording (or the picker) is already running: stop it
+    try:
+        os.kill(int(open(PIDF).read()), signal.SIGTERM)
+    except Exception:
+        pass
+    sys.exit(0)
+open(PIDF, "w").write(str(os.getpid()))
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import rice
+from rice import Gtk, Gdk, GLib
+import cairo
+
+TAU = 2 * math.pi
+c = rice.colors()
+disp = Gdk.Display.get_default()
+OUT_DIR = os.path.expanduser("~/Videos")
+os.makedirs(OUT_DIR, exist_ok=True)
+opt = dict(sys=True, mic=False, fps=60, cd=0, sink="default", appmode="all", app=None)
+rec = dict(proc=None, t0=0.0, path=None, stopping=False)
+
+
+def sh(*a):
+    try:
+        return subprocess.run(["timeout", "2", *a], capture_output=True, text=True).stdout.strip()
+    except Exception:
+        return ""
+
+
+def toast(text, secs=2.4):
+    t = rice.Card(max(260, 14 * len(text) + 40), 52, radius=26)
+    lab = Gtk.Label(); lab.set_markup(f'<span size="11500" weight="bold">{GLib.markup_escape_text(text)}</span>')
+    t.add(lab)
+    g = rice.primary_geometry()
+    w, _ = t.get_size_request()
+    t.move(g.x + (g.width - w) // 2, g.y + 70)
+    t.show_all()
+    GLib.timeout_add(int(secs * 1000), lambda: (t.quit_anim(), False)[1])
+
+
+# ---------------- picker -----------------------------------------------------
+class Pick(Gtk.DrawingArea):
+    def __init__(self, label, drawicon, action):
+        super().__init__()
+        self.label, self.drawicon, self.action = label, drawicon, action
+        self.hover = 0.0; self.target = 0.0; self.tick = None
+        self.set_size_request(92, 92)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("draw", self.on_draw)
+        self.connect("enter-notify-event", lambda *_: self.go(1.0))
+        self.connect("leave-notify-event", lambda *_: self.go(0.0))
+        self.connect("button-press-event", lambda w, e: (self.action(), True)[1] if e.button == 1 else False)
+
+    def go(self, t):
+        self.target = t
+        if self.tick is None:
+            self.tick = self.add_tick_callback(self.step)
+
+    def step(self, w, clock):
+        d = self.target - self.hover
+        self.hover += d * 0.28
+        self.queue_draw()
+        if abs(d) < 0.01:
+            self.hover = self.target; self.tick = None
+            return False
+        return True
+
+    def on_draw(self, w, cr):
+        a = self.get_allocation()
+        cx, cy = a.width / 2, 34
+        rice.rounded(cr, 4, 4, a.width - 8, a.height - 8, 20)
+        cr.set_source_rgba(*rice.rgb(c["accent"])[:3], 0.07 + 0.2 * self.hover); cr.fill()
+        cr.set_line_width(2); cr.set_line_cap(cairo.LINE_CAP_ROUND); cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        cr.set_source_rgba(*rice.rgb(c["fg"])); self.drawicon(cr, cx, cy)
+        cr.select_font_face("JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(11)
+        e = cr.text_extents(self.label)
+        cr.set_source_rgba(*rice.rgb(c["dim"])); cr.move_to(cx - e.width / 2 - e.x_bearing, 74); cr.show_text(self.label)
+        return False
+
+
+def ic_desktop(cr, x, y):
+    rice.rounded(cr, x - 14, y - 11, 28, 18, 3); cr.stroke(); cr.move_to(x - 6, y + 12); cr.line_to(x + 6, y + 12); cr.stroke()
+
+
+def ic_monitor(cr, x, y):
+    rice.rounded(cr, x - 10, y - 11, 20, 18, 3); cr.stroke(); cr.arc(x, y - 2, 3, 0, TAU); cr.fill()
+    cr.move_to(x - 5, y + 12); cr.line_to(x + 5, y + 12); cr.stroke()
+
+
+def ic_region(cr, x, y):
+    for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+        cr.move_to(x + sx * 13, y + sy * 5); cr.line_to(x + sx * 13, y + sy * 12); cr.line_to(x + sx * 6, y + sy * 12); cr.stroke()
+    cr.arc(x, y + 1, 3.2, 0, TAU); cr.fill()
+
+
+class Toggle(Gtk.Button):
+    def __init__(self, key, label):
+        super().__init__()
+        self.key, self.base = key, label
+        self.get_style_context().add_class("pill")
+        self.connect("clicked", self.flip)
+        self.paint()
+
+    def flip(self, *_):
+        opt[self.key] = not opt[self.key]; self.paint()
+
+    def paint(self):
+        on = opt[self.key]
+        self.set_label(("●  " if on else "○  ") + self.base)
+
+
+class Cycle(Gtk.Button):
+    """Countdown before recording starts: off / 3 / 5 / 10 seconds."""
+    VALS = (0, 3, 5, 10)
+
+    def __init__(self):
+        super().__init__()
+        self.get_style_context().add_class("pill")
+        self.connect("clicked", self.flip)
+        self.paint()
+
+    def flip(self, *_):
+        opt["cd"] = self.VALS[(self.VALS.index(opt["cd"]) + 1) % len(self.VALS)]; self.paint()
+
+    def paint(self):
+        self.set_label("Countdown  " + ("off" if not opt["cd"] else f"{opt['cd']}s"))
+
+
+
+def pj(*a):
+    try:
+        return json.loads(subprocess.run(["timeout", "3", "pactl", "-f", "json", *a], capture_output=True, text=True).stdout or "[]")
+    except Exception:
+        return []
+
+
+def sinks():
+    return [(x["name"], x.get("description") or x["name"]) for x in pj("list", "sinks")]
+
+
+def apps():
+    """Names of programs that currently have an audio stream."""
+    out = []
+    for x in pj("list", "sink-inputs"):
+        n = x.get("properties", {}).get("application.name")
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def trunc(t, n=24):
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+
+class Choice(Gtk.Button):
+    """Click to cycle through (label, value) options."""
+
+    def __init__(self, prefix, opts, get, put):
+        super().__init__()
+        self.prefix, self.opts, self.get, self.put = prefix, opts, get, put
+        self.get_style_context().add_class("pill")
+        self.connect("clicked", self.flip)
+        self.paint()
+
+    def cur(self):
+        v = self.get()
+        for i, (l, x) in enumerate(self.opts):
+            if x == v:
+                return i
+        return 0
+
+    def flip(self, *_):
+        i = (self.cur() + 1) % len(self.opts)
+        self.put(self.opts[i][1]); self.paint()
+
+    def paint(self):
+        self.set_label(f"{self.prefix}  {self.opts[self.cur()][0]}")
+
+
+PH = 290
+picker = rice.Card(380, PH, radius=26)
+pv = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+pv.set_margin_start(16); pv.set_margin_end(16); pv.set_margin_top(14); pv.set_margin_bottom(12)
+picker.add(pv)
+prow = Gtk.Box(spacing=6, homogeneous=True)
+pv.pack_start(prow, False, False, 0)
+trow = Gtk.Box(spacing=6, homogeneous=True)
+trow.pack_start(Toggle("mic", "Microphone"), True, True, 0)
+trow.pack_start(Cycle(), True, True, 0)
+SINKS = sinks()
+AUDIO_OPTS = [("off", None), ("default output", "default")] + [(trunc(d, 26), n) for n, d in SINKS]
+
+
+def put_audio(v):
+    opt["sink"] = v
+
+
+def put_app(v):
+    opt["appmode"], opt["app"] = v if v else ("all", None)
+
+
+APP_OPTS = [("all apps", None)]
+for a_ in apps():
+    APP_OPTS += [("only " + trunc(a_, 18), ("only", a_)), ("all except " + trunc(a_, 12), ("except", a_))]
+pv.pack_start(Choice("Audio", AUDIO_OPTS, lambda: opt["sink"], put_audio), False, False, 0)
+pv.pack_start(Choice("App", APP_OPTS, lambda: (opt["appmode"], opt["app"]) if opt["app"] else None, put_app), False, False, 0)
+pv.pack_start(trow, False, False, 0)
+
+
+def mon_under_pointer():
+    _, px, py = disp.get_default_seat().get_pointer().get_position()
+    m = disp.get_monitor_at_point(px, py) or disp.get_primary_monitor()
+    g = m.get_geometry()
+    return g.x, g.y, g.width, g.height
+
+
+def choose(kind):
+    disp.get_default_seat().ungrab()
+    if kind == "region":
+        picker.hide()
+        r = subprocess.run(["slop", "-f", "%x %y %w %h", "-b", "2", "-c", "0.3,0.5,1,0.6"], capture_output=True, text=True).stdout.split()
+        if len(r) != 4:
+            return finish_all()
+        x, y, w, h = [int(v) for v in r]
+    elif kind == "monitor":
+        picker.hide(); x, y, w, h = mon_under_pointer()
+    else:
+        picker.hide()
+        s = disp.get_default_screen(); x, y, w, h = 0, 0, s.get_width(), s.get_height()
+    go = lambda: (start(x, y, w & ~1, h & ~1), False)[1]
+    if opt["cd"]:
+        GLib.timeout_add(250, lambda: (countdown(opt["cd"], go), False)[1])
+    else:
+        GLib.timeout_add(350, go)
+
+
+def countdown(n, then):
+    """Big number on the monitor under the pointer; hidden again before the recording begins."""
+    mx, my, mw, mh = mon_under_pointer()
+    cd = rice.Card(120, 120, radius=26)
+    lab = Gtk.Label(); cd.add(lab)
+    cd.move(mx + (mw - 120) // 2, my + (mh - 120) // 2)
+    cd.show_all()
+    left = [n]
+
+    def tick():
+        if left[0] <= 0:
+            cd.hide(); cd.destroy()
+            GLib.timeout_add(350, then)       # let picom drop the card before the first frame
+            return False
+        lab.set_markup(f'<span size="48000" weight="bold">{left[0]}</span>')
+        left[0] -= 1
+        return True
+    tick()
+    GLib.timeout_add(1000, tick)
+
+
+prow.pack_start(Pick("Desktop", ic_desktop, lambda: choose("desktop")), True, True, 0)
+prow.pack_start(Pick("Monitor", ic_monitor, lambda: choose("monitor")), True, True, 0)
+prow.pack_start(Pick("Region", ic_region, lambda: choose("region")), True, True, 0)
+
+
+
+# ---------------- audio routing (per-app capture through a null sink) ---------
+route = dict(null=None, loop=None, real=None, stop=False)
+
+
+def pc(*a):
+    return subprocess.run(["timeout", "3", "pactl", *a], capture_output=True, text=True).stdout.strip()
+
+
+def leftovers():
+    """A crashed earlier run may have left streams parked in rice_rec: put them back and drop the modules."""
+    mods = pc("list", "short", "modules").splitlines()
+    ids = [m.split()[0] for m in mods if "rice_rec" in m]
+    if not ids:
+        return
+    real = sh("pactl", "get-default-sink")
+    for x in pj("list", "sink-inputs"):
+        if x.get("sink_name") == "rice_rec" or x.get("sink") is not None and any(s["name"] == "rice_rec" and s["index"] == x["sink"] for s in pj("list", "sinks")):
+            pc("move-sink-input", str(x["index"]), real)
+    for i in sorted(ids, reverse=True):
+        pc("unload-module", i)
+
+
+def matches(x):
+    p = x.get("properties", {})
+    a = opt["app"]
+    hit = a in (p.get("application.name"), p.get("application.process.binary"))
+    return hit if opt["appmode"] == "only" else not hit
+
+
+def sweep():
+    """Move every matching stream into the capture sink (new streams too, e.g. a new browser tab)."""
+    rr = next((s["index"] for s in pj("list", "sinks") if s["name"] == "rice_rec"), None)
+    for x in pj("list", "sink-inputs"):
+        if rr is not None and x.get("sink") != rr and matches(x):
+            pc("move-sink-input", str(x["index"]), "rice_rec")
+
+
+def watcher():
+    while not route["stop"]:
+        sweep(); time.sleep(0.6)
+
+
+def capture_source():
+    """PulseAudio source name to record, or None for no audio. Sets up routing for per-app capture."""
+    if opt["sink"] is None:
+        return None
+    sink = sh("pactl", "get-default-sink") if opt["sink"] == "default" else opt["sink"]
+    if not sink:
+        return None
+    if opt["appmode"] == "all" or not opt["app"]:
+        return sink + ".monitor"
+    leftovers()
+    route["real"] = sink
+    route["null"] = pc("load-module", "module-null-sink", "sink_name=rice_rec", "sink_properties=device.description=RiceRec")
+    route["loop"] = pc("load-module", "module-loopback", "source=rice_rec.monitor", f"sink={sink}", "latency_msec=30")
+    route["stop"] = False
+    sweep()
+    threading.Thread(target=watcher, daemon=True).start()
+    return "rice_rec.monitor"
+
+
+def route_restore():
+    if not route["null"]:
+        return
+    route["stop"] = True
+    time.sleep(0.7)
+    rr = next((s["index"] for s in pj("list", "sinks") if s["name"] == "rice_rec"), None)
+    for x in pj("list", "sink-inputs"):
+        if rr is not None and x.get("sink") == rr:
+            pc("move-sink-input", str(x["index"]), route["real"])
+    for m in (route["loop"], route["null"]):
+        if m:
+            pc("unload-module", m)
+    route["null"] = None
+
+
+leftovers()
+
+# ---------------- recording ----------------------------------------------------
+pill = None
+
+
+def start(x, y, w, h):
+    global pill
+    rec["path"] = os.path.join(OUT_DIR, "rice-" + time.strftime("%Y%m%d_%H%M%S") + ".mp4")
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-thread_queue_size", "512",
+           "-f", "x11grab", "-framerate", str(opt["fps"]), "-draw_mouse", "1", "-video_size", f"{w}x{h}",
+           "-i", f"{os.environ.get('DISPLAY', ':0')}+{x},{y}"]
+    n = 1
+    src = capture_source()
+    if src:
+        cmd += ["-f", "pulse", "-thread_queue_size", "512", "-i", src]; n += 1
+    if opt["mic"]:
+        msrc = sh("pactl", "get-default-source")
+        if msrc and not msrc.endswith(".monitor"):
+            cmd += ["-f", "pulse", "-thread_queue_size", "512", "-i", msrc]; n += 1
+    if n > 2:
+        cmd += ["-filter_complex", f"amix=inputs={n - 1}:duration=longest[a]", "-map", "0:v", "-map", "[a]"]
+    elif n == 2:
+        cmd += ["-map", "0:v", "-map", "1:a"]
+    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(opt["fps"]),
+            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", rec["path"]]
+    rec["proc"] = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    rec["t0"] = time.time()
+    pill = Pill()
+    GLib.timeout_add(500, watch)
+
+
+def watch():
+    if rec["proc"] and rec["proc"].poll() is not None and not rec["stopping"]:
+        route_restore()
+        toast("Recording failed")
+        GLib.timeout_add(2600, finish_all)
+        return False
+    return True
+
+
+class Pill(rice.Card):
+    def __init__(self):
+        super().__init__(196, 48, radius=24)
+        self.da = Gtk.DrawingArea()
+        self.da.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.da.connect("draw", self.paint)
+        self.da.connect("button-press-event", lambda *_: (stop(), True)[1])
+        self.add(self.da)
+        g = rice.primary_geometry()
+        self.move(g.x + g.width - 196 - 18, g.y + 64)
+        self.show_all()
+        self.da.add_tick_callback(lambda w, clk: (w.queue_draw(), True)[1])
+
+    def paint(self, w, cr):
+        t = time.time() - rec["t0"]
+        pulse = 0.55 + 0.45 * math.sin(t * 4)
+        cr.arc(26, 24, 6.5, 0, TAU); cr.set_source_rgba(0.95, 0.27, 0.32, pulse); cr.fill()
+        cr.select_font_face("JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(15)
+        cr.set_source_rgba(*rice.rgb(c["fg"]))
+        cr.move_to(44, 30); cr.show_text("%02d:%02d" % (t // 60, t % 60))
+        rice.rounded(cr, 138, 11, 46, 26, 13); cr.set_source_rgba(0.95, 0.27, 0.32, 0.9); cr.fill()
+        cr.set_source_rgba(1, 1, 1, 1); cr.rectangle(156, 18, 10, 10); cr.fill()
+        return False
+
+
+def stop(*_):
+    global pill
+    if rec["stopping"]:
+        return
+    rec["stopping"] = True
+    p = rec["proc"]
+    if p and p.poll() is None:
+        try:
+            p.stdin.write(b"q"); p.stdin.flush()   # ffmpeg finalizes the mp4 on 'q'
+        except Exception:
+            p.send_signal(signal.SIGINT)
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    route_restore()
+    if pill:
+        pill.quit_anim_soft()
+    toast("Saved  " + os.path.basename(rec["path"] or ""))
+    GLib.timeout_add(2800, finish_all)
+
+
+def quit_anim_soft(self):
+    self.hide()
+
+
+rice.Card.quit_anim_soft = quit_anim_soft
+
+
+def finish_all(*_):
+    try:
+        os.remove(PIDF)
+    except OSError:
+        pass
+    Gtk.main_quit()
+    return False
+
+
+# ---------------- picker window glue --------------------------------------------------
+def on_term(*_):
+    if rec["proc"]:
+        stop()
+    else:
+        picker.quit_anim()
+        GLib.timeout_add(260, finish_all)
+    return True
+
+
+def on_key(w, e):
+    if e.keyval == Gdk.KEY_Escape and not rec["proc"]:
+        on_term()
+    return True
+
+
+def grab():
+    if rec["proc"]:
+        return False
+    seat = disp.get_default_seat()
+    if seat.grab(picker.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None) == Gdk.GrabStatus.SUCCESS:
+        return False
+    grab.n += 1
+    return grab.n < 30
+
+
+def on_press(w, e):
+    a = picker.get_allocation()
+    if e.button == 3 or not (0 <= e.x <= a.width and 0 <= e.y <= a.height):
+        on_term()
+        return True
+    return False
+
+
+grab.n = 0
+picker.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+picker.connect("key-press-event", on_key)
+picker.connect("button-press-event", on_press)
+mx, my, mw, mh = mon_under_pointer()
+picker.move(mx + (mw - 340) // 2, my + (mh - PH) // 2)
+picker.show_all()
+GLib.timeout_add(60, grab)
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, on_term)
+Gtk.main()

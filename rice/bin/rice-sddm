@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""rice-sddm: make SDDM use the rice login theme, in one step.
+
+  rice-sddm            show the plan, then one pkexec prompt: install theme "rice" and make it active
+  rice-sddm --status   installed / active / last colour sync (no root)
+  rice-sddm --preview  run the greeter in test mode on this display (Esc closes it; any password = wrong)
+  rice-sddm --revert   one pkexec prompt: put /etc/sddm.conf back, remove 10-rice.conf
+  rice-sddm --sync     rewrite /var/lib/rice-sddm (colours + blurred wallpaper) from the live theme now
+  -y / --yes           skip the "continue?" question (for the settings panel button)
+
+Layout after install:
+  ~/.local/share/rice/sddm-theme/   QML source (edit here, run rice-sddm again to update)
+  /usr/share/sddm/themes/rice/      root-owned copy; theme.conf -> /var/lib/rice-sddm/theme.conf
+  /var/lib/rice-sddm/               user-owned: theme.conf + rice-bg.jpg, rewritten by hooks.sddm()
+                                    on every final theme apply, so theme switches need no root
+  /etc/sddm.conf.d/10-rice.conf     [Theme] Current=rice, [General] InputMethod= (no on-screen keyboard)
+  /etc/sddm.conf.pre-rice           original /etc/sddm.conf (its Current=/InputMethod= lines are
+                                    commented out, because /etc/sddm.conf is read after sddm.conf.d)
+"""
+import os, sys, subprocess, shutil, hashlib, glob, re, time, json, pwd, tempfile
+
+SELF = os.path.realpath(sys.argv[0])
+HOME = os.path.expanduser("~")
+SRC = os.path.join(HOME, ".local/share/rice/sddm-theme")
+DEST = "/usr/share/sddm/themes/rice"
+DATA = "/var/lib/rice-sddm"
+DROPIN = "/etc/sddm.conf.d/10-rice.conf"
+MAINCONF = "/etc/sddm.conf"
+BACKUP = "/etc/sddm.conf.pre-rice"
+MARK = "#rice-sddm# "
+FILES = ("Main.qml", "metadata.desktop", "background.jpg", "theme.conf.default")
+SILENT = "/usr/share/sddm/themes/silent"
+GREETER = shutil.which("sddm-greeter-qt6") or shutil.which("sddm-greeter")
+
+
+def say(*a):
+    print(*a, flush=True)
+
+
+def digest(d):
+    h = hashlib.sha1()
+    for f in FILES:
+        try:
+            h.update(open(os.path.join(d, f), "rb").read())
+        except OSError:
+            h.update(b"-")
+    return h.hexdigest()[:10]
+
+
+# ------------------------------------------------------------------ effective sddm config (read-only)
+def conf_files():
+    fs = []
+    for d in ("/usr/lib/sddm/sddm.conf.d", "/etc/sddm.conf.d"):
+        fs += sorted(glob.glob(d + "/*.conf"))
+    if os.path.exists(MAINCONF):
+        fs.append(MAINCONF)          # sddm reads /etc/sddm.conf last: it wins
+    return fs
+
+
+def effective(section, key):
+    val, src = None, None
+    for f in conf_files():
+        sect = None
+        try:
+            lines = open(f).read().splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            s = ln.strip()
+            if not s or s[0] in "#;":
+                continue
+            m = re.match(r"\[(.+)\]", s)
+            if m:
+                sect = m.group(1)
+                continue
+            if sect == section and "=" in s:
+                k, v = s.split("=", 1)
+                if k.strip() == key:
+                    val, src = v.strip(), f
+    return val, src
+
+
+def conf_val(path, key):
+    try:
+        for ln in open(path):
+            m = re.match(r'\s*%s\s*=\s*"?([^"\n]*)"?' % re.escape(key), ln)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+# ------------------------------------------------------------------ checks + sync (user)
+def validate(theme_dir):
+    """Load the theme offscreen in greeter test mode; a QML error makes sddm fall back to its embedded theme."""
+    if not GREETER:
+        return True, "sddm-greeter not found, skipped QML check"
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_VIRTUALKEYBOARD_DESKTOP_DISABLE="1")
+    env.pop("DISPLAY", None)
+    with tempfile.TemporaryFile("w+") as log:
+        try:
+            subprocess.run([GREETER, "--test-mode", "--theme", theme_dir], stdout=log, stderr=log, env=env, timeout=4)
+        except subprocess.TimeoutExpired:
+            pass                       # still running after 4 s = it loaded
+        log.seek(0)
+        out = log.read()
+    bad = [ln for ln in out.splitlines() if "Fallback to embedded theme" in ln or re.search(r"Main\.qml:\d+", ln)]
+    return (not bad), ("\n".join(bad[:6]) if bad else "QML loads cleanly")
+
+
+def sync():
+    """Same as a final theme apply does: hooks.sddm() with the live colours and wallpaper."""
+    sys.path.insert(0, os.path.join(HOME, ".local/lib/rice"))
+    import hooks
+    try:
+        c = json.load(open(os.path.join(HOME, ".cache/theme/colors.json")))
+        wall = open(os.path.join(HOME, ".cache/theme/wall")).read().strip()
+    except (OSError, ValueError) as e:
+        say(f"  sync skipped: no live theme ({e})")
+        return False
+    ok = hooks.sddm(c, wall)
+    say(f"  sync {'done' if ok else 'FAILED (see ~/.cache/rice/sddm.log)'}: {DATA}/theme.conf + rice-bg.jpg")
+    return ok
+
+
+def status():
+    cur, src = effective("Theme", "Current")
+    im, imsrc = effective("General", "InputMethod")
+    inst = os.path.exists(os.path.join(DEST, "Main.qml"))
+    same = inst and digest(DEST) == digest(SRC)
+    link = os.path.realpath(os.path.join(DEST, "theme.conf")) if inst else None
+    say(f"theme source   {SRC} ({'ok' if os.path.exists(os.path.join(SRC, 'Main.qml')) else 'MISSING'})")
+    say(f"installed      {'yes' if inst else 'no'}" + (f", {'up to date' if same else 'OUTDATED (run rice-sddm)'}" if inst else ""))
+    if inst:
+        say(f"theme.conf     -> {link}")
+    say(f"active         {'yes' if cur == 'rice' else 'no'} (Current={cur or '(default)'} from {src or '-'})")
+    say(f"InputMethod    {im!r} from {imsrc or '-'}" + ("  <- on-screen keyboard will pop up" if im else ""))
+    w = os.path.isdir(DATA) and os.access(DATA, os.W_OK)
+    say(f"data dir       {DATA}: {'writable' if w else 'missing / not writable'}")
+    synced = conf_val(os.path.join(DATA, "theme.conf"), "synced")
+    say(f"last sync      {synced or 'never'}" + (f" (accent {conf_val(os.path.join(DATA, 'theme.conf'), 'accent')})" if synced else ""))
+    say(f"backup         {BACKUP if os.path.exists(BACKUP) else 'none'}")
+    return 0 if (inst and cur == "rice") else 1
+
+
+def preview():
+    if not GREETER:
+        say("sddm-greeter not installed"); return 1
+    if not os.environ.get("DISPLAY"):
+        say("no DISPLAY"); return 1
+    tmp = os.path.join(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()), "rice-sddm-preview")
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    for f in FILES:
+        if os.path.exists(os.path.join(SRC, f)):
+            shutil.copy(os.path.join(SRC, f), tmp)
+    conf = os.path.join(DATA, "theme.conf")
+    if os.path.exists(conf):
+        t = open(conf).read()
+    else:                              # never synced: live colours, theme fallback background
+        sys.path.insert(0, os.path.join(HOME, ".local/lib/rice"))
+        import hooks
+        c = json.load(open(os.path.join(HOME, ".cache/theme/colors.json")))
+        t = hooks.sddm_theme_conf(c, bg="")
+    t = re.sub(r'(?m)^preview=.*$', 'preview="true"', t)
+    open(os.path.join(tmp, "theme.conf"), "w").write(t)
+    say("preview: Esc closes it, any password shows the wrong-password shake, power buttons do nothing")
+    env = dict(os.environ, QT_VIRTUALKEYBOARD_DESKTOP_DISABLE="1")
+    # the greeter ignores Qt.quit(); the theme prints a marker on Esc in preview mode and we stop it here
+    p = subprocess.Popen([GREETER, "--test-mode", "--theme", tmp], env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    try:
+        for ln in p.stdout:
+            if "rice-sddm-preview-quit" in ln:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        shutil.rmtree(tmp, ignore_errors=True)
+    return 0
+
+
+def run_root(args):
+    if not shutil.which("pkexec"):
+        say("pkexec missing; run instead:  sudo " + " ".join([SELF] + args)); return 1
+    return subprocess.run(["pkexec", SELF] + args).returncode
+
+
+def install(yes):
+    if not os.path.exists(os.path.join(SRC, "Main.qml")):
+        say(f"theme source missing: {SRC}"); return 1
+    cur, src = effective("Theme", "Current")
+    say("rice-sddm will (one password prompt via pkexec):")
+    say(f"  1. copy the theme {SRC} -> {DEST} (root-owned)")
+    say(f"  2. create {DATA} owned by {pwd.getpwuid(os.getuid()).pw_name} (colours + blurred wallpaper; theme switches update it, no root)")
+    say(f"  3. back up {MAINCONF} -> {BACKUP}, comment out its Current=/InputMethod= lines")
+    say(f"  4. write {DROPIN}: Current=rice (now: {cur or 'default'}), InputMethod= (no on-screen keyboard)")
+    say("  undo with: rice-sddm --revert   (takes effect at the next SDDM start: logout or reboot)")
+    ok, why = validate(SRC)
+    say(f"  QML check: {why}")
+    if not ok:
+        say("theme has QML errors, not installing"); return 1
+    if not yes and sys.stdin.isatty():
+        if input("continue? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+            return 1
+    rc = run_root(["--root", "install", pwd.getpwuid(os.getuid()).pw_name, SRC])
+    if rc != 0:
+        say(f"root step failed or cancelled (exit {rc}); nothing else changed"); return rc
+    sync()
+    say("")
+    status()
+    return 0
+
+
+# ------------------------------------------------------------------ root side (via pkexec)
+def root_install(user, src):
+    pw = pwd.getpwnam(user)
+    for f in ("Main.qml", "metadata.desktop"):
+        if not os.path.isfile(os.path.join(src, f)):
+            sys.exit(f"missing {src}/{f}")
+    # 1. data dir, user-owned
+    os.makedirs(DATA, mode=0o755, exist_ok=True)
+    os.chown(DATA, pw.pw_uid, pw.pw_gid); os.chmod(DATA, 0o755)
+    tc = os.path.join(DATA, "theme.conf")
+    if not os.path.exists(tc) and os.path.isfile(os.path.join(src, "theme.conf.default")):
+        shutil.copyfile(os.path.join(src, "theme.conf.default"), tc)
+        os.chown(tc, pw.pw_uid, pw.pw_gid); os.chmod(tc, 0o644)
+    # 2. theme copy (regular files only, root-owned), swapped in atomically
+    new = DEST + ".new"
+    shutil.rmtree(new, ignore_errors=True)
+    os.makedirs(new, mode=0o755)
+    for f in FILES:
+        p = os.path.join(src, f)
+        if os.path.isfile(p) and not os.path.islink(p):
+            shutil.copyfile(p, os.path.join(new, f)); os.chmod(os.path.join(new, f), 0o644)
+    os.symlink(tc, os.path.join(new, "theme.conf"))
+    old = DEST + ".old"
+    shutil.rmtree(old, ignore_errors=True)
+    if os.path.exists(DEST):
+        os.rename(DEST, old)
+    os.rename(new, DEST)
+    shutil.rmtree(old, ignore_errors=True)
+    # 3. silent theme keeps reading /var/lib/rice-sddm too (what rice-setup-root did)
+    if os.path.isdir(SILENT):
+        for a, b in (("rice.conf", "configs/rice.conf"), ("rice-bg.jpg", "backgrounds/rice-bg.jpg")):
+            t = os.path.join(SILENT, b)
+            if not os.path.lexists(t):
+                os.symlink(os.path.join(DATA, a), t)
+    # 4. /etc/sddm.conf is read after sddm.conf.d, so its Current=/InputMethod= would win: comment them out
+    if os.path.exists(MAINCONF):
+        if not os.path.exists(BACKUP):
+            shutil.copy2(MAINCONF, BACKUP)
+        out = []
+        for ln in open(MAINCONF).read().splitlines():
+            if re.match(r"\s*(Current|InputMethod)\s*=", ln) or re.match(r"\s*GreeterEnvironment\s*=.*qtvirtualkeyboard", ln):
+                ln = MARK + ln
+            out.append(ln)
+        tmp = MAINCONF + ".rice-tmp"
+        open(tmp, "w").write("\n".join(out) + "\n"); os.chmod(tmp, 0o644)
+        os.replace(tmp, MAINCONF)
+    os.makedirs(os.path.dirname(DROPIN), exist_ok=True)
+    open(DROPIN, "w").write("# written by rice-sddm; undo: rice-sddm --revert\n"
+                            "[Theme]\nCurrent=rice\n\n[General]\nInputMethod=\n")
+    os.chmod(DROPIN, 0o644)
+    print("root: installed", DEST, "and activated it")
+
+
+def root_revert():
+    if os.path.exists(BACKUP):
+        shutil.copy2(BACKUP, MAINCONF)
+        os.remove(BACKUP)
+    elif os.path.exists(MAINCONF):           # no backup: just uncomment our marks
+        t = open(MAINCONF).read().replace(MARK, "")
+        open(MAINCONF, "w").write(t)
+    if os.path.exists(DROPIN):
+        os.remove(DROPIN)
+    print("root: reverted (theme files in", DEST, "left in place, inactive)")
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["--root"]:
+        if os.geteuid() != 0:
+            sys.exit("--root needs root")
+        if a[1:2] == ["install"] and len(a) == 4:
+            return root_install(a[2], a[3])
+        if a[1:2] == ["revert"]:
+            return root_revert()
+        sys.exit("bad --root call")
+    if os.geteuid() == 0:
+        sys.exit("run rice-sddm as your user; it asks for root itself (pkexec)")
+    yes = "-y" in a or "--yes" in a
+    a = [x for x in a if x not in ("-y", "--yes")]
+    if not a or a[0] == "--install":
+        return install(yes)
+    if a[0] == "--status":
+        return status()
+    if a[0] == "--preview":
+        return preview()
+    if a[0] == "--sync":
+        return 0 if sync() else 1
+    if a[0] == "--revert":
+        rc = run_root(["--root", "revert"])
+        if rc == 0:
+            say("reverted; SDDM uses the previous theme from the next start")
+            status()
+        return rc
+    if a[0] == "--check":
+        ok, why = validate(SRC); say(why); return 0 if ok else 1
+    say(__doc__); return 0 if a[0] in ("-h", "--help") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

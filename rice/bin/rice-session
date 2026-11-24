@@ -1,0 +1,71 @@
+#!/bin/bash
+# rice-session lock|logout|reboot|poweroff|restore
+# logout: snapshot open apps, close windows gracefully, then end the whole login session
+#         (logind kills every leftover process, so nothing keeps running for no reason).
+# restore: relaunch the apps saved by the last logout.
+SNAP=$HOME/.cache/rice/session.json
+mkdir -p "$HOME/.cache/rice"
+
+snapshot() {
+	python3 - "$SNAP" <<'PY'
+import subprocess, sys, json, os
+skip = ("RiceCard", "RiceShot", "RiceAuth", "Rofi", "RiceLock", "dwm")
+out, seen = [], set()
+try:
+    lines = subprocess.run(["wmctrl", "-lpx"], capture_output=True, text=True, timeout=3).stdout.splitlines()
+except Exception:
+    lines = []
+for ln in lines:
+    p = ln.split(None, 5)
+    if len(p) < 5:
+        continue
+    pid, cls = int(p[2]), p[3]
+    if pid in seen or any(s in cls for s in skip) or pid <= 1:
+        continue
+    seen.add(pid)
+    try:
+        cmd = open(f"/proc/{pid}/cmdline").read().split("\0")[:-1]
+    except OSError:
+        continue
+    if cmd:
+        out.append({"cmd": cmd, "class": cls})
+json.dump(out, open(sys.argv[1], "w"))
+PY
+}
+
+closeall() {
+	# ask every window to close at once, then wait (max ~1.5 s, polling fast) for the clean ones to go
+	local id n
+	for id in $(wmctrl -l | awk '{print $1}'); do wmctrl -ic "$id" & done
+	wait
+	for n in $(seq 8); do [ -z "$(wmctrl -l)" ] && break; sleep 0.1; done
+}
+
+case "$1" in
+	logout|reboot|poweroff)
+		# one power action at a time: repeated clicks must not start it twice
+		exec 9>"${XDG_RUNTIME_DIR:-/tmp}/rice-session.lock"
+		flock -n 9 || exit 0 ;;
+esac
+
+case "$1" in
+	lock) exec rice-lock ;;
+	logout)
+		snapshot; closeall
+		timeout 5 loginctl terminate-session "${XDG_SESSION_ID:-$(loginctl | awk -v u="$USER" '$3==u{print $1;exit}')}" \
+			|| pkill -TERM -u "$(id -u)"
+		;;
+	# this box runs runit: runit-init is what the reboot/poweroff wrappers use; loginctl can hang here
+	reboot)   snapshot; closeall; sudo -n /sbin/runit-init 6 || timeout 8 loginctl reboot ;;
+	poweroff) snapshot; closeall; sudo -n /sbin/runit-init 0 || timeout 8 loginctl poweroff ;;
+	restore)
+		[ -f "$SNAP" ] || exit 0
+		python3 - "$SNAP" <<'PY'
+import json, sys, subprocess, time
+for a in json.load(open(sys.argv[1])):
+    subprocess.Popen(a["cmd"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.4)
+PY
+		;;
+	*) echo "usage: rice-session lock|logout|reboot|poweroff|restore" >&2; exit 2 ;;
+esac

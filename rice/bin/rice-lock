@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""Lock screen: blurred wallpaper, date, huge stacked clock, greeting, pill password field, music card.
+Same look as the "rice" SDDM theme (~/.local/share/rice/sddm-theme); background is the pre-blurred
+wallpaper hooks.sddm() writes to /var/lib/rice-sddm/rice-bg.jpg (falls back to a blurred screenshot).
+Password is checked with unix_chkpwd (same as the system login). Keyboard and pointer are grabbed."""
+import os, sys, subprocess, signal, time, math, fcntl, threading
+
+CACHE = os.path.expanduser("~/.cache/rice")
+os.makedirs(CACHE, exist_ok=True)
+lockf = open(os.path.join(CACHE, "lock.lock"), "w")
+try:
+    fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(0)  # already locked
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import rice, mpris
+from rice import Gtk, Gdk, GLib
+import cairo
+from gi.repository import GdkPixbuf
+import gi
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Pango, PangoCairo
+
+TAU = 2 * math.pi
+
+
+def rice_mix(a, b, f):
+    ra, rb = (int(a[i:i + 2], 16) for i in (1, 3, 5)), (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * f) for x, y in zip(ra, rb))
+USER = os.environ.get("USER", "user")
+c = rice.colors()
+ERR = "#ee5d66"
+try:
+    import pwd
+    _real = (pwd.getpwnam(USER).pw_gecos or "").split(",")[0].strip()
+except Exception:
+    _real = ""
+NAME = (_real.split(" ")[0] if _real else USER)
+NAME = NAME[:1].upper() + NAME[1:]
+FACE = next((p for p in (os.path.expanduser("~/.face.icon"), os.path.expanduser("~/.face")) if os.path.isfile(p)), None)
+WALLBLUR = "/var/lib/rice-sddm/rice-bg.jpg"     # pre-blurred wallpaper, rewritten on every final theme apply
+
+
+def greeting():
+    h = time.localtime().tm_hour
+    return "Good night" if h < 5 else "Good morning" if h < 12 else "Good afternoon" if h < 18 else "Good evening"
+
+# ---- snapshot of the whole desktop (taken before any lock window exists) -------------
+# The lock appears at once with the dimmed raw shot; the blurred version fades in when ImageMagick is done.
+SHOT = os.path.join(CACHE, "lock.png")
+BLUR = os.path.join(CACHE, "lock-blur.png")
+def load_wall():
+    """The pre-blurred jpg; gdk-pixbuf here has no JPEG loader, so PIL decodes it (only when needed)."""
+    if not os.path.isfile(WALLBLUR):
+        return None
+    try:
+        return GdkPixbuf.Pixbuf.new_from_file(WALLBLUR)
+    except Exception:
+        pass
+    try:
+        from PIL import Image
+        im = Image.open(WALLBLUR).convert("RGB")
+        w, h = im.size
+        return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(im.tobytes()), GdkPixbuf.Colorspace.RGB, False, 8, w, h, w * 3)
+    except Exception:
+        return None
+
+
+wallpb = load_wall()
+full = None
+if wallpb is None:
+    subprocess.run(["maim", SHOT], timeout=5)
+    try:
+        full = GdkPixbuf.Pixbuf.new_from_file(SHOT)
+    except Exception:
+        full = None
+blurred = dict(pb=None, t=0.0)
+
+disp = Gdk.Display.get_default()
+mons = [disp.get_monitor(i) for i in range(disp.get_n_monitors())]
+primary = disp.get_primary_monitor() or mons[0]
+sc_w = disp.get_default_screen().get_width()
+sc_h = disp.get_default_screen().get_height()
+
+css = Gtk.CssProvider()
+css.load_from_data(f"""
+* {{ font-family: 'Inter', 'Symbols Nerd Font'; color: {c['fg']}; }}
+window {{ background: transparent; }}
+entry {{ background-color: alpha({c['bg']}, 0.45); background-image: none; border: 1.5px solid alpha({c['fg']}, 0.18);
+        border-image: none; border-radius: 28px; box-shadow: none; outline: none;
+        padding: 0 62px 0 26px; min-height: 56px; color: {c['fg']}; font-size: 18px; min-width: 272px;
+        caret-color: {c['fg']}; }}
+entry:focus {{ border-color: alpha({c['accent']}, 0.9); box-shadow: none; outline: none; }}
+entry.bad {{ border-color: {ERR}; }}
+button.go {{ background: {c['accent']}; background-image: none; border: none; border-radius: 99px; box-shadow: none;
+            min-width: 42px; min-height: 42px; padding: 0; margin: 7px; }}
+button.go:hover {{ background: shade({c['accent']}, 1.12); }}
+button.go label {{ color: {'#111111' if c.get('light') else '#ffffff'}; font-size: 20px; font-weight: bold; }}
+.dim {{ color: alpha({c['fg']}, 0.85); }}
+.err {{ color: {ERR}; }}
+""".encode())
+Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 5)
+
+
+class LockWin(Gtk.Window):
+    def __init__(self, mon, main):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.set_wmclass("rice-lock", "RiceLock")
+        g = mon.get_geometry()
+        self.g, self.main = g, main
+        self.set_app_paintable(True)
+        self.set_default_size(g.width, g.height)
+        self.move(g.x, g.y)
+        vis = self.get_screen().get_rgba_visual()
+        if vis:
+            self.set_visual(vis)
+        self.connect("draw", self.on_draw)
+        self.fade = 0.0
+        self.busy = False
+        self.bgpb = None
+        if wallpb is not None:     # wallpaper scaled to cover this monitor
+            sw, sh = wallpb.get_width(), wallpb.get_height()
+            k = max(g.width / sw, g.height / sh)
+            pb = wallpb.scale_simple(max(1, round(sw * k)), max(1, round(sh * k)), GdkPixbuf.InterpType.BILINEAR)
+            self.bgpb = pb.new_subpixbuf((pb.get_width() - g.width) // 2, (pb.get_height() - g.height) // 2, g.width, g.height)
+        self.s = max(0.6, min(g.width / 1920, g.height / 1080))
+        # date line on top, stacked clock, then (main monitor) greeting, pill field, message, music card
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        box.set_halign(Gtk.Align.CENTER); box.set_valign(Gtk.Align.START)
+        box.set_margin_top(round(g.height * 0.12))
+        self.box = box
+        self.date = Gtk.Label(); self.date.get_style_context().add_class("dim")
+        self.clock = Gtk.DrawingArea()
+        self.clock.connect("draw", self.draw_clock)
+        self.clock_px = round(270 * self.s)
+        self.clock.set_size_request(round(self.clock_px * 1.4), round(self.clock_px * 1.72))
+        box.pack_start(self.date, False, False, 0)
+        box.pack_start(self.clock, False, False, round(6 * self.s))
+        if main:
+            who = Gtk.Box(spacing=12); who.set_halign(Gtk.Align.CENTER)
+            av = Gtk.DrawingArea(); av.set_size_request(40, 40); av.connect("draw", self.draw_avatar)
+            self.face = None
+            if FACE:
+                try:
+                    self.face = GdkPixbuf.Pixbuf.new_from_file_at_scale(FACE, 40, 40, False)
+                except Exception:
+                    self.face = None
+            self.hello = Gtk.Label()
+            who.pack_start(av, False, False, 0); who.pack_start(self.hello, False, False, 0)
+            self.entry = Gtk.Entry(); self.entry.set_visibility(False); self.entry.set_invisible_char("\u2022")
+            self.entry.set_placeholder_text("password")
+            self.entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+            self.entry.connect("activate", self.try_unlock)
+            self.entry.set_size_request(round(360 * self.s), -1)
+            go = Gtk.Button(label="\u2192"); go.get_style_context().add_class("go")
+            go.set_halign(Gtk.Align.END); go.set_valign(Gtk.Align.CENTER); go.set_can_focus(False)
+            go.connect("clicked", lambda *_: self.try_unlock(self.entry))
+            pill = Gtk.Overlay(); pill.add(self.entry); pill.add_overlay(go)
+            pill.set_halign(Gtk.Align.CENTER)
+            self.pill = pill
+            self.msg = Gtk.Label(); self.msg.set_size_request(-1, 22)
+            box.pack_start(who, False, False, round(22 * self.s))
+            box.pack_start(pill, False, False, 0)
+            box.pack_start(self.msg, False, False, 12)
+            self.card = MusicCard()
+            self.card.set_halign(Gtk.Align.CENTER)
+            box.pack_start(self.card, False, False, 14)
+        box.set_opacity(0.0)
+        self.add(box)
+        self.tick_clock()
+
+    def tick_clock(self):
+        self.date.set_markup(f'<span size="{round(18000 * self.s)}" weight="500">{time.strftime("%A, %-d %B")}</span>')
+        self.clock.queue_draw()
+        if self.main:
+            self.hello.set_markup(f'<span size="{round(16500 * self.s)}" weight="600">{greeting()}, {GLib.markup_escape_text(NAME)}</span>')
+
+    def draw_clock(self, w, cr):
+        """Hour over minutes, Inter Display Black squeezed to 74 % width (no condensed font is installed)."""
+        a = w.get_allocation()
+        fd = Pango.FontDescription.from_string("Inter Display Black")
+        fd.set_absolute_size(self.clock_px * Pango.SCALE)
+        y = self.clock_px * 0.12
+        for i, txt in enumerate((time.strftime("%H"), time.strftime("%M"))):
+            lay = PangoCairo.create_layout(cr)
+            lay.set_font_description(fd)
+            lay.set_text(txt, -1)
+            ink, _ = lay.get_pixel_extents()
+            cr.save()
+            sx = 0.74
+            cr.translate(a.width / 2 - (ink.x + ink.width / 2) * sx, y - ink.y)
+            cr.scale(sx, 1)
+            col = c["fg"] if i == 0 else rice_mix(c["fg"], c["accent"], 0.45)
+            cr.set_source_rgba(*rice.rgb(col, 1))
+            PangoCairo.show_layout(cr, lay)
+            cr.restore()
+            y += ink.height + self.clock_px * 0.08
+        return False
+
+    def draw_avatar(self, w, cr):
+        a = w.get_allocation(); r = min(a.width, a.height) / 2
+        cr.arc(a.width / 2, a.height / 2, r - 1, 0, TAU)
+        if self.face is not None:
+            cr.save(); cr.clip(); Gdk.cairo_set_source_pixbuf(cr, self.face, 0, 0); cr.paint(); cr.restore()
+        else:
+            cr.set_source_rgba(*rice.rgb(c["accent"], 1)); cr.fill()
+            lay = PangoCairo.create_layout(cr)
+            lay.set_font_description(Pango.FontDescription.from_string("Inter Bold 14"))
+            lay.set_text(NAME[:1], -1)
+            ink, lg = lay.get_pixel_extents()
+            cr.move_to(a.width / 2 - lg.width / 2, a.height / 2 - lg.height / 2)
+            cr.set_source_rgba(*rice.rgb("#111111" if c.get("light") else "#ffffff", 1))
+            PangoCairo.show_layout(cr, lay)
+        cr.new_path(); cr.arc(a.width / 2, a.height / 2, r - 1, 0, TAU)
+        cr.set_source_rgba(*rice.rgb(c["fg"], 0.35)); cr.set_line_width(1.5); cr.stroke()
+        return False
+
+    def shake(self):
+        """Wrong password: damped horizontal shake of the pill (margins shift a centred widget)."""
+        t0 = time.monotonic()
+
+        def step(*_):
+            t = time.monotonic() - t0
+            if t > 0.42:
+                self.pill.set_margin_start(0); self.pill.set_margin_end(0)
+                return False
+            dx = 18 * self.s * math.sin(t * 2 * TAU / 0.18) * (1 - t / 0.42)
+            self.pill.set_margin_start(round(max(0, 2 * dx))); self.pill.set_margin_end(round(max(0, -2 * dx)))
+            return True
+        GLib.timeout_add(16, step)
+
+    def on_draw(self, w, cr):
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        if self.bgpb is not None:
+            cr.set_source_rgba(0, 0, 0, 1); cr.paint()
+            cr.set_operator(cairo.OPERATOR_OVER)
+            Gdk.cairo_set_source_pixbuf(cr, self.bgpb, 0, 0)
+            cr.paint_with_alpha(self.fade)
+            # same tint as the SDDM theme: a bit darker toward the bottom so text always reads
+            g = cairo.LinearGradient(0, 0, 0, self.g.height)
+            g.add_color_stop_rgba(0, *rice.rgb(c["bg"], 0.22 * self.fade))
+            g.add_color_stop_rgba(1, *rice.rgb(c["bg"], 0.55 * self.fade))
+            cr.set_source(g); cr.paint()
+        elif full:
+            sx, sy = self.g.x, self.g.y
+            Gdk.cairo_set_source_pixbuf(cr, full, -sx, -sy)
+            cr.paint_with_alpha(self.fade)
+            cr.set_operator(cairo.OPERATOR_OVER)
+            if blurred["pb"] is not None:
+                Gdk.cairo_set_source_pixbuf(cr, blurred["pb"], -sx, -sy)
+                cr.paint_with_alpha(blurred["t"])
+            cr.set_source_rgba(0, 0, 0, 0.38 * (1 - blurred["t"]) * self.fade)
+            cr.paint()
+        else:
+            cr.set_source_rgba(*rice.rgb(c["bg"], 1)); cr.paint()
+        return False
+
+    def try_unlock(self, entry):
+        """Check in a thread (a failed unix_chkpwd sleeps ~2 s); the UI stays alive, input stays grabbed."""
+        if self.busy:
+            return
+        pw = entry.get_text()
+        if not pw:
+            return
+        self.busy = True
+        self.msg.get_style_context().remove_class("err")
+        self.msg.set_markup(f'<span size="{round(11500 * self.s)}" weight="500">checking…</span>')
+
+        def job():
+            try:
+                ok = subprocess.run(["/sbin/unix_chkpwd", USER, "nullok"], input=(pw + "\0").encode(),
+                                    capture_output=True, timeout=15).returncode == 0
+            except Exception:
+                ok = False
+            GLib.idle_add(self.result, ok)
+        threading.Thread(target=job, daemon=True).start()
+
+    def result(self, ok):
+        self.busy = False
+        self.entry.set_text("")
+        if ok:
+            finish()
+            return False
+        self.msg.set_markup(f'<span size="{round(11500 * self.s)}" weight="500">Wrong password</span>')
+        self.msg.get_style_context().add_class("err")
+        ctx = self.entry.get_style_context(); ctx.add_class("bad")
+        self.entry.grab_focus_without_selecting()
+        self.shake()
+
+        def clear():
+            self.msg.set_text(""); ctx.remove_class("bad"); self.msg.get_style_context().remove_class("err")
+            return False
+        GLib.timeout_add(1800, clear)
+        return False
+
+
+class MusicCard(Gtk.EventBox):
+    """Mini MPRIS card: art, title, artist, progress, prev/play/next."""
+
+    def __init__(self):
+        super().__init__()
+        self.set_visible_window(False)
+        self.p = None
+        self.inf = None
+        self.art = None
+        self.set_size_request(380, 108)
+        self.da = Gtk.DrawingArea(); self.da.set_size_request(380, 108)
+        self.add(self.da)
+        self.da.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.da.connect("draw", self.on_draw)
+        self.da.connect("button-press-event", self.on_click)
+        GLib.timeout_add(1000, self.poll)
+        self.poll()
+
+    def poll(self):
+        self.p = mpris.active()
+        self.inf = mpris.info(self.p) if self.p else None
+        if self.inf and self.inf["art"]:
+            try:
+                self.art = GdkPixbuf.Pixbuf.new_from_file_at_size(self.inf["art"], 84, 84)
+            except Exception:
+                self.art = None
+        else:
+            self.art = None
+        self.da.queue_draw()
+        return True
+
+    def buttons(self):
+        return {"Previous": 244, "PlayPause": 288, "Next": 332}
+
+    def on_click(self, w, e):
+        if not self.p:
+            return True
+        for m, x in self.buttons().items():
+            if abs(e.x - x) < 18 and 62 < e.y < 100:
+                mpris.call(self.p, m)
+                GLib.timeout_add(180, self.poll)
+        return True
+
+    def on_draw(self, w, cr):
+        a = w.get_allocation()
+        rice.rounded(cr, 0.5, 0.5, a.width - 1, a.height - 1, 22)
+        cr.set_source_rgba(*rice.rgb(c["bg"], 0.55)); cr.fill_preserve()
+        cr.set_source_rgba(*rice.rgb(c["accent"], 0.45)); cr.set_line_width(1); cr.stroke()
+        # art
+        rice.rounded(cr, 12, 12, 84, 84, 14); cr.save(); cr.clip()
+        if self.art:
+            Gdk.cairo_set_source_pixbuf(cr, self.art, 12, 12); cr.paint()
+        else:
+            cr.set_source_rgba(*rice.rgb(c["bg2"], 1)); cr.paint()
+        cr.restore()
+        cr.select_font_face("JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        if not self.inf:
+            cr.set_source_rgba(*rice.rgb(c["fg"], 0.7)); cr.set_font_size(13)
+            cr.move_to(112, 58); cr.show_text("Nothing playing")
+            return False
+        t = self.inf["title"]
+        cr.set_source_rgba(*rice.rgb(c["fg"])); cr.set_font_size(14)
+        cr.move_to(108, 32); cr.show_text(t if len(t) < 26 else t[:25] + "…")
+        cr.select_font_face("JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_source_rgba(*rice.rgb(c["fg"], 0.65)); cr.set_font_size(11.5)
+        ar = self.inf["artist"]
+        cr.move_to(108, 50); cr.show_text(ar if len(ar) < 30 else ar[:29] + "…")
+        # progress
+        f = min(self.inf["pos"] / self.inf["length"], 1.0)
+        rice.rounded(cr, 108, 62, 100, 4, 2); cr.set_source_rgba(*rice.rgb(c["border"], 0.9)); cr.fill()
+        if f > 0:
+            rice.rounded(cr, 108, 62, max(100 * f, 4), 4, 2); cr.set_source_rgba(*rice.rgb(c["accent"])); cr.fill()
+        # transport
+        cr.set_source_rgba(*rice.rgb(c["fg"]))
+        cx, cy = 244, 80
+        cr.move_to(cx + 5, cy - 7); cr.line_to(cx - 4, cy); cr.line_to(cx + 5, cy + 7); cr.close_path(); cr.fill()
+        cr.rectangle(cx - 8, cy - 7, 2.5, 14); cr.fill()
+        cx = 288
+        if self.inf["playing"]:
+            cr.rectangle(cx - 6, cy - 8, 4, 16); cr.fill(); cr.rectangle(cx + 2, cy - 8, 4, 16); cr.fill()
+        else:
+            cr.move_to(cx - 5, cy - 9); cr.line_to(cx + 8, cy); cr.line_to(cx - 5, cy + 9); cr.close_path(); cr.fill()
+        cx = 332
+        cr.move_to(cx - 5, cy - 7); cr.line_to(cx + 4, cy); cr.line_to(cx - 5, cy + 7); cr.close_path(); cr.fill()
+        cr.rectangle(cx + 5.5, cy - 7, 2.5, 14); cr.fill()
+        return False
+
+
+wins = [LockWin(m, m is primary or (m.get_geometry().x == primary.get_geometry().x and m.get_geometry().y == primary.get_geometry().y)) for m in mons]
+
+
+def make_blur():
+    try:
+        subprocess.run(["convert", SHOT, "-filter", "Gaussian", "-virtual-pixel", "Edge", "-resize", "25%", "-blur", "0x6",
+                        "-resize", "400%", "-fill", "black", "-colorize", "38%", BLUR], timeout=15, capture_output=True)
+        pb = GdkPixbuf.Pixbuf.new_from_file(BLUR)
+    except Exception:
+        return
+    GLib.idle_add(blur_ready, pb)
+
+
+def blur_ready(pb):
+    blurred["pb"] = pb
+
+    def step(w, clock):
+        t0 = step.t0 = getattr(step, "t0", None) or clock.get_frame_time()
+        t = min((clock.get_frame_time() - t0) / 450000.0, 1.0)
+        blurred["t"] = t
+        for lw in wins:
+            lw.queue_draw()
+        return t < 1.0
+    mainwin.add_tick_callback(step)
+    return False
+
+
+def finish(*_):
+    seat = disp.get_default_seat()
+    seat.ungrab()
+    Gtk.main_quit()
+
+
+def fade_in(w, clock):
+    t0 = fade_in.t0 = getattr(fade_in, "t0", None) or clock.get_frame_time()
+    t = min((clock.get_frame_time() - t0) / 600000.0, 1.0)
+    e = 1 - (1 - t) ** 3
+    for lw in wins:
+        lw.fade = e
+        lw.box.set_opacity(e)
+        lw.box.set_margin_top(round(lw.g.height * 0.12 + 36 * lw.s * (1 - e)))
+        lw.queue_draw()
+    return t < 1.0
+
+
+blank = Gdk.Cursor.new_from_name(disp, "default")
+for lw in wins:
+    lw.show_all()
+    lw.get_window().set_cursor(blank)
+mainwin = next(w for w in wins if w.main)
+mainwin.add_tick_callback(fade_in)
+
+
+if wallpb is None and full is not None:
+    threading.Thread(target=make_blur, daemon=True).start()
+
+
+def grab():
+    seat = disp.get_default_seat()
+    st = seat.grab(mainwin.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None)
+    if st == Gdk.GrabStatus.SUCCESS:
+        mainwin.entry.grab_focus_without_selecting()
+        return False
+    return True      # keep trying: a locker without a grab is no locker
+
+
+grab.n = 0
+GLib.timeout_add(30, grab)
+def keep_focus(w, e):
+    if not mainwin.entry.has_focus():
+        mainwin.entry.grab_focus_without_selecting()
+    return False
+
+
+mainwin.connect("key-press-event", keep_focus)
+
+
+def tick():
+    for lw in wins:
+        lw.tick_clock()
+    return True
+
+
+GLib.timeout_add_seconds(1, tick)
+for s in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(s, signal.SIG_IGN)   # a locker must not be killable by a stray signal
+Gtk.main()
+for f in (SHOT, BLUR):
+    try:
+        os.remove(f)
+    except OSError:
+        pass

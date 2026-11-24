@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Tools menu (Mod+Shift+o)."""
+import os, sys, subprocess, signal
+# single instance (spam-safe): decided before the heavy imports
+import fcntl as _fc, signal as _sg
+_cd = os.path.expanduser("~/.cache/rice"); os.makedirs(_cd, exist_ok=True)
+_lk = open(os.path.join(_cd, "once-rice-tools.lock"), "w")
+try:
+    _fc.flock(_lk, _fc.LOCK_EX | _fc.LOCK_NB)
+except OSError:
+    if True:
+        try:
+            import time as _tm
+            if _tm.time() - os.path.getmtime(os.path.join(_cd, "once-rice-tools.pid")) > 1.2: os.kill(int(open(os.path.join(_cd, "once-rice-tools.pid")).read()), _sg.SIGTERM)
+        except Exception: pass
+    sys.exit(0)
+open(os.path.join(_cd, "once-rice-tools.pid"), "w").write(str(os.getpid()))
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import rice, widgets as w
+from rice import Gtk, Gdk, GLib
+
+W_, H_ = 560, 460
+card = rice.Card(W_, H_, radius=26)
+box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+for m in ("start", "end"): getattr(box, f"set_margin_{m}")(22)
+box.set_margin_top(20); box.set_margin_bottom(14)
+card.add(box)
+t = Gtk.Label(xalign=0); t.set_markup('<span size="15000" weight="bold">Tools</span>')
+box.pack_start(t, False, False, 2)
+
+
+def launch(*cmd):
+    def f():
+        subprocess.Popen(["sh", "-c", "sleep 0.25; exec \"$@\"", "sh", *cmd], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        card.quit_anim()
+    return f
+
+
+TOOLS = [
+    ("", "Search", ("rice-search",)), ("", "Convert", ("rice-convert",)),
+    ("", "Download", ("rice-dl",)), ("", "Clipboard", ("clip-pick",)),
+    ("", "Record", ("rice-record",)), ("", "Screenshot", ("rice-shot",)),
+    ("", "Colour picker", ("rice-pick",)), ("", "QR code", ("rice-qr",)),
+    ("", "Themes", ("theme-switch",)), ("", "Settings", ("rice-settings",)),
+    ("", "Media", ("rice-media",)), ("", "Volume", ("rice-volume",)),
+]
+ent = w.entry("search tools, or anything …  (enter on no match opens universal search)")
+box.pack_start(ent, False, False, 4)
+grid = Gtk.Grid(column_spacing=8, row_spacing=8, column_homogeneous=True, row_homogeneous=False)
+grid.set_size_request(-1, 300); grid.set_valign(Gtk.Align.START)
+box.pack_start(grid, False, False, 6)
+shown = []
+
+
+def fill(q=""):
+    for c in grid.get_children():
+        grid.remove(c)
+    q = q.lower().strip()
+    shown[:] = [t for t in TOOLS if not q or q in t[1].lower()]
+    for i, (g, l, c) in enumerate(shown):
+        t = w.Tile(g, l, launch(*c), 120, 94); t.set_halign(Gtk.Align.CENTER)
+        grid.attach(t, i % 4, i // 4, 1, 1)
+    grid.show_all()
+
+
+def go(*_):
+    if shown:
+        launch(*shown[0][2])()
+    elif ent.get_text().strip():
+        launch("rice-search", ent.get_text().strip())()
+
+
+ent.connect("changed", lambda e: fill(e.get_text()))
+ent.connect("activate", go)
+fill()
+hint = Gtk.Label(xalign=0.5)
+hint.set_markup('<span size="9000" alpha="50%">type to filter   ⏎ open first   esc close</span>')
+box.pack_end(hint, False, False, 0)
+
+
+def on_key(wd, e):
+    if e.keyval == Gdk.KEY_Escape:
+        card.quit_anim(); return True
+    return False
+
+
+card.connect("key-press-event", on_key)
+card.show_all()
+GLib.timeout_add(150, lambda: (ent.grab_focus(), False)[1])
+x, y, _g = w.mon_center(W_, H_)
+card.move(x, y - 30)
+w.close_on_outside(card)
+w.grab_keys(card)
+signal.signal(signal.SIGTERM, lambda *a: GLib.idle_add(card.quit_anim))
+Gtk.main()

@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Clipboard history picker (Mod+v): a rice Card, same open/close animation as the other menus.
+Type to filter, Up/Down, Enter or click = copy, Esc / click outside = close."""
+import os, sys, subprocess, signal
+# single instance (spam-safe): decided before the heavy imports
+import fcntl as _fc, signal as _sg
+_cd = os.path.expanduser("~/.cache/rice"); os.makedirs(_cd, exist_ok=True)
+_lk = open(os.path.join(_cd, "once-clip-pick.lock"), "w")
+try:
+    _fc.flock(_lk, _fc.LOCK_EX | _fc.LOCK_NB)
+except OSError:
+    if True:
+        try:
+            import time as _tm
+            if _tm.time() - os.path.getmtime(os.path.join(_cd, "once-clip-pick.pid")) > 1.2: os.kill(int(open(os.path.join(_cd, "once-clip-pick.pid")).read()), _sg.SIGTERM)
+        except Exception: pass
+    sys.exit(0)
+open(os.path.join(_cd, "once-clip-pick.pid"), "w").write(str(os.getpid()))
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import rice, widgets as w
+from rice import Gtk, Gdk, GLib
+from gi.repository import Pango, GdkPixbuf
+
+D = os.path.expanduser("~/.cache/clip")
+fs = sorted(os.listdir(D), reverse=True)[:60] if os.path.isdir(D) else []
+if not fs:
+    raise SystemExit
+
+W_, H_ = 640, 470
+card = rice.Card(W_, H_, radius=26)
+box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+for m in ("start", "end"): getattr(box, f"set_margin_{m}")(18)
+box.set_margin_top(16); box.set_margin_bottom(14)
+card.add(box)
+t = Gtk.Label(xalign=0); t.set_markup('<span size="15000" weight="bold">Clipboard</span>')
+box.pack_start(t, False, False, 2)
+ent = w.entry("filter history …")
+box.pack_start(ent, False, False, 2)
+sc = Gtk.ScrolledWindow(); sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+sc.set_size_request(-1, 330)
+lst = Gtk.ListBox(); lst.set_selection_mode(Gtk.SelectionMode.SINGLE); lst.set_activate_on_single_click(True)
+sc.add(lst)
+box.pack_start(sc, True, True, 2)
+foot = Gtk.Label(xalign=0); foot.set_markup('<span size="9000" alpha="55%">type to filter   ↵ copy   esc close</span>')
+box.pack_start(foot, False, False, 0)
+
+items = []
+for f in fs:
+    p = os.path.join(D, f)
+    if f.endswith(".png"):
+        items.append(dict(path=p, img=True, text="[image]"))
+    else:
+        try:
+            tx = " ".join(open(p, errors="ignore").read().split())[:160]
+        except OSError:
+            continue
+        if tx:
+            items.append(dict(path=p, img=False, text=tx))
+shown = []
+
+
+def fill(q=""):
+    for c in lst.get_children():
+        lst.remove(c)
+    q = q.lower().strip()
+    shown[:] = [i for i in items if not q or (not i["img"] and q in i["text"].lower())][:40]
+    for it in shown:
+        row = Gtk.ListBoxRow()
+        hb = Gtk.Box(spacing=10); hb.set_margin_top(7); hb.set_margin_bottom(7); hb.set_margin_start(10); hb.set_margin_end(10)
+        if it["img"]:
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(it["path"], 120, 56, True)
+                hb.pack_start(Gtk.Image.new_from_pixbuf(pb), False, False, 0)
+            except Exception:
+                hb.pack_start(Gtk.Label(label="[image]", xalign=0), False, False, 0)
+        else:
+            lb = Gtk.Label(label=it["text"], xalign=0); lb.set_ellipsize(Pango.EllipsizeMode.END)
+            lb.set_single_line_mode(True)
+            hb.pack_start(lb, True, True, 0)
+        row.add(hb); lst.add(row)
+    lst.show_all()
+    if shown:
+        lst.select_row(lst.get_row_at_index(0))
+
+
+def copy(it):
+    p = it["path"]
+    if it["img"]:
+        subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/png", "-i", p])
+    else:
+        subprocess.run(["xclip", "-selection", "clipboard", "-i", p])
+
+
+def choose(i):
+    if 0 <= i < len(shown):
+        it = shown[i]
+        card.quit_anim()
+        GLib.timeout_add(200, lambda: (copy(it), False)[1])
+
+
+def move(d):
+    r = lst.get_selected_row()
+    i = (r.get_index() if r else -1) + d
+    if shown:
+        i = max(0, min(i, len(shown) - 1))
+        lst.select_row(lst.get_row_at_index(i))
+        lst.get_row_at_index(i).grab_focus(); ent.grab_focus_without_selecting()
+
+
+def on_key(wd, e):
+    k = e.keyval
+    if k == Gdk.KEY_Escape:
+        card.quit_anim(); return True
+    if k == Gdk.KEY_Down: move(1); return True
+    if k == Gdk.KEY_Up: move(-1); return True
+    if k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+        r = lst.get_selected_row(); choose(r.get_index() if r else 0); return True
+    return False
+
+
+def on_press(wd, e):
+    a = card.get_allocation()
+    if e.button == 3 or not (0 <= e.x <= a.width and 0 <= e.y <= a.height):
+        card.quit_anim(); return True
+    return False
+
+
+ent.connect("changed", lambda e: fill(e.get_text()))
+lst.connect("row-activated", lambda lb, row: choose(row.get_index()))
+card.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+card.connect("key-press-event", on_key)
+card.connect("button-press-event", on_press)
+fill()
+x, y, g = w.mon_center(W_, H_)
+card.move(x, y)
+card.show_all()
+w.grab_keys(card)
+GLib.timeout_add(120, lambda: (ent.grab_focus(), False)[1])
+signal.signal(signal.SIGTERM, lambda *a: GLib.idle_add(card.quit_anim))
+Gtk.main()

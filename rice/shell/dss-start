@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Start DarkShadow's Shell (ported QML) on X11/dwm.  dss-start [stop]
+D="$HOME/.local/share/dss"
+export QML_IMPORT_PATH="$D/qml" PATH="$D/bin:$PATH" __GL_SYNC_TO_VBLANK=0 __GL_YIELD=USLEEP
+[ "$1" = stop ] && { for p in $(pgrep -x qs); do kill "$p"; done; exit 0; }
+mkdir -p "$HOME/.cache/rice"
+for f in launcher-open clip-open wifi-open bluetooth-open power-open volume-open dashboard-open; do [ -e "$HOME/.cache/rice/$f" ] || : > "$HOME/.cache/rice/$f"; done
+( sleep 6; exec "$D/bin/rice-widget-fade" ) >/dev/null 2>&1 &
+exec qs -n -p "$HOME/.config/quickshell/rice-desktop" >> "$HOME/.cache/rice/desktop.log" 2>&1

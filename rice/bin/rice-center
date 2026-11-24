@@ -1,0 +1,1521 @@
+#!/usr/bin/env python3
+"""Control centre: side panel that slides in from the right edge under the bar.
+   rice-center [control|today|system|customize]
+   Run again closes it (toggle); with a tab name while open it switches to that tab (or closes if it is showing)."""
+import os, sys, signal
+signal.signal(signal.SIGUSR1, signal.SIG_IGN)          # a tab switch request must never kill us while we start
+CACHE = os.path.expanduser("~/.cache/rice")
+PID, TABF = os.path.join(CACHE, "center.pid"), os.path.join(CACHE, "center.tab")
+TABS = ("control", "today", "system", "customize")
+want = sys.argv[1].lower() if len(sys.argv) > 1 and sys.argv[1].lower() in TABS else None
+os.makedirs(CACHE, exist_ok=True)
+try:
+    old = int(open(PID).read())
+    if old != os.getpid() and "rice-center" in open(f"/proc/{old}/cmdline").read():
+        cur_tab = ""
+        try: cur_tab = open(TABF).read().strip()
+        except OSError: pass
+        if want and want != cur_tab:
+            open(TABF + ".req", "w").write(want)
+            os.kill(old, signal.SIGUSR1)
+        else:
+            os.kill(old, signal.SIGTERM)
+        sys.exit(0)
+except (OSError, ValueError):
+    pass
+open(PID, "w").write(str(os.getpid()))
+
+import subprocess, threading, shutil, json, time, math
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import rice, settings, widgets as w
+from rice import Gtk, Gdk, GLib, cairo
+
+PW = 420                     # panel width
+PAD = 22
+CW = PW - 2 * PAD            # content width
+HAVE = {c: shutil.which(c) for c in ("nmcli", "bluetoothctl", "dunstctl", "nvidia-smi", "wpctl", "xset")}
+
+panel = rice.Panel(PW)
+
+
+# ------------------------------------------------------------------ helpers
+def sh(*a):
+    try:
+        subprocess.Popen(list(a), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
+def out(*a, t=2):
+    try:
+        return subprocess.run(["timeout", str(t), *a], capture_output=True, text=True).stdout.strip()
+    except Exception:
+        return ""
+
+
+def bg(fn, then=None):
+    """Run fn in a thread, then(result) on the main loop."""
+    def run():
+        try:
+            r = fn()
+        except Exception:
+            r = None
+        if then:
+            GLib.idle_add(lambda: (then(r), False)[1])
+    threading.Thread(target=run, daemon=True).start()
+
+
+def launch(cmd, need=None):
+    """Close the centre, then start cmd detached. A missing program only shows a note and keeps the panel open."""
+    if not shutil.which(need or cmd[0]):
+        note(f"{need or cmd[0]} is not installed")
+        return
+    panel.quit_anim()
+    GLib.timeout_add(260, lambda: (sh(*cmd), False)[1])
+
+
+def spawn_keep(cmd):
+    """Start a helper without closing the panel; ignore it if missing."""
+    if shutil.which(cmd[0]):
+        sh(*cmd)
+
+
+def mix(a, b, k):
+    return tuple(a[i] + (b[i] - a[i]) * k for i in range(3))
+
+
+def lerp(a, b, k):
+    return a + (b - a) * k
+
+
+class Tween:
+    """Value easing toward a target with the motion preset (rice.spring), driven by the fast frame clock."""
+
+    def __init__(self, widget, v=0.0, base=0.3):
+        self.wd, self.v, self.base = widget, float(v), base
+        self.a = self.b = float(v)
+        self.t0, self.dur, self.tk = 0.0, 0.3, None
+
+    def go(self, to, base=None):
+        to = float(to)
+        if self.tk is not None and abs(to - self.b) < 1e-6:
+            return
+        self.a, self.b = self.v, to
+        self.t0, self.dur = time.monotonic(), rice.mdur(base or self.base)
+        if self.tk is None:
+            self.tk = self.wd.add_tick_callback(self._step)
+
+    def _step(self, wd, clock):
+        t = min((time.monotonic() - self.t0) / self.dur, 1.0)
+        self.v = self.a + (self.b - self.a) * rice.spring(t)
+        wd.queue_draw()
+        if t >= 1.0:
+            self.v = self.b; self.tk = None
+            return False
+        return True
+
+
+def area(wd, h, draw, press=None, motion=None, leave=None, scroll=None):
+    d = Gtk.DrawingArea()
+    d.set_size_request(wd, h)
+    d.connect("draw", draw)
+    ev = 0
+    if press:
+        ev |= Gdk.EventMask.BUTTON_PRESS_MASK; d.connect("button-press-event", press)
+    if motion:
+        ev |= Gdk.EventMask.POINTER_MOTION_MASK; d.connect("motion-notify-event", motion)
+    if leave:
+        ev |= Gdk.EventMask.LEAVE_NOTIFY_MASK; d.connect("leave-notify-event", leave)
+    if scroll:
+        ev |= Gdk.EventMask.SCROLL_MASK; d.connect("scroll-event", scroll)
+    d.add_events(ev)
+    return d
+
+
+def soft(cr, x, y, ww, hh, r=18, a=0.07):
+    rice.rounded(cr, x, y, ww, hh, r)
+    cr.set_source_rgba(*w.col("fg", a)); cr.fill()
+
+
+def fit(cr, s, size, maxw, bold=False, font=None):
+    """Cut s with an ellipsis so it fits maxw at this size."""
+    cr.select_font_face(font or rice.FONT, 0, 1 if bold else 0); cr.set_font_size(size)
+    if cr.text_extents(s).x_advance <= maxw:
+        return s
+    while s and cr.text_extents(s + "…").x_advance > maxw:
+        s = s[:-1]
+    return s + "…"
+
+
+def section(box, title, right=None):
+    h = Gtk.Box(spacing=8)
+    h.pack_start(w.heading(title), False, False, 0)
+    if right is not None:
+        h.pack_end(right, False, False, 0)
+    h.set_margin_top(6)
+    box.pack_start(h, False, False, 0)
+
+
+# ------------------------------------------------------------------ tab header
+TAB_INFO = (("control", "", "Control"), ("today", "", "Today"),
+            ("system", "", "System"), ("customize", "", "Style"))
+
+
+class Tabs(Gtk.DrawingArea):
+    def __init__(self, cb):
+        super().__init__()
+        self.cb, self.sel, self.hot = cb, 0, -1
+        self.tw = Tween(self, 0.0, 0.32)
+        self.set_size_request(CW, 40)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("draw", self._draw)
+        self.connect("button-press-event", self._press)
+        self.connect("motion-notify-event", self._motion)
+        self.connect("leave-notify-event", lambda *a: (setattr(self, "hot", -1), self.queue_draw()))
+
+    def _idx(self, x):
+        return max(0, min(len(TAB_INFO) - 1, int(x / (self.get_allocated_width() / len(TAB_INFO)))))
+
+    def _press(self, wd, e):
+        if e.button == 1:
+            self.cb(TAB_INFO[self._idx(e.x)][0])
+        return True
+
+    def _motion(self, wd, e):
+        i = self._idx(e.x)
+        if i != self.hot:
+            self.hot = i; self.queue_draw()
+        return False
+
+    def set(self, i):
+        self.sel = i; self.tw.go(i)
+
+    def _draw(self, wd, cr):
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        n = len(TAB_INFO); sw = (W - 6) / n
+        rice.rounded(cr, 0.5, 0.5, W - 1, H - 1, H / 2)
+        cr.set_source_rgba(*w.col("fg", 0.07)); cr.fill()
+        if 0 <= self.hot != self.sel:
+            rice.rounded(cr, 3 + self.hot * sw, 3, sw, H - 6, (H - 6) / 2)
+            cr.set_source_rgba(*w.col("fg", 0.06)); cr.fill()
+        v = self.tw.v
+        rice.rounded(cr, 3 + v * sw, 3, sw, H - 6, (H - 6) / 2)
+        cr.set_source_rgba(*w.col("accent")); cr.fill()
+        for i, (_k, g, lab) in enumerate(TAB_INFO):
+            k = max(0.0, 1.0 - abs(i - v))
+            col = mix(w.col("dim"), w.col("bg"), k)
+            cx = 3 + sw * (i + 0.5)
+            cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(11.5)
+            tw_ = cr.text_extents(lab).x_advance
+            x0 = cx - (tw_ + 20) / 2
+            cr.select_font_face(rice.ICON_FONT, 0, 0); cr.set_font_size(13)
+            cr.set_source_rgba(*col, 1); cr.move_to(x0, H / 2 + 5); cr.show_text(g)
+            cr.select_font_face(rice.FONT, 0, 1 if k > 0.5 else 0); cr.set_font_size(11.5)
+            cr.set_source_rgba(*col, 1); cr.move_to(x0 + 20, H / 2 + 4.5); cr.show_text(lab)
+        return False
+
+
+# ------------------------------------------------------------------ layout
+root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+for m, v in (("start", PAD), ("end", PAD), ("top", 20), ("bottom", 18)):
+    getattr(root, f"set_margin_{m}")(v)
+panel.add(root)
+tabs = Tabs(lambda k: goto(k))
+root.pack_start(tabs, False, False, 0)
+stack = Gtk.Stack(); stack.set_homogeneous(True); stack.set_transition_type(Gtk.StackTransitionType.NONE)
+root.pack_start(stack, True, True, 0)
+fx = stack                 # the switch snapshots are painted after the stack's own drawing (no overlay: it ate the clicks)
+PAGES = {}
+msg = Gtk.Label(); msg.set_no_show_all(True)
+root.pack_end(msg, False, False, 0)
+
+
+def note(t):
+    msg.set_markup(f'<span size="10000" alpha="70%">{GLib.markup_escape_text(t)}</span>'); msg.show()
+    if getattr(note, "tm", None):
+        GLib.source_remove(note.tm)
+    note.tm = GLib.timeout_add(2600, lambda: (msg.hide(), setattr(note, "tm", None), False)[2])
+
+
+def page(name):
+    sc = Gtk.ScrolledWindow(); sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    sc.set_overlay_scrolling(True)
+    b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    b.set_margin_bottom(6)
+    sc.add(b)
+    stack.add_named(sc, name)
+    PAGES[name] = sc
+    return b
+
+
+# ---- tab switch: both pages are snapshots painted by the overlay (repaint only, no resize)
+FX = dict(old=None, new=None, t0=0.0, dur=0.3, dir=1, tk=None, page=None)
+
+
+def _snap(widget):
+    a = widget.get_allocation()
+    if a.width < 2 or a.height < 2:
+        return None
+    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, a.width, a.height)
+    o = widget.get_opacity(); widget.set_opacity(1.0)
+    widget.draw(cairo.Context(s))
+    widget.set_opacity(o)
+    return s
+
+
+def fx_draw(wd, cr):
+    if FX["tk"] is None:
+        return False
+    t = min((time.monotonic() - FX["t0"]) / FX["dur"], 1.0)
+    e = rice.spring(t)
+    m = rice.motion()["name"]
+    d = 0 if m == "minimal" else 34 * FX["dir"]
+    fo = max(0.0, 1.0 - min(t / 0.55, 1.0))            # old page leaves quicker than the new one arrives
+    if FX["old"] is not None and fo > 0:
+        cr.set_source_surface(FX["old"], -d * min(e, 1.0) * 0.6, 0); cr.paint_with_alpha(fo)
+    if FX["new"] is not None:
+        u = min(max((t - 0.12) / 0.88, 0.0), 1.0)
+        cr.set_source_surface(FX["new"], d * (1.0 - e), 0); cr.paint_with_alpha(u * u * (3 - 2 * u))
+    return False
+
+
+stack.connect_after("draw", fx_draw)
+
+
+def _fx_tick(wd, clock):
+    t = (time.monotonic() - FX["t0"]) / FX["dur"]
+    fx.queue_draw()
+    if t >= 1.0:
+        FX["tk"] = None
+        if FX["page"] is not None:
+            FX["page"].set_opacity(1.0)
+        FX["old"] = FX["new"] = None
+        fx.queue_draw()
+        return False
+    return True
+
+
+CUR = [None]
+
+
+def goto(name, animate=True):
+    if name not in PAGES or name == CUR[0]:
+        return
+    prev = CUR[0]
+    CUR[0] = name
+    try: open(TABF, "w").write(name)
+    except OSError: pass
+    i = TABS.index(name)
+    tabs.set(i)
+    oldp = PAGES.get(prev) if prev else None
+    newp = PAGES[name]
+    can = animate and rice.anim_on() and oldp is not None and panel.get_mapped()
+    if FX["tk"] is not None and FX["page"] is not None:        # a switch while one is running: finish it now
+        FX["page"].set_opacity(1.0)
+    old_s = _snap(oldp) if can else None
+    stack.set_visible_child(newp)
+    ON_SHOW.get(name, lambda: None)()
+    if not can or old_s is None:
+        newp.set_opacity(1.0)
+        return
+    panel.check_resize()
+    new_s = _snap(newp)
+    newp.set_opacity(0.0)
+    FX.update(old=old_s, new=new_s, t0=time.monotonic(), dur=rice.mdur(0.36), page=newp,
+              dir=1 if TABS.index(prev) < i else -1)
+    if FX["tk"] is None:
+        FX["tk"] = fx.add_tick_callback(_fx_tick)
+
+
+ON_SHOW = {}
+
+
+def visible(name):
+    return CUR[0] == name and panel.get_mapped() and not getattr(panel, "_leaving", False)
+
+
+# ================================================================== CONTROL
+pc = page("control")
+
+
+class Toggle(Gtk.DrawingArea):
+    """Quick tile: icon, label, state line. toggle=True keeps an on/off state; False is a one-shot action."""
+
+    def __init__(self, glyph, label, cb, on=False, toggle=True, sub=None, ww=116, hh=86):
+        super().__init__()
+        self.glyph, self.label, self.cb, self.on, self.toggle, self.sub = glyph, label, cb, on, toggle, sub
+        self.k = Tween(self, 1.0 if on else 0.0, 0.28)
+        self.h = Tween(self, 0.0, 0.2)
+        self.set_size_request(ww, hh)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("draw", self._draw)
+        self.connect("enter-notify-event", lambda *a: self.h.go(1.0))
+        self.connect("leave-notify-event", lambda *a: self.h.go(0.0))
+        self.connect("button-press-event", self._press)
+
+    def set(self, on):
+        self.on = bool(on); self.k.go(1.0 if self.on else 0.0); self.queue_draw()
+
+    def _press(self, wd, e):
+        if e.button != 1:
+            return False
+        if self.toggle:
+            self.set(not self.on)
+            self.cb(self.on)
+        else:
+            self.cb()
+        return True
+
+    def _draw(self, wd, cr):
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        k, hv = self.k.v, self.h.v
+        rice.rounded(cr, 2, 2, W - 4, H - 4, 20)
+        fg, ac = w.col("fg"), w.col("accent")
+        cr.set_source_rgba(*mix(fg, ac, min(max(k, 0), 1)), lerp(0.07 + 0.05 * hv, 0.9, min(max(k, 0), 1))); cr.fill()
+        ic = "bg" if k > 0.5 else "accent"
+        # icon in a soft disc, top-left
+        cr.arc(28, 28, 15, 0, 2 * math.pi)
+        cr.set_source_rgba(*w.col("bg" if k > 0.5 else "fg", 0.16 if k > 0.5 else 0.07)); cr.fill()
+        w.icon(cr, self.glyph, 28, 34 - 1.5 * hv, 15, ic)
+        txt = "bg" if k > 0.5 else "fg"
+        fs = 11.5
+        cr.select_font_face(rice.FONT, 0, 1)
+        while fs > 9.6:
+            cr.set_font_size(fs)
+            if cr.text_extents(self.label).x_advance <= W - 24:
+                break
+            fs -= 0.5
+        cr.set_source_rgba(*w.col(txt)); cr.move_to(14, H - 26); cr.show_text(fit(cr, self.label, fs, W - 24, True))
+        sub = self.sub if not self.toggle else ("On" if self.on else "Off")
+        if callable(sub):
+            sub = sub()
+        if sub:
+            cr.select_font_face(rice.FONT, 0, 0); cr.set_font_size(9.5)
+            cr.set_source_rgba(*w.col("bg" if k > 0.5 else "dim", 0.8)); cr.move_to(14, H - 12); cr.show_text(fit(cr, sub, 9.5, W - 24))
+        return False
+
+
+grid = Gtk.FlowBox(); grid.set_selection_mode(Gtk.SelectionMode.NONE)
+grid.set_max_children_per_line(3); grid.set_min_children_per_line(3); grid.set_homogeneous(True)
+grid.set_column_spacing(4); grid.set_row_spacing(4)
+TILES = {}
+
+
+def add_tile(key, t):
+    TILES[key] = t
+    grid.add(t)
+
+
+# Wi-Fi
+def wifi_state():
+    return out("nmcli", "radio", "wifi").strip() == "enabled"
+
+
+def wifi_set(on):
+    sh("timeout", "6", "nmcli", "radio", "wifi", "on" if on else "off")
+
+
+if HAVE["nmcli"]:
+    add_tile("wifi", Toggle("", "Wi-Fi", wifi_set))
+
+
+# Bluetooth
+def bt_state():
+    return "Powered: yes" in out("bluetoothctl", "show")
+
+
+def bt_set(on):
+    sh("timeout", "6", "bluetoothctl", "power", "on" if on else "off")
+
+
+if HAVE["bluetoothctl"]:
+    add_tile("bt", Toggle("", "Bluetooth", bt_set))
+
+
+# Do not disturb
+def dnd_state():
+    if HAVE["dunstctl"]:
+        r = out("dunstctl", "is-paused")
+        if r in ("true", "false"):
+            return r == "true"
+    return bool(settings.get("dnd"))
+
+
+def dnd_set(on):
+    settings.put("dnd", bool(on))
+    if HAVE["dunstctl"]:
+        sh("timeout", "3", "dunstctl", "set-paused", "true" if on else "false")
+
+
+add_tile("dnd", Toggle("", "Do not disturb", dnd_set))
+
+
+# Night light: same setting + gamma code as rice-settings (rice-apply, xrandr gamma)
+def night_set(on):
+    settings.sput("night", bool(on))
+    sh("rice-apply")
+
+
+add_tile("night", Toggle("", "Night light", night_set, on=bool(settings.sget("night", False))))
+
+
+# Keep awake: screen saver + DPMS off; off again restores the user's timeout (or X defaults)
+KA = os.path.join(CACHE, "keepawake")
+
+
+def awake_state():
+    if not os.path.exists(KA):
+        return False
+    q = out("xset", "q")
+    return "timeout:  0" in q or "timeout: 0" in q
+
+
+def awake_set(on):
+    if on:
+        open(KA, "w").close()
+        sh("sh", "-c", "xset s off; xset -dpms")
+    else:
+        try: os.remove(KA)
+        except OSError: pass
+        mn = settings.sget("dpms_min")
+        if mn is not None:
+            sh("rice-apply")
+        else:
+            sh("sh", "-c", "xset s default; xset s on; xset +dpms")
+
+
+add_tile("awake", Toggle("", "Keep awake", awake_set))
+add_tile("shot", Toggle("", "Screenshot", lambda: launch(["rice-shot"]), toggle=False, sub="capture area"))
+add_tile("rec", Toggle("", "Record", lambda: launch(["rice-record"]), toggle=False, sub="screen + audio"))
+add_tile("term", Toggle("", "Terminal", lambda: launch(["konsole"]), toggle=False, sub="konsole"))
+pc.pack_start(grid, False, False, 0)
+
+
+def load_states():
+    def work():
+        r = dict(dnd=dnd_state(), awake=awake_state())
+        if "wifi" in TILES: r["wifi"] = wifi_state()
+        if "bt" in TILES: r["bt"] = bt_state()
+        return r
+
+    def done(r):
+        for k, v in (r or {}).items():
+            if k in TILES and TILES[k].on != v:
+                TILES[k].set(v)
+    bg(work, done)
+
+
+# ---- sound sliders
+SND = dict(vol=0.5, vmute=False, mic=0.5, mmute=False, drag=None, tm={})
+
+
+class Level(Gtk.DrawingArea):
+    """Icon button + thick pill slider + percent; drag or scroll to set, click the icon to mute."""
+
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind                         # "vol" or "mic"
+        self.tw = Tween(self, 0.5, 0.22)
+        self.drag = False
+        self.set_size_request(CW, 44)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK)
+        self.connect("draw", self._draw)
+        self.connect("button-press-event", self._press)
+        self.connect("button-release-event", lambda *a: (setattr(self, "drag", False), self.queue_draw()))
+        self.connect("motion-notify-event", self._motion)
+        self.connect("scroll-event", self._scroll)
+
+    X0 = 50
+
+    def _frac(self, x):
+        return max(0.0, min(1.0, (x - self.X0) / (self.get_allocated_width() - self.X0 - 54)))
+
+    def _set(self, f):
+        SND[self.kind] = f
+        self.tw.v = self.tw.a = self.tw.b = f
+        self.queue_draw()
+        push(self.kind)
+
+    def _press(self, wd, e):
+        if e.button != 1:
+            return False
+        if e.x < self.X0 - 6:
+            mk = "vmute" if self.kind == "vol" else "mmute"
+            SND[mk] = not SND[mk]; self.queue_draw()
+            dev = "@DEFAULT_AUDIO_SINK@" if self.kind == "vol" else "@DEFAULT_AUDIO_SOURCE@"
+            sh("timeout", "2", "sh", "-c", f"wpctl set-mute {dev} {'1' if SND[mk] else '0'}; pkill -RTMIN+10 -x dwm-status")
+            return True
+        self.drag = True
+        self._set(self._frac(e.x))
+        return True
+
+    def _motion(self, wd, e):
+        if self.drag:
+            self._set(self._frac(e.x))
+        return True
+
+    def _scroll(self, wd, e):
+        d = {Gdk.ScrollDirection.UP: 0.05, Gdk.ScrollDirection.DOWN: -0.05}.get(e.direction)
+        if d is None:
+            ok, dx, dy = e.get_scroll_deltas()
+            d = -dy * 0.05 if ok else 0
+        if d:
+            self._set(max(0.0, min(1.0, SND[self.kind] + d)))
+        return True
+
+    def _draw(self, wd, cr):
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        muted = SND["vmute" if self.kind == "vol" else "mmute"]
+        v = self.tw.v
+        cr.arc(20, H / 2, 18, 0, 2 * math.pi)
+        cr.set_source_rgba(*w.col("fg", 0.08)); cr.fill()
+        if self.kind == "vol":
+            g = "" if muted else ("" if v < 0.01 else ("" if v < 0.5 else ""))
+        else:
+            g = "" if muted else ""
+        w.icon(cr, g, 20, H / 2 + 6, 15, "dim" if muted else "accent")
+        x0, x1 = self.X0, W - 54
+        th = 16 if self.drag else 12
+        rice.rounded(cr, x0, H / 2 - th / 2, x1 - x0, th, th / 2)
+        cr.set_source_rgba(*w.col("fg", 0.1)); cr.fill()
+        fw = max(th, (x1 - x0) * v)
+        rice.rounded(cr, x0, H / 2 - th / 2, fw, th, th / 2)
+        cr.set_source_rgba(*w.col("dim" if muted else "accent")); cr.fill()
+        cr.arc(x0 + fw - th / 2, H / 2, th / 2 + 3, 0, 2 * math.pi)
+        cr.set_source_rgba(*w.col("fg")); cr.fill()
+        w.text(cr, "muted" if muted else f"{int(round(v * 100))}%", W - 2, H / 2 + 4.5, 11, True, "dim" if muted else "fg", 1, "r")
+        return False
+
+
+def push(kind):
+    tm = SND["tm"]
+    if tm.get(kind):
+        GLib.source_remove(tm[kind])
+
+    def go():
+        tm[kind] = None
+        v = SND[kind]
+        dev = "@DEFAULT_AUDIO_SINK@" if kind == "vol" else "@DEFAULT_AUDIO_SOURCE@"
+        sh("timeout", "2", "sh", "-c", f"wpctl set-volume -l 1.0 {dev} {v:.3f}; pkill -RTMIN+10 -x dwm-status")
+        return False
+    tm[kind] = GLib.timeout_add(45, go)
+
+
+section(pc, "Sound")
+lv_vol, lv_mic = Level("vol"), Level("mic")
+pc.pack_start(lv_vol, False, False, 0)
+pc.pack_start(lv_mic, False, False, 0)
+
+
+def load_sound():
+    def parse(s):
+        try:
+            p = s.split()
+            return min(1.0, float(p[1])), "[MUTED]" in s
+        except Exception:
+            return None
+
+    def work():
+        if not HAVE["wpctl"]:
+            return None
+        return parse(out("wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@")), parse(out("wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"))
+
+    def done(r):
+        if not r:
+            return
+        for lv, key, mk, val in ((lv_vol, "vol", "vmute", r[0]), (lv_mic, "mic", "mmute", r[1])):
+            if val is None or lv.drag or SND["tm"].get(key):
+                continue
+            SND[key], SND[mk] = val
+            lv.tw.go(val[0])
+    bg(work, done)
+
+
+# ---- media
+MED = dict(p=None, info=None, t=0.0, pb=None, art=None, busy=False, hot=None)
+MH = 132
+
+
+def media_poll():
+    if MED["busy"]:
+        return
+    MED["busy"] = True
+
+    def work():
+        import mpris
+        p = mpris.active()
+        return p, (mpris.info(p) if p else None)
+
+    def done(r):
+        MED["busy"] = False
+        p, inf = r if r else (None, None)
+        MED["p"], MED["info"], MED["t"] = p, inf, time.monotonic()
+        if inf and inf.get("art") != MED["art"]:
+            MED["art"], MED["pb"] = inf.get("art"), None
+            if inf.get("art"):
+                try:
+                    from gi.repository import GdkPixbuf
+                    MED["pb"] = GdkPixbuf.Pixbuf.new_from_file_at_scale(inf["art"], 168, 168, True)
+                except Exception:
+                    MED["pb"] = None
+        media.queue_draw()
+    bg(work, done)
+
+
+def media_pos():
+    inf = MED["info"]
+    if not inf:
+        return 0.0
+    pos = inf["pos"] + ((time.monotonic() - MED["t"]) * 1e6 if inf["playing"] else 0)
+    return max(0.0, min(1.0, pos / inf["length"]))
+
+
+def fmt_t(us):
+    s = int(us / 1e6)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+BTNS = (("prev", "", -46), ("play", None, 0), ("next", "", 46))
+
+
+def media_draw(wd, cr):
+    W, H = wd.get_allocated_width(), wd.get_allocated_height()
+    soft(cr, 0, 0, W, H, 22, 0.07)
+    inf = MED["info"]
+    A = 84
+    ax, ay = 14, 14
+    rice.rounded(cr, ax, ay, A, A, 16)
+    if MED["pb"] is not None:
+        cr.save(); cr.clip()
+        pb = MED["pb"]; s = A / min(pb.get_width(), pb.get_height())
+        cr.translate(ax + (A - pb.get_width() * s) / 2, ay + (A - pb.get_height() * s) / 2); cr.scale(s, s)
+        Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0); cr.get_source().set_filter(cairo.FILTER_GOOD); cr.paint()
+        cr.restore()
+    else:
+        cr.set_source_rgba(*w.col("accent", 0.18)); cr.fill()
+        w.icon(cr, "", ax + A / 2, ay + A / 2 + 9, 26, "accent")
+    tx = ax + A + 14
+    tw_ = W - tx - 14
+    if not inf:
+        w.text(cr, "Nothing playing", tx, 42, 13, True)
+        w.text(cr, "start a player to control it here", tx, 62, 10, False, "dim")
+    else:
+        cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(13)
+        cr.set_source_rgba(*w.col("fg")); cr.move_to(tx, 34); cr.show_text(fit(cr, inf["title"], 13, tw_, True))
+        cr.select_font_face(rice.FONT, 0, 0); cr.set_font_size(10.5)
+        cr.set_source_rgba(*w.col("dim")); cr.move_to(tx, 53); cr.show_text(fit(cr, inf["artist"] or "", 10.5, tw_))
+    by = 82
+    for k, g, dx in BTNS:
+        cx = tx + 52 + dx
+        hot = MED["hot"] == k
+        if k == "play":
+            cr.arc(cx, by, 17, 0, 2 * math.pi); cr.set_source_rgba(*w.col("accent", 1.0 if inf else 0.35)); cr.fill()
+            w.icon(cr, "" if inf and inf["playing"] else "", cx + (0 if inf and inf["playing"] else 1.5), by + 5.5, 14, "bg")
+        else:
+            if hot:
+                cr.arc(cx, by, 15, 0, 2 * math.pi); cr.set_source_rgba(*w.col("fg", 0.1)); cr.fill()
+            w.icon(cr, g, cx, by + 5, 13, "fg", 1.0 if inf else 0.35)
+    # progress
+    py = H - 18
+    x0, x1 = 14, W - 14
+    rice.rounded(cr, x0, py - 2.5, x1 - x0, 5, 2.5); cr.set_source_rgba(*w.col("fg", 0.1)); cr.fill()
+    f = media_pos()
+    if inf and inf["length"] > 1e6:
+        rice.rounded(cr, x0, py - 2.5, max(5, (x1 - x0) * f), 5, 2.5); cr.set_source_rgba(*w.col("accent")); cr.fill()
+        w.text(cr, fmt_t(f * inf["length"]), x0, py - 8, 9, False, "dim")
+        w.text(cr, fmt_t(inf["length"]), x1, py - 8, 9, False, "dim", 1, "r")
+    return False
+
+
+def media_hit(x, y):
+    tx = 14 + 84 + 14
+    for k, _g, dx in BTNS:
+        if (x - (tx + 52 + dx)) ** 2 + (y - 82) ** 2 < 19 ** 2:
+            return k
+    return None
+
+
+def media_press(wd, e):
+    k = media_hit(e.x, e.y)
+    p = MED["p"]
+    if e.button != 1 or not k or not p:
+        return True
+    import mpris
+    meth = {"prev": "Previous", "play": "PlayPause", "next": "Next"}[k]
+    if k == "play" and MED["info"]:
+        MED["info"]["pos"] = int(media_pos() * MED["info"]["length"]); MED["t"] = time.monotonic()
+        MED["info"]["playing"] = not MED["info"]["playing"]; media.queue_draw()
+    bg(lambda: mpris.call(p, meth), lambda _r: GLib.timeout_add(250, lambda: (media_poll(), False)[1]))
+    return True
+
+
+def media_motion(wd, e):
+    k = media_hit(e.x, e.y)
+    if k != MED["hot"]:
+        MED["hot"] = k; wd.queue_draw()
+    return False
+
+
+section(pc, "Now playing")
+media = area(CW, MH, media_draw, media_press, media_motion, lambda wd, e: (MED.update(hot=None), wd.queue_draw(), False)[2])
+pc.pack_start(media, False, False, 0)
+
+
+# ---- notifications
+NOTE = dict(items=[], count=0, waiting=0)
+
+
+def notes_load():
+    if not HAVE["dunstctl"]:
+        NOTE.update(items=[], count=0); notes.queue_draw(); return
+
+    def work():
+        items = []
+        try:
+            d = json.loads(out("dunstctl", "history") or "{}")
+            for it in (d.get("data") or [[]])[0]:
+                g = lambda k: str((it.get(k) or {}).get("data", ""))
+                items.append(dict(app=g("appname"), summary=g("summary"), body=g("body"), ts=int(g("timestamp") or 0)))
+        except Exception:
+            pass
+        wt = out("dunstctl", "count", "waiting")
+        return items, int(wt) if wt.isdigit() else 0
+
+    def done(r):
+        if r:
+            NOTE.update(items=r[0], count=len(r[0]), waiting=r[1])
+        notes.set_size_request(CW, notes_h())
+        notes.queue_draw()
+        clear_btn.set_visible(NOTE["count"] > 0)
+    bg(work, done)
+
+
+def notes_h():
+    n = min(len(NOTE["items"]), 3)
+    return 96 if n == 0 else 12 + n * 58 + (22 if NOTE["count"] > 3 else 0)
+
+
+def ago(ts):
+    try:
+        up = float(open("/proc/uptime").read().split()[0]) * 1e6
+        s = max(0, int((up - ts) / 1e6))
+    except Exception:
+        return ""
+    if s < 60: return "now"
+    if s < 3600: return f"{s // 60}m"
+    if s < 86400: return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def notes_draw(wd, cr):
+    W, H = wd.get_allocated_width(), wd.get_allocated_height()
+    items = NOTE["items"][:3]
+    if not items:
+        soft(cr, 0, 0, W, H, 22, 0.05)
+        cr.arc(W / 2, 34, 16, 0, 2 * math.pi); cr.set_source_rgba(*w.col("accent", 0.18)); cr.fill()
+        w.icon(cr, "", W / 2, 39.5, 14, "accent")
+        w.text(cr, "All caught up", W / 2, 70, 12.5, True, "fg", 1, "c")
+        sub = "no notifications" if HAVE["dunstctl"] else "no notification daemon found"
+        if HAVE["dunstctl"] and TILES["dnd"].on:
+            sub = "do not disturb is on"
+        w.text(cr, sub, W / 2, 86, 9.5, False, "dim", 1, "c")
+        return False
+    y = 6
+    for it in items:
+        soft(cr, 0, y, W, 52, 16, 0.07)
+        cr.arc(24, y + 26, 12, 0, 2 * math.pi); cr.set_source_rgba(*w.col("accent", 0.2)); cr.fill()
+        w.icon(cr, "", 24, y + 31, 11, "accent")
+        cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(11)
+        cr.set_source_rgba(*w.col("fg")); cr.move_to(46, y + 22); cr.show_text(fit(cr, it["summary"] or it["app"], 11, W - 100, True))
+        cr.select_font_face(rice.FONT, 0, 0); cr.set_font_size(9.5)
+        cr.set_source_rgba(*w.col("dim")); cr.move_to(46, y + 39); cr.show_text(fit(cr, " ".join((it["body"] or it["app"]).split()), 9.5, W - 100))
+        w.text(cr, ago(it["ts"]), W - 12, y + 22, 9, False, "dim", 1, "r")
+        y += 58
+    if NOTE["count"] > 3:
+        w.text(cr, f"+ {NOTE['count'] - 3} more in history", W / 2, y + 12, 9.5, False, "dim", 1, "c")
+    return False
+
+
+def clear_notes():
+    sh("timeout", "3", "dunstctl", "history-clear")
+    NOTE.update(items=[], count=0)
+    GLib.timeout_add(300, lambda: (notes_load(), False)[1])
+
+
+clear_btn = w.Btn("Clear", clear_notes, primary=False, w=70, h=26)
+clear_btn.set_no_show_all(True)
+section(pc, "Notifications", clear_btn)
+notes = area(CW, 96, notes_draw)
+pc.pack_start(notes, False, False, 0)
+
+
+def control_show():
+    load_states(); load_sound(); media_poll(); notes_load()
+
+
+def control_tick():
+    if visible("control"):
+        media.queue_draw()
+        control_tick.n += 1
+        if control_tick.n % 2 == 0:
+            media_poll()
+        if control_tick.n % 4 == 0:
+            load_sound()
+        if control_tick.n % 10 == 0:
+            notes_load()
+    return True
+
+
+control_tick.n = 0
+ON_SHOW["control"] = control_show
+
+
+# ================================================================== TODAY
+pt = page("today")
+CAL = dict(y=0, m=0, hot=None)
+
+
+def clock_draw(wd, cr):
+    W, H = wd.get_allocated_width(), wd.get_allocated_height()
+    lt = time.localtime()
+    w.text(cr, time.strftime("%H:%M", lt), 2, 58, 52, True)
+    cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(52)
+    xw = cr.text_extents(time.strftime("%H:%M", lt)).x_advance
+    w.text(cr, time.strftime(":%S", lt), xw + 8, 58, 16, True, "accent")
+    w.text(cr, time.strftime("%A", lt), 2, 86, 15, True, "accent")
+    w.text(cr, time.strftime("%-d %B %Y", lt), 2, 106, 12.5, False, "dim")
+    return False
+
+
+clock = area(CW, 116, clock_draw)
+pt.pack_start(clock, False, False, 0)
+
+CH = 262
+
+
+def cal_draw(wd, cr):
+    import calendar
+    W, H = wd.get_allocated_width(), wd.get_allocated_height()
+    soft(cr, 0, 0, W, H, 22, 0.06)
+    y, m = CAL["y"], CAL["m"]
+    today = time.localtime()
+    w.text(cr, f"{calendar.month_name[m]} {y}", 18, 32, 14, True)
+    for k, g, cx in (("prev", "", W - 64), ("next", "", W - 30)):
+        cr.arc(cx, 27, 13, 0, 2 * math.pi)
+        cr.set_source_rgba(*w.col("fg", 0.14 if CAL["hot"] == k else 0.07)); cr.fill()
+        w.icon(cr, g, cx, 31.5, 11, "fg")
+    cw = (W - 20) / 7.0
+    for i, d in enumerate(("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")):
+        w.text(cr, d, 10 + cw * (i + 0.5), 62, 9.5, True, "dim", 0.8 if i < 5 else 0.55, "c")
+    weeks = calendar.Calendar(0).monthdatescalendar(y, m)
+    rh = (H - 78) / 6.0
+    for r, wk in enumerate(weeks):
+        for i, d in enumerate(wk):
+            cx, cy = 10 + cw * (i + 0.5), 78 + rh * (r + 0.5)
+            is_today = (d.year, d.month, d.day) == (today.tm_year, today.tm_mon, today.tm_mday)
+            if is_today:
+                cr.arc(cx, cy, 14, 0, 2 * math.pi); cr.set_source_rgba(*w.col("accent")); cr.fill()
+            inm = d.month == m
+            w.text(cr, str(d.day), cx, cy + 4, 11, is_today, "bg" if is_today else ("fg" if inm else "dim"),
+                   1.0 if (inm or is_today) else 0.35, "c")
+    return False
+
+
+def cal_hit(wd, x, y):
+    W = wd.get_allocated_width()
+    for k, cx in (("prev", W - 64), ("next", W - 30)):
+        if (x - cx) ** 2 + (y - 27) ** 2 < 16 ** 2:
+            return k
+    if y < 44 and x < W - 90:
+        return "title"
+    return None
+
+
+def cal_press(wd, e):
+    k = cal_hit(wd, e.x, e.y)
+    if k == "prev":
+        CAL["m"] -= 1
+        if CAL["m"] < 1: CAL["m"], CAL["y"] = 12, CAL["y"] - 1
+    elif k == "next":
+        CAL["m"] += 1
+        if CAL["m"] > 12: CAL["m"], CAL["y"] = 1, CAL["y"] + 1
+    elif k == "title":
+        lt = time.localtime(); CAL["y"], CAL["m"] = lt.tm_year, lt.tm_mon
+    wd.queue_draw()
+    return True
+
+
+def cal_motion(wd, e):
+    k = cal_hit(wd, e.x, e.y)
+    if k != CAL["hot"]:
+        CAL["hot"] = k; wd.queue_draw()
+    return False
+
+
+lt0 = time.localtime(); CAL["y"], CAL["m"] = lt0.tm_year, lt0.tm_mon
+cal = area(CW, CH, cal_draw, cal_press, cal_motion, lambda wd, e: (CAL.update(hot=None), wd.queue_draw(), False)[2])
+pt.pack_start(cal, False, False, 0)
+
+# ---- weather (wttr.in, cached 30 min)
+WFILE = os.path.join(CACHE, "weather.json")
+WX = dict(d=None, ts=0, state="loading")
+
+
+def wx_icon(code):
+    c = int(code or 113)
+    if c == 113: return ""
+    if c == 116: return ""
+    if c in (119, 122): return ""
+    if c in (143, 248, 260): return ""
+    if c in (200, 386, 389, 392, 395): return ""
+    if c in (179, 182, 185, 227, 230, 311, 314, 317, 320, 323, 326, 329, 332, 335, 338, 350, 362, 365, 368, 371, 374, 377): return ""
+    return ""
+
+
+def wx_load():
+    def work():
+        try:
+            c = json.load(open(WFILE))
+            if time.time() - c.get("ts", 0) < 1800 and c.get("d"):
+                return c["d"], c["ts"], "ok"
+        except Exception:
+            c = None
+        try:
+            import urllib.request
+            rq = urllib.request.Request("https://wttr.in/?format=j1", headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(rq, timeout=4) as r:
+                d = json.loads(r.read().decode())
+            cur = d["current_condition"][0]
+            area_ = (d.get("nearest_area") or [{}])[0]
+            small = dict(temp=cur.get("temp_C"), feels=cur.get("FeelsLikeC"), hum=cur.get("humidity"),
+                         wind=cur.get("windspeedKmph"), desc=(cur.get("weatherDesc") or [{}])[0].get("value", ""),
+                         code=cur.get("weatherCode"),
+                         place=((area_.get("areaName") or [{}])[0].get("value", "")),
+                         days=[dict(date=x.get("date"), hi=x.get("maxtempC"), lo=x.get("mintempC"),
+                                    code=(x.get("hourly") or [{}] * 5)[4].get("weatherCode") if len(x.get("hourly") or []) > 4 else 113)
+                               for x in (d.get("weather") or [])[:3]])
+            ts = time.time()
+            tmp = WFILE + ".tmp"
+            json.dump(dict(ts=ts, d=small), open(tmp, "w")); os.replace(tmp, WFILE)
+            return small, ts, "ok"
+        except Exception:
+            if c and c.get("d"):
+                return c["d"], c.get("ts", 0), "stale"
+            return None, 0, "offline"
+
+    def done(r):
+        if r:
+            WX["d"], WX["ts"], WX["state"] = r
+        weather.queue_draw()
+    bg(work, done)
+
+
+def wx_draw(wd, cr):
+    W, H = wd.get_allocated_width(), wd.get_allocated_height()
+    soft(cr, 0, 0, W, H, 22, 0.06)
+    d = WX["d"]
+    if not d:
+        w.icon(cr, "", 46, 70, 34, "dim")
+        w.text(cr, "Weather" if WX["state"] == "loading" else "Weather unavailable", 90, 58, 13, True)
+        w.text(cr, "loading …" if WX["state"] == "loading" else "offline, will retry next time", 90, 78, 10, False, "dim")
+        return False
+    w.icon(cr, wx_icon(d.get("code")), 46, 66, 34, "accent")
+    adv = w.text(cr, f"{d.get('temp', '?')}°", 88, 66, 34, True)
+    w.text(cr, "C", 88 + adv + 2, 50, 12, True, "dim")
+    tx = W - 16
+    w.text(cr, fit(cr, d.get("desc", ""), 11.5, W - 200, True), tx, 34, 11.5, True, "fg", 1, "r")
+    w.text(cr, f"feels {d.get('feels', '?')}°  ·  {d.get('hum', '?')}% hum", tx, 54, 9.5, False, "dim", 1, "r")
+    w.text(cr, f"wind {d.get('wind', '?')} km/h", tx, 70, 9.5, False, "dim", 1, "r")
+    place = d.get("place") or ""
+    if WX["state"] == "stale":
+        mins = int((time.time() - WX["ts"]) / 60)
+        place = f"offline · {mins // 60}h {mins % 60}m old" if mins >= 60 else f"offline · {mins}m old"
+    w.text(cr, fit(cr, place, 9.5, 150), 20, 92, 9.5, False, "dim")
+    days = d.get("days") or []
+    if days:
+        import datetime
+        cw = (W - 24) / len(days)
+        for i, x in enumerate(days):
+            cx = 12 + cw * (i + 0.5)
+            soft(cr, 12 + cw * i + 3, 104, cw - 6, H - 116, 14, 0.06)
+            try:
+                nm = "Today" if i == 0 else datetime.date.fromisoformat(x["date"]).strftime("%a")
+            except Exception:
+                nm = ""
+            w.text(cr, nm, cx - 22, 126, 10, True, "fg", 1, "c")
+            w.icon(cr, wx_icon(x.get("code")), cx + 20, 130, 15, "accent")
+            w.text(cr, f"{x.get('hi', '?')}° / {x.get('lo', '?')}°", cx, 148, 9.5, False, "dim", 1, "c")
+    return False
+
+
+section(pt, "Weather")
+weather = area(CW, 166, wx_draw)
+pt.pack_start(weather, False, False, 0)
+
+
+def today_tick():
+    if visible("today"):
+        clock.queue_draw()
+    return True
+
+
+ON_SHOW["today"] = lambda: (clock.queue_draw(), wx_load() if WX["state"] != "ok" or time.time() - WX["ts"] > 1800 else None)
+
+
+# ================================================================== SYSTEM
+ps = page("system")
+
+
+class Ring(Gtk.DrawingArea):
+    def __init__(self, label, glyph):
+        super().__init__()
+        self.label, self.glyph, self.big, self.sub = label, glyph, "–", ""
+        self.tw = Tween(self, 0.0, 0.6)
+        self.set_size_request(CW // 2 - 6, 168)
+        self.connect("draw", self._draw)
+
+    def set(self, frac, big, sub):
+        self.big, self.sub = big, sub
+        self.tw.go(max(0.0, min(1.0, frac)))
+        self.queue_draw()
+
+    def _draw(self, wd, cr):
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        soft(cr, 0, 0, W, H, 22, 0.06)
+        cx, cy, r = W / 2, 70, 44
+        cr.set_line_width(9); cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        a0 = math.pi * 0.75
+        span = math.pi * 1.5
+        cr.arc(cx, cy, r, a0, a0 + span); cr.set_source_rgba(*w.col("fg", 0.1)); cr.stroke()
+        v = max(0.0, min(self.tw.v, 1.0))
+        if v > 0.003:
+            ac, a2 = w.col("accent"), w.col("accent2")
+            g = cairo.LinearGradient(cx - r, cy, cx + r, cy)
+            g.add_color_stop_rgba(0, *ac[:3], 1); g.add_color_stop_rgba(1, *a2[:3], 1)
+            cr.arc(cx, cy, r, a0, a0 + span * v); cr.set_source(g); cr.stroke()
+        w.text(cr, self.big, cx, cy + 6, 18, True, "fg", 1, "c")
+        w.icon(cr, self.glyph, cx, cy + 40, 13, "accent")
+        w.text(cr, self.label, cx, H - 26, 11.5, True, "fg", 1, "c")
+        w.text(cr, fit(cr, self.sub, 9.5, W - 16), cx, H - 11, 9.5, False, "dim", 1, "c")
+        return False
+
+
+rings = dict(cpu=Ring("CPU", ""), ram=Ring("Memory", "\U000f035b"), gpu=Ring("GPU", ""), disk=Ring("Disk", ""))
+rg = Gtk.Grid(); rg.set_column_spacing(12); rg.set_row_spacing(12)
+order = ["cpu", "ram"] + (["gpu"] if HAVE["nvidia-smi"] else []) + ["disk"]
+for i, k in enumerate(order):
+    rg.attach(rings[k], i % 2, i // 2, 1, 1)
+section(ps, "Usage")
+ps.pack_start(rg, False, False, 0)
+
+
+class Info(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self.set_size_request(CW, 30)
+        self.connect("draw", self._draw)
+
+    def set(self, rows):
+        self.rows = rows
+        self.set_size_request(CW, 14 + 30 * len(rows))
+        self.queue_draw()
+
+    def _draw(self, wd, cr):
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        soft(cr, 0, 0, W, H, 22, 0.06)
+        for i, (g, k, v) in enumerate(self.rows):
+            y = 26 + 30 * i
+            w.icon(cr, g, 26, y + 1, 12, "accent")
+            w.text(cr, k, 46, y, 10.5, False, "dim")
+            w.text(cr, fit(cr, v, 10.5, W - 150, True), W - 18, y, 10.5, True, "fg", 1, "r")
+        return False
+
+
+section(ps, "This computer")
+sysinfo = Info()
+ps.pack_start(sysinfo, False, False, 0)
+SYS = dict(cpu=None, busy=False, cpu_model=None)
+
+
+def cpu_times():
+    with open("/proc/stat") as f:
+        p = [int(x) for x in f.readline().split()[1:]]
+    idle = p[3] + (p[4] if len(p) > 4 else 0)
+    return sum(p), idle
+
+
+def gib(kb):
+    return kb / 1048576.0
+
+
+def fmt_up(s):
+    s = int(s); d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    return (f"{d}d " if d else "") + (f"{h}h " if h or d else "") + f"{m}m"
+
+
+def sys_poll():
+    if SYS["busy"]:
+        return
+    SYS["busy"] = True
+
+    def work():
+        r = {}
+        tot, idle = cpu_times()
+        if SYS["cpu"]:
+            dt, di = tot - SYS["cpu"][0], idle - SYS["cpu"][1]
+            r["cpu"] = 1.0 - di / dt if dt > 0 else 0.0
+        SYS["cpu"] = (tot, idle)
+        mem = {}
+        for ln in open("/proc/meminfo"):
+            k, v = ln.split(":", 1); mem[k] = int(v.split()[0])
+        r["ram"] = (mem["MemTotal"] - mem["MemAvailable"], mem["MemTotal"])
+        st = os.statvfs("/")
+        r["disk"] = ((st.f_blocks - st.f_bfree) * st.f_frsize, st.f_blocks * st.f_frsize)
+        if HAVE["nvidia-smi"]:
+            g = out("nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits")
+            try:
+                u, mu, mt, tp = [x.strip() for x in g.splitlines()[0].split(",")]
+                r["gpu"] = (float(u) / 100, float(mu), float(mt), tp)
+            except Exception:
+                pass
+        up = float(open("/proc/uptime").read().split()[0])
+        la = os.getloadavg()
+        if SYS["cpu_model"] is None:
+            SYS["cpu_model"] = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), "")
+            SYS["ncpu"] = os.cpu_count() or 1
+        un = os.uname()
+        r["info"] = [("", "Uptime", fmt_up(up)), ("", "Kernel", f"{un.sysname} {un.release}"),
+                     ("", "Load", f"{la[0]:.2f}  {la[1]:.2f}  {la[2]:.2f}"),
+                     ("", "Processor", f"{SYS['cpu_model']} ({SYS['ncpu']})"),
+                     ("", "Host", un.nodename)]
+        return r
+
+    def done(r):
+        SYS["busy"] = False
+        if not r:
+            return
+        if "cpu" in r:
+            rings["cpu"].set(r["cpu"], f"{r['cpu'] * 100:.0f}%", f"{SYS.get('ncpu', 1)} threads · load {os.getloadavg()[0]:.1f}")
+        u, t = r["ram"]
+        rings["ram"].set(u / t, f"{u / t * 100:.0f}%", f"{gib(u):.1f} / {gib(t):.0f} GiB")
+        u, t = r["disk"]
+        rings["disk"].set(u / t if t else 0, f"{u / t * 100:.0f}%" if t else "–", f"{u / 1e9:.0f} / {t / 1e9:.0f} GB on /")
+        if "gpu" in r:
+            gu, mu, mt, tp = r["gpu"]
+            rings["gpu"].set(gu, f"{gu * 100:.0f}%", f"{mu / 1024:.1f} / {mt / 1024:.0f} GiB · {tp}°C")
+        sysinfo.set(r["info"])
+    bg(work, done)
+
+
+def sys_tick():
+    if visible("system"):
+        sys_poll()
+    return True
+
+
+ON_SHOW["system"] = sys_poll
+
+
+# ================================================================== CUSTOMIZE
+pz = page("customize")
+
+
+class Preset(Gtk.DrawingArea):
+    """Motion preset card: name, description and a dot that plays the preset's curve on hover / select."""
+
+    def __init__(self, key):
+        super().__init__()
+        self.key, self.p = key, rice.motion(key)
+        self.sel = Tween(self, 0.0, 0.25)
+        self.hv = Tween(self, 0.0, 0.2)
+        self.t0, self.play, self.loop = 0.0, False, False
+        self.set_size_request(CW, 52)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("draw", self._draw)
+        self.connect("enter-notify-event", lambda *a: (self.hv.go(1.0), self.start(True)))
+        self.connect("leave-notify-event", lambda *a: (self.hv.go(0.0), setattr(self, "loop", False)))
+        self.connect("button-press-event", self._press)
+        self.tk = None
+
+    def start(self, loop=False):
+        self.loop = loop
+        if not self.play:
+            self.play, self.t0 = True, time.monotonic()
+        if self.tk is None:
+            self.tk = self.add_tick_callback(self._tick)
+
+    def _dur(self):
+        sp = float(settings.get("motion_speed") or 1.0) if not hasattr(self, "_sp") else self._sp
+        return max(0.75 * self.p["k"] / min(max(sp, 0.5), 2.0), 0.12)
+
+    def _tick(self, wd, clock):
+        self.queue_draw()
+        t = (time.monotonic() - self.t0) / self._dur()
+        if t >= 1.65:                                  # play, rest a moment at the end, then loop or stop
+            if self.loop:
+                self.t0 = time.monotonic(); return True
+            self.play = False; self.tk = None
+            return False
+        return True
+
+    def _press(self, wd, e):
+        if e.button == 1:
+            pick_motion(self.key)
+        return True
+
+    def _draw(self, wd, cr):
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        s, hv = min(max(self.sel.v, 0), 1), self.hv.v
+        rice.rounded(cr, 1, 1, W - 2, H - 2, 18)
+        cr.set_source_rgba(*mix(w.col("fg"), w.col("accent"), s), 0.06 + 0.04 * hv + 0.12 * s); cr.fill_preserve()
+        cr.set_source_rgba(*w.col("accent", 0.85 * s)); cr.set_line_width(1.5); cr.stroke()
+        w.text(cr, self.p["label"], 18, 23, 12.5, True)
+        w.text(cr, self.p["desc"], 18, 40, 9.5, False, "dim")
+        # preview track
+        tx0, tx1, ty = W - 150, W - 26, H / 2
+        cr.set_line_width(2); cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.move_to(tx0, ty); cr.line_to(tx1, ty); cr.set_source_rgba(*w.col("fg", 0.12)); cr.stroke()
+        cr.arc(tx1, ty, 3, 0, 2 * math.pi); cr.set_source_rgba(*w.col("fg", 0.25)); cr.fill()
+        t = (time.monotonic() - self.t0) / self._dur() if self.play else 1.0
+        v = rice.spring(min(max(t, 0.0), 1.0), self.p)
+        if self.p["curve"] == "linear":
+            a = min(max(t, 0.0), 1.0) if self.play else 1.0
+            x = tx0 + (tx1 - tx0) * v
+            cr.arc(x, ty, 7, 0, 2 * math.pi); cr.set_source_rgba(*w.col("accent", 0.35 + 0.65 * a)); cr.fill()
+        else:
+            x = tx0 + (tx1 - tx0) * v
+            if self.play and t < 1.0:                   # faint trail
+                for i in range(1, 5):
+                    tt = max(t - i * 0.05, 0.0)
+                    xx = tx0 + (tx1 - tx0) * rice.spring(tt, self.p)
+                    cr.arc(xx, ty, 7 - i, 0, 2 * math.pi); cr.set_source_rgba(*w.col("accent", 0.18 - 0.035 * i)); cr.fill()
+            cr.arc(x, ty, 7, 0, 2 * math.pi); cr.set_source_rgba(*w.col("accent")); cr.fill()
+        return False
+
+
+PRESETS = {}
+
+
+def pick_motion(key):
+    settings.put("motion", key)
+    rice._MCACHE[1] = None                         # take the new preset at once
+    for k, c in PRESETS.items():
+        c.sel.go(1.0 if k == key else 0.0)
+    PRESETS[key].start(False)
+
+
+section(pz, "Motion")
+curm = rice.motion()["name"]
+for k in rice.MOTION_ORDER:
+    c = Preset(k); PRESETS[k] = c
+    if k == curm:
+        c.sel.v = c.sel.a = c.sel.b = 1.0
+    pz.pack_start(c, False, False, 0)
+
+
+def labelled(label, ctl, sub=None):
+    r_ = w.row(label, ctl, sub)
+    return r_
+
+
+SPEED = dict(tm=None)
+sp_lab = Gtk.Label(); sp_lab.set_size_request(56, -1); sp_lab.set_xalign(1)
+
+
+def sp_show(v):
+    sp_lab.set_markup(f'<span size="10500" weight="bold">{int(round(v * 100))}%</span>')
+
+
+def sp_changed(f):
+    v = round((0.5 + f * 1.5) / 0.05) * 0.05
+    sp_show(v)
+    for c in PRESETS.values():
+        c._sp = v
+    if SPEED["tm"]:
+        GLib.source_remove(SPEED["tm"])
+
+    def save():
+        SPEED["tm"] = None
+        settings.put("motion_speed", round(v, 2)); rice._MCACHE[1] = None
+        return False
+    SPEED["tm"] = GLib.timeout_add(250, save)
+
+
+sp0 = min(max(float(settings.get("motion_speed") or 1.0), 0.5), 2.0)
+for c in PRESETS.values():
+    c._sp = sp0
+sp_sl = w.Slider((sp0 - 0.5) / 1.5, sp_changed, 190)
+sp_show(sp0)
+hb = Gtk.Box(spacing=4); hb.pack_start(sp_sl, False, False, 0); hb.pack_start(sp_lab, False, False, 0)
+pz.pack_start(labelled("Speed", hb, "slower · faster"), False, False, 2)
+pz.pack_start(labelled("Animations", w.Switch(bool(settings.get("anim")), lambda v: (settings.put("anim", v), rice._MCACHE.__setitem__(1, None))),
+                       "popups, panels, dock"), False, False, 0)
+
+# ---- dock
+DOCK = dict(autohide=False, size=48, magnify=True, monitor="primary")
+DOCK.update(settings.get("dock") or {})
+DT = dict(tm=None)
+
+
+def dock_reload():
+    """Tell a running rice-dock to reload its settings (SIGUSR1 to processes named rice-dock, found by PID)."""
+    me = os.getpid()
+    for p in os.listdir("/proc"):
+        if not p.isdigit() or int(p) == me:
+            continue
+        try:
+            argv = open(f"/proc/{p}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        names = [os.path.basename(a.decode(errors="ignore")) for a in argv[:2]]
+        if "rice-dock" in names:
+            try: os.kill(int(p), signal.SIGUSR1)
+            except OSError: pass
+
+
+def dock_put(k, v):
+    DOCK[k] = v
+    if DT["tm"]:
+        GLib.source_remove(DT["tm"])
+
+    def save():
+        DT["tm"] = None
+        d = dict(settings.get("dock") or {}); d.update(DOCK)
+        settings.put("dock", d)
+        dock_reload()
+        return False
+    DT["tm"] = GLib.timeout_add(250, save)
+
+
+section(pz, "Design")
+
+
+def design_put(i):
+    import designs
+    settings.put("design", designs.ORDER[i])
+    def run():
+        try:
+            import themes
+            themes.apply(themes.current_item(), True)
+        except Exception:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+import designs as _dz
+_di = _dz.ORDER.index(_dz.name())
+pz.pack_start(labelled("Design", w.Seg([_dz.DESIGNS[k]["label"] for k in _dz.ORDER], _di, design_put, 380),
+                       "Material 3 tonal colours, macOS, brutal; changes colours, fonts, dock"), False, False, 0)
+
+section(pz, "Bar")
+
+
+def bar_put(k, v):
+    settings.sput(k, int(v))
+    subprocess.Popen(["rice-apply"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+pz.pack_start(labelled("Workspace marks", w.Seg(["Dots", "Numbers", "Dashes", "Pill"], int(settings.sget("bar_tags", 0)),
+                                                lambda i: bar_put("bar_tags", i), 280), "how tags are drawn (needs the rebuilt dwm)"), False, False, 0)
+pz.pack_start(labelled("Window title", w.Switch(bool(settings.sget("bar_title", 1)), lambda v: bar_put("bar_title", v)), "centre of the bar"), False, False, 0)
+pz.pack_start(labelled("Layout label", w.Switch(bool(settings.sget("bar_layout", 1)), lambda v: bar_put("bar_layout", v)), "[]= tile"), False, False, 0)
+pz.pack_start(w.vslider("Window gaps", "between tiled windows and screen edges", 0, 40, int(settings.sget("gap", 10)), lambda v: f"{int(v)} px", lambda v: bar_put("gap", v)), False, False, 0)
+pz.pack_start(w.vslider("Bar top gap", "space above the floating bar", 0, 30, int(settings.sget("vpad", 10)), lambda v: f"{int(v)} px", lambda v: bar_put("vpad", v)), False, False, 0)
+pz.pack_start(w.vslider("Bar side gap", "space left and right of the bar", 0, 40, int(settings.sget("spad", 12)), lambda v: f"{int(v)} px", lambda v: bar_put("spad", v)), False, False, 0)
+
+section(pz, "Dock")
+SIZES = (40, 48, 60)
+MONS = ("primary", "pointer", "all")
+pz.pack_start(labelled("Auto-hide", w.Switch(bool(DOCK.get("autohide")), lambda v: dock_put("autohide", v)), "hide until the pointer reaches it"), False, False, 0)
+pz.pack_start(labelled("Magnify", w.Switch(bool(DOCK.get("magnify")), lambda v: dock_put("magnify", v)), "icons grow under the pointer"), False, False, 0)
+si = min(range(3), key=lambda i: abs(SIZES[i] - int(DOCK.get("size") or 48)))
+pz.pack_start(labelled("Icon size", w.Seg(["S", "M", "L"], si, lambda i: dock_put("size", SIZES[i]), 150)), False, False, 0)
+mi = MONS.index(DOCK.get("monitor")) if DOCK.get("monitor") in MONS else 0
+pz.pack_start(labelled("Monitor", w.Seg(["Main", "Pointer", "All"], mi, lambda i: dock_put("monitor", MONS[i]), 200)), False, False, 0)
+
+# ---- shortcuts to the other rice tools
+section(pz, "Desktop")
+
+
+class Act(Gtk.DrawingArea):
+    def __init__(self, glyph, label, cb):
+        super().__init__()
+        self.glyph, self.label, self.cb = glyph, label, cb
+        self.hv = Tween(self, 0.0, 0.2)
+        self.set_size_request(CW // 2 - 5, 48)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("draw", self._draw)
+        self.connect("enter-notify-event", lambda *a: self.hv.go(1.0))
+        self.connect("leave-notify-event", lambda *a: self.hv.go(0.0))
+        self.connect("button-press-event", lambda wd, e: (self.cb(), True)[1] if e.button == 1 else False)
+
+    def _draw(self, wd, cr):
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        k = min(max(self.hv.v, 0), 1)
+        rice.rounded(cr, 1, 1, W - 2, H - 2, (H - 2) / 2)
+        cr.set_source_rgba(*mix(w.col("fg"), w.col("accent"), k), 0.08 + 0.8 * k); cr.fill()
+        w.icon(cr, self.glyph, 26, H / 2 + 5, 14, "bg" if k > 0.5 else "accent")
+        cr.select_font_face(rice.FONT, 0, 1); cr.set_font_size(11)
+        cr.set_source_rgba(*w.col("bg" if k > 0.5 else "fg")); cr.move_to(44, H / 2 + 4); cr.show_text(fit(cr, self.label, 11, W - 54, True))
+        return False
+
+
+ag = Gtk.Grid(); ag.set_column_spacing(10); ag.set_row_spacing(10)
+for i, (g, lab, cmd) in enumerate((("", "Edit desktop", ["rice-desk", "--edit"]), ("", "Widgets", ["rice-desk", "--add"]),
+                                   ("", "Wallpaper & theme", ["theme-switch"]), ("", "Login screen", ["rice-sddm"]))):
+    ag.attach(Act(g, lab, lambda c=cmd: launch(c)), i % 2, i // 2, 1, 1)
+pz.pack_start(ag, False, False, 0)
+ON_SHOW["customize"] = lambda: None
+
+
+# ------------------------------------------------------------------ keys, grab, signals
+def on_key(wd, e):
+    k = e.keyval
+    if k in (Gdk.KEY_Escape, Gdk.KEY_q):
+        panel.quit_anim(); return True
+    if k in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3, Gdk.KEY_4):
+        goto(TABS[k - Gdk.KEY_1]); return True
+    if k in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab, Gdk.KEY_Right, Gdk.KEY_Left):
+        d = -1 if k in (Gdk.KEY_ISO_Left_Tab, Gdk.KEY_Left) or e.state & Gdk.ModifierType.SHIFT_MASK else 1
+        goto(TABS[(TABS.index(CUR[0]) + d) % len(TABS)]); return True
+    return False
+
+
+def on_press(wd, e):
+    a = panel.get_allocation()
+    if not (0 <= e.x <= a.width and 0 <= e.y <= a.height):
+        panel.quit_anim(); return True
+    return False
+
+
+def req_tab():
+    try:
+        t = open(TABF + ".req").read().strip(); os.remove(TABF + ".req")
+    except OSError:
+        return True
+    if t in TABS:
+        goto(t)
+    return True
+
+
+panel.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+panel.connect("key-press-event", on_key)
+panel.connect("button-press-event", on_press)
+panel.show_all()
+goto(want or "control", animate=False)
+w.grab_keys(panel)
+GLib.timeout_add(1000, control_tick)
+GLib.timeout_add(1000, today_tick)
+GLib.timeout_add(1500, sys_tick)
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda *a: (panel.quit_anim(), True)[1])
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, lambda *a: req_tab())
+Gtk.main()
+try:
+    if int(open(PID).read()) == os.getpid():
+        os.remove(PID)
+    os.remove(TABF)
+except (OSError, ValueError):
+    pass
