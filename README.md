@@ -52,6 +52,64 @@ sudo make install           # installs the dwm binary to /usr/local/bin
 
 Add `exec dwm` to `~/.xinitrc`, or a session entry for your display manager.
 
+## Dependencies
+
+**Build:** a C99 compiler, `make`, `pkg-config`, and the dev headers for Xlib, Xft, fontconfig, Xinerama, Xext, XTest and cairo (xlib backend).
+
+| Distro | Packages |
+| --- | --- |
+| Gentoo | `x11-libs/libX11 x11-libs/libXft x11-libs/libXinerama x11-libs/libXtst x11-libs/libXext x11-libs/cairo media-libs/fontconfig` |
+| Debian / Ubuntu | `build-essential pkg-config libx11-dev libxft-dev libxinerama-dev libxtst-dev libxext-dev libcairo2-dev libfontconfig1-dev` |
+| Arch | `base-devel libx11 libxft libxinerama libxtst libxext cairo fontconfig` |
+
+**Runtime, required:** `xrdb` (colours are read from X resources) and a terminal. The default is `konsole`; edit `termcmd` in `config.h`.
+
+**Runtime, optional.** mwm itself does not start these, your `~/.xprofile` does:
+
+| Tool | Used for |
+| --- | --- |
+| `picom` | compositing: blur, shadows, rounded corners. The bar is ARGB and wants a compositor. |
+| `feh` | wallpaper |
+| `pipewire`, `pipewire-pulse`, `wireplumber` | audio (`wpctl`, `pactl`) |
+| `quickshell` (X11 build) | the widget, dock and launcher shell |
+| `xrandr`, `setxkbmap`, `xset` | monitor layout, keyboard, screen blanking |
+| `xdotool`, `maim`, `xclip` | scripting, screenshots, clipboard |
+| a polkit agent | auth prompts |
+| JetBrains Mono and Symbols Nerd Font | bar font |
+
+The key binds in the default `config.h` call helper scripts that are **not** in this repo: `rice-search`, `rice-center`, `rice-map`, `rice-lock`, `rice-power`, `rice-media`, `rice-record`, `rice-settings`, `rice-gamebar` and `dwm-volume`. Without them those keys do nothing. Point them at your own commands in `config.h`, or in `~/.config/rice/binds.conf`.
+
+## Session setup (`~/.xprofile`)
+
+mwm is started by your login manager or `~/.xinitrc`. Put session setup in `~/.xprofile` (SDDM, GDM and LightDM source it) or at the top of `~/.xinitrc`. A minimal one:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+
+# monitors (check names with `xrandr`)
+xrandr --output DP-1 --primary --mode 1920x1080 --pos 0x1080 \
+       --output HDMI-1 --mode 1920x1080 --pos 0x0
+
+xrdb -merge ~/.Xresources            # colours: dwm.normbgcolor, dwm.selbgcolor ...
+feh --bg-fill ~/Pictures/wall.jpg &
+picom --config ~/.config/picom/picom.conf &
+
+setxkbmap us                         # your layout
+xset s off; xset s noblank; xset -dpms
+
+export XCURSOR_THEME=Adwaita XCURSOR_SIZE=24
+export NO_AT_BRIDGE=1
+
+# audio: start once, after the session bus is up
+(sleep 2; pipewire-pulse) &
+```
+
+Notes:
+- `xrdb -merge` must run before mwm starts, or after it followed by `Mod+F5`. mwm reloads colours on `RESOURCE_MANAGER` changes.
+- Start `picom` before `quickshell`, so the panels get blur.
+- On NVIDIA with two monitors of different refresh rates, `__GL_SYNC_DISPLAY_DEVICE=<fast output> picom ...` keeps the fast one smooth.
+- `exec mwm` or `exec dwm` goes last in `~/.xinitrc`. Display managers start it from the session entry instead.
+
 ## Upstream
 
 mwm is built on dwm 6.8 from `git.suckless.org/dwm`, with the systray patch applied by hand.
