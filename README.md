@@ -103,6 +103,71 @@ multi-monitor behaviour, still one readable C file, configured by editing `confi
 
 Full reference: [docs/dwm-features.md](docs/dwm-features.md).
 
+## The rice
+
+The screenshots show mwm with a full desktop shell on top. The shell is a set of Python/GTK helpers and a Quickshell QML
+layer that talk to mwm through its keys and IPC. They live outside this repo (see the note under [Build](#build)).
+mwm runs fine without them.
+
+<details>
+<summary><b>Theming from the wallpaper</b></summary>
+
+- Every theme is a wallpaper. The accent is extracted in OKLab from a 64x64 copy: it picks the colourful hue the picture really has, muted pictures give muted accents, and grey pictures stay grey.
+- One apply writes colours for the bar, rofi, Konsole, kitty, btop, cava, fastfetch, Qt, SDDM and the shell, then reloads picom.
+- Contrast guard: text, accents and borders are pushed away from the background until they pass WCAG contrast.
+- Fonts follow the mood of the palette: IBM Plex (serious), Inter or JetBrains (calm), Nunito (soft), Fraunces (elegant), Space Grotesk (techy), Fredoka (playful).
+- Design styles: Wallpaper, Material 3 (tonal roles), macOS (system greys and blue, magnify dock), Brutal (black, white, hard edges).
+- Wallpaper sources: `mono` (default: black and white, muted, ink), `wallhaven`, `minimal`, `both`, plus your own folder.
+- `rice-themecheck` verifies that the live theme matches the wallpaper and repairs it with `--fix`.
+- Glass mode: translucent blurred menus tinted by the wallpaper, or solid menus (near black, near white on bright wallpapers).
+
+</details>
+
+<details>
+<summary><b>Launcher, search and tools</b></summary>
+
+- Universal search: apps, files, settings, commands, a calculator and unit converter. Prefixes: `>` run in a terminal, `?` web, `=` math, `/` or `~` browse paths.
+- Clipboard history with filter.
+- Media card: art, title, artist, progress, previous, play, next.
+- Tools menu: Convert (images, video, audio, archives), Download, Record, Screenshot, Colour picker, QR code, Themes, Settings, Media, Volume.
+- Screenshot editor: per-monitor capture, zoom and pan, and OCR (English, German, French, Spanish, Hungarian, Russian).
+- Screen recorder: audio output, per-app audio and mic.
+- Lock screen, power menu, polkit prompt, and an SDDM login theme built from the wallpaper.
+
+</details>
+
+<details>
+<summary><b>Shell: bar, dock, widgets, island</b></summary>
+
+- Control centre (`Mod+n`): Control, Today, System and Style tabs. Style holds motion presets, dock options, bar options and the design picker.
+- Dock: touch the bottom screen edge. Click opens or focuses, middle click opens a new window, right click pins. Magnify, autohide, per-monitor.
+- Desktop widgets: clock (several styles), audio visualiser, weather, battery, lyrics and more. `Mod+e` edits them: drag, resize, nudge, glass or bare, add, remove. Right click a widget for font, design, accent and opacity.
+- Widgets hide while windows are open on their monitor, through the compositor, so tag switches do not redraw them.
+- Dynamic island over the bar: clock and weather when idle, equaliser and title when music plays, a media card on hover.
+- Game bar: volume, mic, do-not-disturb, screenshot and record in one card.
+- Hot corner, intro screen with a key cheat sheet, and a wallpaper picker.
+- Menus grow out of the bar as a glass shape, then fade their contents in. Closing folds them back.
+
+</details>
+
+<details>
+<summary><b>Settings app</b></summary>
+
+Appearance (glass, scheme, animations, terminal opacity, blur, shadows), Wallpapers, Sound (volume, devices), Display
+(resolution, refresh, orientation, brightness, night light, screen-off), Keyboard and Mouse, Windows and Bar (gaps),
+Network (interfaces, DNS, MTU, DHCP renew, tests), Shortcuts (writes `~/.config/rice/binds.conf`) and About.
+
+</details>
+
+<details>
+<summary><b>Compositor</b></summary>
+
+Rules for [picom](https://github.com/yshui/picom) 13 keep menus, cards and widgets clean: no animation on ghost windows,
+no blur or shadow on the shell widgets (it made every widget a block), lighter blur and no shadow on moving windows to
+remove tag-switch stutter. Games get their own rule. On NVIDIA, sync the swap to the fast monitor.
+
+</details>
+
 ## Install
 
 ### Dependencies
@@ -173,7 +238,6 @@ Then add `exec dwm` to the end of `~/.xinitrc`, or pick the session in your disp
 | `Mod+Shift+space` | toggle floating |
 | `Mod+1..9` | view tag |
 | `Mod+Shift+1..9` | send window to tag |
-| `Mod+0` | view all tags |
 | `Mod+,` / `.` | focus previous / next monitor |
 | `Mod+Shift+,` / `.` | send window to previous / next monitor |
 | `Mod+b` | toggle bar |
@@ -183,6 +247,22 @@ Then add `exec dwm` to the end of `~/.xinitrc`, or pick the session in your disp
 | `Mod+Shift+s` / `Print` | screenshot |
 | `Mod+Shift+l` | lock |
 | `Mod+F5` | reload colours from X resources |
+| `Mod+e` / `Mod+Shift+e` | edit / add desktop widgets |
+| `Mod+g` | game bar |
+| `Mod+Shift+t` | theme switcher |
+| `Mod+Shift+o` | tools menu |
+| `Mod+Shift+m` | media card |
+| `Mod+Shift+r` | screen recorder |
+| `Mod+t` | tile layout |
+| `Mod+Ctrl+space` | default layout |
+| `Mod+0` / `Mod+Shift+0` | view all tags / show a window on all tags |
+| `Mod+Arrows` | snap half or quarter |
+| `Mod+Shift+Arrows` | nudge 48 px |
+| `Mod+Ctrl+Arrows` | resize |
+| `Mod+Shift+j` / `k` | move window down / up the stack |
+| `Mod+scroll` | zoom the canvas (canvas mode) |
+| `Mod+Ctrl+0` | reset canvas zoom |
+| volume keys | volume up, down, mute (`dwm-volume`) |
 | `Mod+Shift+q` | quit |
 | `Mod+Ctrl+Shift+q` | restart, keep windows and tags |
 
@@ -225,6 +305,20 @@ xprop -root -f _RICE_CMD 32c -set _RICE_CMD "2, 12"    # set the gap to 12 px
 Leave about 40 ms between two writes, or the second one is swallowed. The command set (view a tag, gaps,
 canvas, monitor moves) is in [docs/dwm-features.md](docs/dwm-features.md). mwm publishes tag and monitor state
 on `_RICE_TAGS` and `_RICE_MONS` for shells to read.
+
+## Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| Colours, blur or the terminal look wrong | `rice-themecheck --fix`. Log: `~/.cache/rice/themecheck.log` |
+| A script crashed | `~/.cache/rice/crash.log` holds every traceback |
+| A menu leaves a see-through ghost | check the picom rules, reload with `kill -USR1 <picom pid>` |
+| Animations feel heavy | Settings > Appearance > Animations, or lighter blur in the picom config |
+| The tray is on the wrong monitor | set `systraypinning` in `config.h` (1 = first, 2 = second) and rebuild |
+| `Mod+z` says "no data from dwm" | the running binary is older than the build: `sudo make install`, then restart mwm |
+| Keys do nothing after editing `keys[]` | `~/.config/rice/binds.conf` overrides them: delete it or reset in Settings > Shortcuts |
+| Audio hangs | `wpctl` blocks when PipeWire is stale: restart PipeWire |
+| Stutter with a game running | GPU load, not mwm. Close the heavy app, or move it to another monitor |
 
 ## FAQ
 
