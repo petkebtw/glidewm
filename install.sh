@@ -5,22 +5,28 @@
 #   3. the Quickshell shell (DarkShadow's Shell, built for X11 by port.sh)
 #   4. a login session "mwm" for SDDM, LightDM, GDM ... and app menu entries
 #
-#   ./install.sh              check, then install everything (asks before it starts)
+#   ./install.sh              check, then pick what to install from a menu (all parts are on at first)
 #   ./install.sh --check      only check the dependencies and the existing setup
 #   ./install.sh --yes        do not ask
 #   ./install.sh --dry-run    show every step, change nothing
+#   ./install.sh --only=rice,shell   install only these parts (build, rice, shell, session, apps), no menu
 #   ./install.sh --no-build | --no-rice | --no-shell | --no-session | --no-apps     leave a part out
 #
 # Nothing of yours is overwritten: existing files are skipped or backed up (*.bak-DATE), and the script says which.
 set -u
 R="$(cd "$(dirname "$0")" && pwd)"
 STAMP=$(date +%Y%m%d-%H%M%S)
-YES=0 DRY=0 CHECK=0 BUILD=1 RICE=1 SHELL_=1 SESSION=1 APPS=1
+YES=0 DRY=0 CHECK=0 ONLY=0 BUILD=1 RICE=1 SHELL_=1 SESSION=1 APPS=1
 for a in "$@"; do
   case "$a" in
     --yes|-y) YES=1 ;; --dry-run|-n) DRY=1 ;; --check) CHECK=1 ;;
+    --only=*) BUILD=0 RICE=0 SHELL_=0 SESSION=0 APPS=0; ONLY=1
+      for x in $(echo "${a#--only=}" | tr ',' ' '); do
+        case $x in build|mwm) BUILD=1 ;; rice) RICE=1 ;; shell) SHELL_=1 ;; session|login) SESSION=1 ;; apps|menu) APPS=1 ;;
+          *) echo "unknown part: $x (build, rice, shell, session, apps)"; exit 2 ;; esac
+      done ;;
     --no-build) BUILD=0 ;; --no-rice) RICE=0 ;; --no-shell) SHELL_=0 ;; --no-session) SESSION=0 ;; --no-apps) APPS=0 ;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $a (see --help)"; exit 2 ;;
   esac
 done
@@ -283,18 +289,62 @@ if [ ${#PKGS[@]} -gt 0 ]; then
 fi
 [ "$CHECK" = 1 ] && exit 0
 
-[ $nb -gt 0 ] && [ "$BUILD" = 1 ] && { bad "mwm cannot be built without the build dependencies. Install them, or run with --no-build."; exit 1; }
-[ $ns -gt 0 ] && [ "$SHELL_" = 1 ] && { warn "Quickshell is missing: the shell part is left out (--no-shell)"; SHELL_=0; }
+# parts that cannot be installed: their dependencies are missing
+NOBUILD="" NOSHELL=""
+[ $nb -gt 0 ] && NOBUILD="needs: ${MISS_build[*]}"
+[ $ns -gt 0 ] && NOSHELL="needs: ${MISS_shell[*]}"
 [ $nc -gt 0 ] && warn "the rice is installed, but the parts that need the missing programs will not work until you install them"
 
-if [ "$YES" = 0 ] && [ "$DRY" = 0 ]; then
-  echo
-  printf '%sInstall%s:' "$B" "$N"
-  [ $BUILD = 1 ] && printf ' mwm'; [ $RICE = 1 ] && printf ' rice'; [ $SHELL_ = 1 ] && printf ' shell'
-  [ $SESSION = 1 ] && printf ' login-session'; [ $APPS = 1 ] && printf ' app-entries'
-  printf '  [Y/n] '
-  read -r ans; case "$ans" in ""|y|Y|yes) ;; *) echo "Nothing changed."; exit 0 ;; esac
+# ---------- what to install ----------
+PART_VAR=(BUILD RICE SHELL_ SESSION APPS)
+PART_NAME=("mwm" "Rice" "Shell" "Login session" "App menu entries")
+PART_DESC=("build, sudo make install -> /usr/local/bin/mwm"
+           "rice-* helpers, Python library, picom/rofi/keys configs, ~/.xprofile"
+           "Quickshell: widgets, control centre, launcher, settings, lock (needs the rice once)"
+           "\"mwm\" at the SDDM / LightDM / GDM login, ~/.xinitrc for startx (sudo)"
+           "Settings, Theme Switcher, Screenshot, Recorder ... in your app launcher")
+blocked() { case $1 in 0) echo "$NOBUILD" ;; 2) echo "$NOSHELL" ;; *) echo "" ;; esac; }
+[ -n "$NOSHELL" ] && [ "$SHELL_" = 1 ] && { SHELL_=0; warn "Shell left out: $NOSHELL"; }
+
+menu() {
+  local i v ans k
+  while :; do
+    printf '\n%sChoose what to install%s  %s(numbers toggle, a = all, n = none, Enter = start, q = quit)%s\n' "$B" "$N" "$D" "$N"
+    for i in 0 1 2 3 4; do
+      v=${!PART_VAR[i]}
+      if [ -n "$(blocked $i)" ]; then printf '  %s%d  [-] %-18s %s%s\n' "$D" $((i + 1)) "${PART_NAME[i]}" "$(blocked $i)" "$N"
+      elif [ "$v" = 1 ]; then printf '  %d  %s[x]%s %-18s %s%s%s\n' $((i + 1)) "$G" "$N" "${PART_NAME[i]}" "$D" "${PART_DESC[i]}" "$N"
+      else printf '  %d  [ ] %-18s %s%s%s\n' $((i + 1)) "${PART_NAME[i]}" "$D" "${PART_DESC[i]}" "$N"; fi
+    done
+    printf '  > '
+    read -r ans || exit 0
+    case "$ans" in
+      "") break ;;
+      q|Q) echo "Nothing changed."; exit 0 ;;
+      a|A) for i in 0 1 2 3 4; do [ -z "$(blocked $i)" ] && eval "${PART_VAR[i]}=1"; done ;;
+      n|N) for i in 0 1 2 3 4; do eval "${PART_VAR[i]}=0"; done ;;
+      *) for k in $(echo "$ans" | tr ',' ' ' | grep -o '[0-9]'); do
+           i=$((k - 1)); [ $i -ge 0 ] && [ $i -le 4 ] || continue
+           if [ -n "$(blocked $i)" ]; then echo "  ${PART_NAME[i]} cannot be installed: $(blocked $i)"; continue; fi
+           eval "${PART_VAR[i]}=$(( 1 - ${!PART_VAR[i]} ))"
+         done ;;
+    esac
+  done
+  [ $((BUILD + RICE + SHELL_ + SESSION + APPS)) -eq 0 ] && { echo "Nothing chosen, nothing changed."; exit 0; }
+  if [ "$SHELL_" = 1 ] && [ "$RICE" = 0 ] && [ ! -e "$HOME/.local/share/dss/src" ]; then
+    warn "the shell needs the rice part once (it links the shell files): Rice is turned on"; RICE=1
+  fi
+}
+
+if [ "$YES" = 0 ] && [ "$ONLY" = 0 ] && [ -t 0 ]; then
+  [ -n "$NOBUILD" ] && BUILD=0
+  menu
+elif [ "$BUILD" = 1 ] && [ -n "$NOBUILD" ]; then
+  bad "mwm cannot be built: $NOBUILD"; exit 1
 fi
+printf '\n%sInstalling:%s' "$B" "$N"
+for i in 0 1 2 3 4; do [ "${!PART_VAR[i]}" = 1 ] && printf ' %s,' "${PART_NAME[i]}"; done | sed 's/,$//'
+echo
 
 SUDO=sudo; [ "$(id -u)" = 0 ] && SUDO=
 rootwrite() { # dst  (content on stdin): write a root-owned file only when it differs; back up an old one
@@ -312,8 +362,9 @@ if [ $BUILD = 1 ]; then
   if [ -f config.h ]; then ok "config.h exists: your config is kept (config.def.h is the default)"
   else run cp config.def.h config.h && ok "config.h made from config.def.h"; fi
   if [ "$DRY" = 1 ]; then run make
-  else make >/tmp/mwm-build.$$ 2>&1 || { bad "make failed:"; tail -20 /tmp/mwm-build.$$; rm -f /tmp/mwm-build.$$; exit 1; }
-       rm -f /tmp/mwm-build.$$; ok "built ./mwm"; fi
+  else log=$(mktemp) || exit 1
+       make >"$log" 2>&1 || { bad "make failed:"; tail -20 "$log"; rm -f "$log"; exit 1; }
+       rm -f "$log"; ok "built ./mwm"; fi
   if [ -e /usr/local/bin/mwm ] && ! strings /usr/local/bin/mwm 2>/dev/null | grep -q _RICE_CMD; then
     run $SUDO cp /usr/local/bin/mwm "/usr/local/bin/mwm.bak-$STAMP" && echo "  backup: /usr/local/bin/mwm.bak-$STAMP"
   fi
@@ -343,9 +394,12 @@ if [ $SHELL_ = 1 ]; then
   else
     [ -f "$S/upstream.rev" ] || { run cp "$R/rice/shell/dss/UPSTREAM" "$S/upstream.rev" && ok "shell version recorded (updates start from it)"; }
     if [ "$DRY" = 1 ]; then run bash "$S/port.sh"
-    elif bash "$S/port.sh" >/tmp/mwm-port.$$ 2>&1; then ok "built ~/.config/quickshell"
-    else bad "port.sh failed:"; tail -15 /tmp/mwm-port.$$; fi
-    rm -f /tmp/mwm-port.$$
+    else
+      log=$(mktemp) || exit 1
+      if bash "$S/port.sh" >"$log" 2>&1; then ok "built ~/.config/quickshell"
+      else bad "port.sh failed:"; tail -15 "$log"; fi
+      rm -f "$log"
+    fi
     grep -q 'dss-start' "$HOME/.xprofile" 2>/dev/null && ok "~/.xprofile starts the shell" \
       || warn "add to ~/.xprofile, after picom:  (sleep 1; ~/.local/share/dss/dss-start) &"
   fi

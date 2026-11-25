@@ -74,10 +74,12 @@ The screenshots show mwm with a full desktop shell on top. It lives in [`rice/`]
 - `theme-switch` (`Mod+Shift+t`): arrows to preview, Enter keeps, Esc reverts.
 
 **🧩 Shell (Quickshell QML)**
-- Bar, dock, control centre (`Mod+n`) and dynamic island.
+- Bar, dock, control centre (`Mod+n`) and dynamic island. Based on [DarkShadow's Shell](https://github.com/shadowww-dev/DarkShadowShell), ported to X11.
 - Desktop widgets: clock, visualiser, weather, battery, lyrics. `Mod+e` edits them.
 - Game bar (`Mod+g`), hot corner, welcome screen, wallpaper picker.
 - Menus grow out of the bar as glass shapes.
+- Screenshot, record and lock in the shell run the mwm tools (`rice-shot`, `rice-record`, `rice-lock`).
+- 🔄 **Update Center** (Shell Settings): pulls mwm and the newest shell, rebuilds it for X11, rolls back if a patch no longer fits.
 
 **🔎 Launcher and tools**
 - Search apps, files, settings, math. Prefixes: `>` terminal, `?` web, `=` math, `/` paths.
@@ -86,8 +88,14 @@ The screenshots show mwm with a full desktop shell on top. It lives in [`rice/`]
 - Screenshot editor with OCR. Screen recorder with per-app audio.
 - Lock screen, power menu, polkit prompt, SDDM theme.
 
-**⚙️ Settings app** (`Mod+o`)
-- Appearance, wallpapers, sound, display, keyboard, mouse, gaps, network, shortcuts.
+**⚙️ Settings** (`Mod+o`)
+- Shell Settings: look, widgets, notifications, wallpapers, updates. Options that only work on Hyprland or niri are hidden.
+- Its **mwm** page opens the mwm settings app: display, keyboard and mouse, gaps, shortcuts, network, sound devices.
+
+**🖼️ Wallpapers**
+- Screenshots, icons and small or tall pictures are not listed as wallpapers.
+- Duplicates (same picture, other name, folder or size) are listed once, the best quality copy.
+- Picking one anywhere (Settings, picker, theme switcher) themes the whole desktop from it.
 
 **🪄 Compositor**
 - [picom](https://github.com/yshui/picom) 13 rules: clean menus, no blur on widgets, light blur on moving windows.
@@ -99,14 +107,24 @@ The screenshots show mwm with a full desktop shell on top. It lives in [`rice/`]
 ```sh
 git clone https://github.com/petkebtw/mwm.git && cd mwm
 ./install.sh --check     # what is installed, what is missing (with the package names for your distro)
-./install.sh             # mwm, the rice, the shell, the "mwm" login session and app menu entries
+./install.sh             # pick the parts in a menu, then install
 ```
 
-- Never overwrites your files: existing ones are kept or backed up (`*.bak-DATE`).
-- Checks the init system (systemd, OpenRC, runit, s6, dinit): logind/elogind, polkit, D-Bus, how PipeWire starts, the display manager at boot.
-- Warns about duplicates: a second mwm login entry, an old install under the name `dwm`, helpers shadowed in `PATH`, things `~/.xprofile` starts twice.
-- `--dry-run` shows every step. `--no-build`, `--no-rice`, `--no-shell`, `--no-session`, `--no-apps` skip a part.
-- Pick **mwm** at the login screen (SDDM, LightDM, GDM), or `startx`.
+```
+Choose what to install  (numbers toggle, a = all, n = none, Enter = start, q = quit)
+  1  [x] mwm                build, sudo make install -> /usr/local/bin/mwm
+  2  [x] Rice               rice-* helpers, Python library, picom/rofi/keys configs, ~/.xprofile
+  3  [x] Shell              Quickshell: widgets, control centre, launcher, settings, lock
+  4  [x] Login session      "mwm" at the SDDM / LightDM / GDM login, ~/.xinitrc for startx (sudo)
+  5  [x] App menu entries   Settings, Theme Switcher, Screenshot, Recorder ... in your app launcher
+```
+
+- 🔍 **Checks first:** every dependency (build, rice, shell, optional) with the install command for Gentoo, Arch, Debian or Fedora. A part whose dependencies are missing is greyed out.
+- ⚙️ **Init system:** systemd, OpenRC, runit, s6 or dinit. It checks logind/elogind, polkit, D-Bus, how PipeWire starts and which display manager starts at boot (and how to enable one).
+- 👯 **Duplicates:** a second mwm login entry, an old install under the name `dwm`, helpers shadowed in `PATH`, things `~/.xprofile` starts twice, picom or the shell running twice.
+- 🛡️ **Safe:** never overwrites your files; existing ones are kept or backed up (`*.bak-DATE`).
+- 🤖 **Scripted:** `--only=rice,shell` (no menu), `--yes`, `--dry-run` (prints every step), `--no-build` / `--no-rice` / `--no-shell` / `--no-session` / `--no-apps`.
+- 🚪 Then log out and pick **mwm** at the login screen, or `startx`.
 
 The manual steps follow.
 
@@ -162,6 +180,7 @@ cp config/xprofile.example ~/.xprofile   # edit monitors, wallpaper, layout
 
 - Needs Python 3, PyGObject (GTK 3), Pillow, `rofi`, `picom`, `feh`, `xdotool`, `maim`, `xclip`, `tesseract`, `ffmpeg`.
 - Quickshell must be built for X11 (Gentoo: `gui-apps/quickshell` with `X`, without `layer-shell`).
+- Or let `../install.sh` do all of it.
 - `rice-dl` needs a [cobalt](https://github.com/imputnet/cobalt) URL in `~/.cache/rice/cobalt_url`.
 
 <details>
@@ -287,6 +306,10 @@ xprop -root -f _RICE_CMD 32c -set _RICE_CMD "2, 12"    # set the gap to 12 px
 | Animations feel heavy | Settings > Appearance, or lighter blur |
 | Tray on wrong monitor | set `systraypinning` in `config.h`, rebuild |
 | `Mod+z`: "no data from dwm" | `sudo make install`, restart mwm |
+| No "mwm" at the login screen | `./install.sh --only=session` |
+| A setting does nothing | tell us: X11-only gaps are hidden by `rice/shell/patches/hide-dead.py` |
+| Shell update failed | it rolled back; the log is in Shell Settings > Update Center |
+| What is missing? | `./install.sh --check` |
 | Key edits do nothing | delete `~/.config/rice/binds.conf` |
 | Audio hangs | restart PipeWire |
 | Stutter with a game | GPU load, not mwm |
