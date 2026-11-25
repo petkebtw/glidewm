@@ -1,5 +1,5 @@
 #!/bin/sh
-# mwm routing: the shell's screenshot and record actions (control centre, game bar, island, Print in the shell) run our
+# glidewm routing: the shell's screenshot and record actions (control centre, game bar, island, Print in the shell) run our
 # tools in ~/.local/bin (rice-shot, rice-record); every other rice-hotcorner command goes to the shell's own script.
 # port.sh renames the shell's script to rice-hotcorner.dss and puts this one in its place.
 L="$HOME/.local/bin"

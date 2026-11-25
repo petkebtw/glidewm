@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""rice-update: updates for the mwm rice. Replaces DarkShadow's Shell updater, which wants ~/shadows-shell and its
+"""rice-update: updates for the glidewm rice. Replaces DarkShadow's Shell updater, which wants ~/shadows-shell and its
 Hyprland install.sh. One update does both halves:
 
-  1. mwm: pulls your mwm clone (github.com/petkebtw/mwm), fast-forward only.
+  1. glidewm: pulls your glidewm clone (github.com/petkebtw/mwm), fast-forward only.
   2. the shell: pulls DarkShadow's Shell (github.com/shadowww-dev/DarkShadowShell) into ~/.local/share/dss/upstream and
      puts its quickshell/, bin/ and sounds/ in src/, bin-src/ and sounds/.
-  Then port.sh rebuilds ~/.config/quickshell with the X11 and mwm changes. If port.sh fails on a new shell version (a
+  Then port.sh rebuilds ~/.config/quickshell with the X11 and glidewm changes. If port.sh fails on a new shell version (a
   patch no longer applies), the previous shell files are put back and rebuilt, so the shell keeps working.
 
   rice-update                 update in a terminal
@@ -16,7 +16,7 @@ Hyprland install.sh. One update does both halves:
                               (steps: ~/.cache/rice/update-live.log, state: ~/.cache/rice/update-live.json)
   rice-update center          open Settings > Update Center
 
-The mwm repo is the first of: the path in ~/.config/rice/repo, ~/mwm, ~/dwm that holds rice/shell/port.sh.
+The glidewm repo is the first of: the path in ~/.config/rice/repo, ~/glidewm, ~/mwm, ~/dwm that holds rice/shell/port.sh.
 The shell commit in use is in ~/.local/share/dss/upstream.rev (seeded from the repo's rice/shell/dss/UPSTREAM).
 """
 import fcntl
@@ -45,8 +45,8 @@ DEFAULTS = {"watch": True, "every_minutes": 1440}
 FIRST_WAIT = 45
 TICK = 30
 URL = "https://github.com/petkebtw/mwm"
-NO_REPO = ("Could not find your mwm clone. Clone it and run its installer:\n"
-           "      git clone %s ~/mwm && cd ~/mwm/rice && ./install.sh\n"
+NO_REPO = ("Could not find your glidewm clone. Clone it and run its installer:\n"
+           "      git clone %s ~/glidewm && cd ~/glidewm/rice && ./install.sh\n"
            "      (or put the clone's path in ~/.config/rice/repo)" % URL)
 
 
@@ -75,7 +75,7 @@ def repo():
         cands.append(open(DIR + "/repo").read().strip())
     except OSError:
         pass
-    cands += [HOME + "/mwm", HOME + "/dwm"]
+    cands += [HOME + "/glidewm", HOME + "/mwm", HOME + "/dwm"]
     for r in cands:
         if r and os.path.isfile(r + "/rice/shell/port.sh") and os.path.isdir(r + "/.git"):
             return r
@@ -158,7 +158,7 @@ def up_sync(say):
             continue
         old = dst + ".old"
         shutil.rmtree(old, ignore_errors=True)
-        if os.path.islink(dst):   # linked into the mwm repo by install.sh: leave the repo alone, use a real copy now
+        if os.path.islink(dst):   # linked into the glidewm repo by install.sh: leave the repo alone, use a real copy now
             bak[to] = ("link", os.readlink(dst))
             os.unlink(dst)
         elif os.path.exists(dst):
@@ -209,11 +209,11 @@ def check(offline=False):
                 mw_n = int(n.stdout.strip() or 0) if n.returncode == 0 else 0
                 if mw_n:
                     lg = git(r, "log", "--format=%s", "-n", "3", "HEAD.." + ref, timeout=5)
-                    news += ["mwm: " + ln for ln in lg.stdout.splitlines() if ln.strip()]
+                    news += ["glidewm: " + ln for ln in lg.stdout.splitlines() if ln.strip()]
             except Exception as e:
                 errs.append(str(e))
         else:
-            errs.append("no mwm clone found (see rice-update --help)")
+            errs.append("no glidewm clone found (see rice-update --help)")
         have = up_rev()
         try:
             if not offline:
@@ -231,8 +231,8 @@ def check(offline=False):
         except Exception as e:
             errs.append(str(e))
             sh_n, sh_have, sh_new = 0, "", ""
-        out["installed"] = "%s · mwm %s" % (sh_have or "?", mw_have or "?")
-        out["latest"] = "%s · mwm %s" % (sh_new or sh_have or "?", mw_new or mw_have or "?")
+        out["installed"] = "%s · glidewm %s" % (sh_have or "?", mw_have or "?")
+        out["latest"] = "%s · glidewm %s" % (sh_new or sh_have or "?", mw_new or mw_have or "?")
         out["changes"] = mw_n + max(sh_n, 0)
         out["update"] = mw_n > 0 or sh_n != 0
         out["commit"] = "%s %s" % (short(UP, "origin/main") if os.path.isdir(UP + "/.git") else "", mw_new)
@@ -249,7 +249,7 @@ def check(offline=False):
 # ---------- update ----------
 
 def update(r, log):
-    """pull mwm (fast-forward only, local edits are never overwritten), pull the shell, rebuild, restart the shell"""
+    """pull glidewm (fast-forward only, local edits are never overwritten), pull the shell, rebuild, restart the shell"""
     def say(s):
         log.write(s + "\n")
         log.flush()
@@ -267,18 +267,18 @@ def update(r, log):
             return 1
         new = short(r, "HEAD")
         if old == new:
-            say("    ✔ mwm is up to date (%s)" % new)
+            say("    ✔ glidewm is up to date (%s)" % new)
         else:
-            say("    ✔ mwm %s → %s" % (old, new))
+            say("    ✔ glidewm %s → %s" % (old, new))
             ch = git(r, "diff", "--name-only", old, new, timeout=10).stdout.split()
             if any(f.endswith((".c", ".h", ".mk")) and "/" not in f for f in ch):
-                say("    ℹ mwm itself changed: run  cd %s && make && sudo make install, then Mod+Shift+q" % r)
+                say("    ℹ glidewm itself changed: run  cd %s && make && sudo make install, then Mod+Shift+q" % r)
         # files new in this version get their links (install.sh skips everything that exists)
         if os.access(r + "/rice/install.sh", os.X_OK):
             say("    → Linking new files (install.sh)")
             step([r + "/rice/install.sh"], cwd=r + "/rice", timeout=60)
     else:
-        say("    ℹ No mwm clone found, updating the shell only")
+        say("    ℹ No glidewm clone found, updating the shell only")
 
     say("    → Fetching DarkShadow's Shell")
     e = up_fetch()
@@ -429,8 +429,8 @@ def notify(st):
     for n in st.get("news", [])[:3]:
         body += "\n•  " + n.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     try:
-        r = subprocess.run(["notify-send", "-a", "mwm", "-i", "system-software-update", "-t", "20000",
-                            "-A", "default=Update now", "-A", "later=Later", "--wait", "mwm update available", body],
+        r = subprocess.run(["notify-send", "-a", "glidewm", "-i", "system-software-update", "-t", "20000",
+                            "-A", "default=Update now", "-A", "later=Later", "--wait", "glidewm update available", body],
                            capture_output=True, text=True, timeout=6 * 3600)
         if r.stdout.strip() == "default":
             open_center()

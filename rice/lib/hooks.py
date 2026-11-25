@@ -46,6 +46,8 @@ def fflogo(s, c):
     if not m:
         return s
     old = m.group(0)
+    if mode == "ascii" and not item.get("ascii") and item.get("builtin"):     # e.g. Tux: fastfetch's own ASCII logo
+        return s.replace(old, '"logo": {"type": "builtin", "source": "%s", "color": {"1": "%s", "2": "%s"}, "padding": {"right": 4}},' % (item["builtin"], acc, acc2), 1)
     if item.get("image") and (mode == "image" or not item.get("ascii")):
         new = re.sub(r'"source":\s*"[^"]*"', '"source": "%s"' % f"{FFLOGOS}/{item['image']}", old, count=1)
         if '"type": "kitty-icat"' not in new and '"type"' not in new:

@@ -1,8 +1,8 @@
 #!/bin/sh
-# mwm routing: the shell asks rice-wm which window manager runs (Settings, About). On mwm the answers name mwm;
+# glidewm routing: the shell asks rice-wm which window manager runs (Settings, About). On glidewm the answers name glidewm;
 # everything else (workspace, move-to, dpms ...) goes to the shell's script (rice-wm.dss, renamed by port.sh).
 case "$1" in
-  label) echo mwm; exit 0 ;;
-  version) v=$( (mwm -v || dwm -v) 2>&1 | head -1 | sed -n "s/^[md]wm-//p"); echo "mwm ${v:-6.8}"; exit 0 ;;
+  label) echo glidewm; exit 0 ;;
+  version) v=$( (glidewm -v || mwm -v || dwm -v) 2>&1 | head -1 | sed -En "s/^(glide|m|d)wm-//p"); echo "glidewm ${v:-6.8}"; exit 0 ;;
 esac
 exec "$HOME/.local/share/dss/bin/rice-wm.dss" "$@"

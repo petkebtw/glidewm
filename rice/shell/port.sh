@@ -6,7 +6,7 @@ D="$HOME/.local/share/dss"
 # crashed on the half-built tree ("Non-existent attached object" on an unpatched WlrLayershell line)
 QB="$HOME/.config/quickshell.build"
 rm -rf "$QB"
-cp -rL "$D/src" "$QB"     # -L: src may be a link into the mwm repo (install.sh); never patch the repo
+cp -rL "$D/src" "$QB"     # -L: src may be a link into the glidewm repo (install.sh); never patch the repo
 cd "$QB"
 # layer-shell attached properties do not exist on X11 panels
 # layer -> X11 stacking (PanelWindow.aboveWindows); namespace / keyboardFocus have no X11 meaning
@@ -192,12 +192,12 @@ grep -q "hand.hslSaturation < 0.08" "$QB/rice-desktop/ClockWidget.qml"
 perl -0pi -e 's/^\s*onPositionChanged: \{ ln\.noScroll = true; ln\.cur = (cell|row)\.index; ln\.noScroll = false \}\n//mg' "$QB/rice-desktop/LauncherM3.qml"
 if grep -q 'onPositionChanged: { ln.noScroll = true' "$QB/rice-desktop/LauncherM3.qml"; then echo "LauncherM3 hover patch did not apply"; exit 1; fi
 
-# Settings on mwm: hide the pages that only work on Hyprland / niri or with the QML bar (it is off: the dwm bar is used),
-# put an mwm page (patches/MwmPage.qml: opens the mwm settings app and tools) where the Hyprland page was, name mwm.
+# Settings on glidewm: hide the pages that only work on Hyprland / niri or with the QML bar (it is off: the dwm bar is used),
+# put an glidewm page (patches/GlidewmPage.qml: opens the glidewm settings app and tools) where the Hyprland page was, name glidewm.
 #   gone: 2 bar, 3 bar layout, 5 recorder (rice-record is used), 6 island (lives in the QML bar), 11 idle & lock
 #   (hypridle, Wayland lock), 23 keyboard (Hyprland input), 28 monitors (hypr-set), 30 keybinds (Hyprland/niri),
-#   33 infinite desktop (Hyprland plugin), 36 window rules (Hyprland). A link to one of them lands on the mwm page.
-cp "$D/patches/MwmPage.qml" "$QB/rice-settings/MwmPage.qml"
+#   33 infinite desktop (Hyprland plugin), 36 window rules (Hyprland). A link to one of them lands on the glidewm page.
+cp "$D/patches/GlidewmPage.qml" "$QB/rice-settings/GlidewmPage.qml"
 python3 - "$QB/rice-settings" <<'PY'
 import sys, re
 q = sys.argv[1]
@@ -206,12 +206,12 @@ def sub(a, b):
     global s
     assert s.count(a) == 1, a
     s = s.replace(a, b)
-sub('readonly property string wmLabel: niri ? "niri" : "Hyprland"', 'readonly property string wmLabel: "mwm"')
+sub('readonly property string wmLabel: niri ? "niri" : "Hyprland"', 'readonly property string wmLabel: "glidewm"')
 sub('pages: niri ? [29, 12, 25, 36, 4, 11] : [29, 33, 12, 25, 36, 4, 11]', 'pages: [4, 29, 12, 25]')
 sub('pages: [2, 3, 6, 7]', 'pages: [7]')
 sub('pages: [38, 30, 31, 28, 5, 23, 15]', 'pages: [38, 31, 15]')
 sub('onPageChanged: {', 'readonly property var gone: [2, 3, 5, 6, 11, 23, 28, 30, 33, 36]\n    onPageChanged: { if (gone.indexOf(page) >= 0) { page = 4; return }')
-sub('HyprlandPage { anchors.fill: parent; ctl: win }', 'MwmPage { anchors.fill: parent; ctl: win }')
+sub('HyprlandPage { anchors.fill: parent; ctl: win }', 'GlidewmPage { anchors.fill: parent; ctl: win }')
 gone = {2, 3, 5, 6, 11, 23, 28, 30, 33, 36}
 n = 0
 def drop(m):
@@ -225,13 +225,13 @@ assert n == len(gone), n
 open(p, "w").write(s)
 p = q + "/AboutPage.qml"; s = open(p).read()
 sub('{ n: "Hyprland", u: "https://hypr.land" }, { n: "niri", u: "https://github.com/niri-wm/niri" }',
-    '{ n: "mwm", u: "https://github.com/petkebtw/mwm" }, { n: "dwm", u: "https://dwm.suckless.org" }')
-sub('n: page.info.wm || "Hyprland"', 'n: page.info.wm || "mwm"')
+    '{ n: "glidewm", u: "https://github.com/petkebtw/mwm" }, { n: "dwm", u: "https://dwm.suckless.org" }')
+sub('n: page.info.wm || "Hyprland"', 'n: page.info.wm || "glidewm"')
 open(p, "w").write(s)
 PY
-grep -q 'MwmPage { anchors.fill' "$QB/rice-settings/shell.qml"
+grep -q 'GlidewmPage { anchors.fill' "$QB/rice-settings/shell.qml"
 
-# Settings rows that cannot work on mwm/X11 (Hyprland blur, animations, input, gaming mode, Minimal mode, night light,
+# Settings rows that cannot work on glidewm/X11 (Hyprland blur, animations, input, gaming mode, Minimal mode, night light,
 # Light mode ...) are hidden: patches/hide-dead.py (list and rules in it)
 python3 "$D/patches/hide-dead.py" "$QB/rice-settings" >/dev/null
 grep -q 'visible: false' "$QB/rice-settings/HomePage.qml"
@@ -240,14 +240,14 @@ grep -q 'visible: false' "$QB/rice-settings/HomePage.qml"
 perl -0pi -e 's/frameTime\) \/ 0\.09\)\)/frameTime) \/ 0.14))/' "$QB/rice-settings/WheelScroll.qml"
 grep -q 'frameTime) / 0.14))' "$QB/rice-settings/WheelScroll.qml"
 
-# wallpapers picked in the shell (Wallpaper page, themes, presets, the picker) go through the mwm theme pipeline
+# wallpapers picked in the shell (Wallpaper page, themes, presets, the picker) go through the glidewm theme pipeline
 # (feh, colours for dwm, rofi, terminals and the shell): awww and matugen do not exist here, nothing changed before
 python3 - "$QB/hyprquickpaper/commands.sh" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 a = 'esac\n\nmkdir -p "$HOME/.cache/rice" "$HOME/.config/waybar"\n'
 assert s.count(a) == 1
-s = s.replace(a, 'esac\n\n# mwm: the picture goes through the mwm theme pipeline (themes.apply)\n'
+s = s.replace(a, 'esac\n\n# glidewm: the picture goes through the glidewm theme pipeline (themes.apply)\n'
   'if [ -f "$HOME/.local/lib/rice/themes.py" ]; then\n'
   '  echo "$img" > "$HOME/.cache/hyprquickpaper-current"\n'
   '  exec python3 -c \'import os, sys; sys.path.insert(0, os.path.expanduser("~/.local/lib/rice")); import themes; themes.apply(themes.item_for(sys.argv[1]))\' "$img"\n'

@@ -388,7 +388,7 @@ refresh(first=True)
 if S["lines"] is None and S["key"]:
     _b = [None]
     _t = threading.Thread(target=lambda: _b.__setitem__(0, lyrics.get(S["artist"], S["title"], S["length"] / 1e6, timeout=1.5)), daemon=True)
-    _t.start(); _t.join(1.6)                              # never wait longer, even if DNS hangs
+    _t.start(); _t.join(0.4)                              # a new song: open now, the fetch goes on and caches it for next time
     S["lines"] = _b[0]
 HAS_LYR = bool(S["lines"])
 S["hl"] = HAS_LYR

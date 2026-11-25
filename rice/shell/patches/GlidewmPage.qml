@@ -2,8 +2,8 @@ import Quickshell
 import Quickshell.Io
 import QtQuick
 
-// Settings > Desktop > mwm (port.sh puts it in place of the Hyprland / niri page): mwm's own settings live in the
-// mwm settings app (~/.local/bin/rice-settings PAGE) and the tools in ~/.local/bin; this page opens them.
+// Settings > Desktop > glidewm (port.sh puts it in place of the Hyprland / niri page): glidewm's own settings live in the
+// glidewm settings app (~/.local/bin/rice-settings PAGE) and the tools in ~/.local/bin; this page opens them.
 Item {
     id: page
     property var ctl
@@ -21,7 +21,7 @@ Item {
         { l: "Display", d: "Monitors, resolution, refresh rate, rotation, brightness, night light", g: "\uf108", p: "display" },
         { l: "Keyboard & mouse", d: "Layout, key repeat, mouse speed and acceleration", g: "\uf11c", p: "input" },
         { l: "Windows & bar", d: "Gaps, bar padding, tiling", g: "\uf2d0", p: "windows" },
-        { l: "Shortcuts", d: "Every mwm key (writes ~/.config/rice/binds.conf)", g: "\uf084", p: "keys" },
+        { l: "Shortcuts", d: "Every glidewm key (writes ~/.config/rice/binds.conf)", g: "\uf084", p: "keys" },
         { l: "Network", d: "Interfaces, DNS, MTU, DHCP renew, tests", g: "\uf1eb", p: "net" },
         { l: "Sound devices", d: "Output and input devices, the audio fix", g: "\uf028", p: "sound" }
     ]
@@ -37,7 +37,7 @@ Item {
     PageScroll {
         anchors.fill: parent
 
-        SectionTitle { text: "mwm"; sub: (page.ver || "mwm") + I18n.t("  ·  the window manager. Its own settings open in the mwm settings app.") }
+        SectionTitle { text: "glidewm"; sub: (page.ver || "glidewm") + I18n.t("  ·  the window manager. Its own settings open in the glidewm settings app.") }
         Repeater {
             model: page.apps
             SettingRow {
@@ -49,7 +49,7 @@ Item {
             }
         }
 
-        SectionTitle { text: I18n.t("Tools"); sub: I18n.t("The mwm tools. The control centre, game bar and island use the same ones.") }
+        SectionTitle { text: I18n.t("Tools"); sub: I18n.t("The glidewm tools. The control centre, game bar and island use the same ones.") }
         Repeater {
             model: page.tools
             SettingRow {

@@ -1,4 +1,4 @@
-# ~/.xprofile for the mwm rice. Edit monitor names, wallpaper and keyboard layout.
+# ~/.xprofile for the glidewm rice. Edit monitor names, wallpaper and keyboard layout.
 export PATH="$HOME/.local/bin:$PATH"
 
 # monitors (names from `xrandr`)
@@ -7,6 +7,10 @@ xrandr --output DP-1 --primary --mode 1920x1080 --pos 0x1080 \
 
 xrdb -merge ~/.Xresources
 theme-switch --restore || feh --bg-fill ~/Pictures/wall.jpg &
+
+# NVIDIA + monitors with different refresh rates: OpenGL apps (the shell, Settings, games) vsync to the slow
+# one unless told otherwise (75 fps instead of 165 measured). Name the fast output here and uncomment.
+# export __GL_SYNC_DISPLAY_DEVICE=DP-1
 
 # compositor (NVIDIA + mixed refresh rates: sync to the fast output)
 # __GL_SYNC_DISPLAY_DEVICE=DP-1 picom --config ~/.config/picom/rice.conf &

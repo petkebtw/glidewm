@@ -2,11 +2,6 @@
 # qs with the X11 shim modules (Quickshell.Wayland/Hyprland), for apps started from dwm keys (no QML_IMPORT_PATH there)
 export QML_IMPORT_PATH="$HOME/.local/share/dss/qml${QML_IMPORT_PATH:+:$QML_IMPORT_PATH}"
 export PATH="$HOME/.local/share/dss/bin:$PATH"
-# Settings and the apps are one window each: sync it to the screen, so scrolling glides evenly. (The desktop shell
-# runs with __GL_SYNC_TO_VBLANK=0 from dss-start: its many windows waited for each other's vblank. Settings started
-# from the shell inherited that and its frames came unevenly.)
-case "$*" in
-  *quickshell/rice-desktop*) ;;
-  *) export __GL_SYNC_TO_VBLANK=1 ;;
-esac
+# vsync on for every shell window (the desktop shell too since 2026-11-25: 165 fps menus instead of 60-120).
+export __GL_SYNC_TO_VBLANK=1
 exec /usr/bin/qs "$@"

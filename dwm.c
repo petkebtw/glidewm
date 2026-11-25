@@ -873,17 +873,20 @@ cleanup(void)
 	Monitor *m;
 	size_t i;
 
-	if (restart) { /* remember tags so windows come back where they were */
+	if (restart) { /* remember tags and monitor of every window, and every monitor's view (preserveonrestart) */
 		Atom at = XInternAtom(dpy, "_RICE_TAGS", False);
 		Client *rc;
-		unsigned long tv;
+		long cv[2], vv[1 + 32];
+		int nv = 1;
 		for (m = mons; m; m = m->next)
 			for (rc = m->clients; rc; rc = rc->next) {
-				tv = rc->tags;
-				XChangeProperty(dpy, rc->win, at, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&tv, 1);
+				cv[0] = rc->tags; cv[1] = m->num;
+				XChangeProperty(dpy, rc->win, at, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)cv, 2);
 			}
-		tv = selmon->tagset[selmon->seltags];
-		XChangeProperty(dpy, root, XInternAtom(dpy, "_RICE_VIEW", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&tv, 1);
+		vv[0] = selmon->num; /* then the viewed tags of monitor 0, 1, ... */
+		for (m = mons; m && nv < 1 + 32; m = m->next)
+			vv[nv++] = m->tagset[m->seltags];
+		XChangeProperty(dpy, root, XInternAtom(dpy, "_RICE_VIEW", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)vv, nv);
 	}
 	view(&a);
 	selmon->lt[selmon->sellt] = &foo;
@@ -1915,12 +1918,20 @@ manage(Window w, XWindowAttributes *wa)
 		c->mon = selmon;
 		applyrules(c);
 	}
-	{ /* tags saved by a restart */
+	{ /* tags (and monitor) saved by a restart */
 		Atom type; int fmt; unsigned long n, after; unsigned char *p = NULL;
 		Atom at = XInternAtom(dpy, "_RICE_TAGS", False);
-		if (XGetWindowProperty(dpy, w, at, 0, 1, True, XA_CARDINAL, &type, &fmt, &n, &after, &p) == Success && p) {
-			if (n == 1 && (*(long *)p & TAGMASK))
-				c->tags = (unsigned int)(*(long *)p & TAGMASK);
+		Monitor *rm;
+		if (XGetWindowProperty(dpy, w, at, 0, 2, True, XA_CARDINAL, &type, &fmt, &n, &after, &p) == Success && p) {
+			long *v = (long *)p;
+			if (n >= 1 && (v[0] & TAGMASK))
+				c->tags = (unsigned int)(v[0] & TAGMASK);
+			if (n >= 2 && !t)
+				for (rm = mons; rm; rm = rm->next)
+					if (rm->num == v[1]) {
+						c->mon = rm;
+						break;
+					}
 			XFree(p);
 		}
 	}
@@ -2520,7 +2531,7 @@ run(void)
 	while (running) {
 		if (baranim && !XPending(dpy)) {
 			fd_set fds;
-			struct timeval tv = { 0, 8000 };
+			struct timeval tv = { 0, 5000 }; /* 200 steps/s: every 165 Hz frame gets a new position (8 ms capped the slide at 125 fps) */
 			FD_ZERO(&fds);
 			FD_SET(ConnectionNumber(dpy), &fds);
 			if (select(ConnectionNumber(dpy) + 1, &fds, NULL, NULL, &tv) == 0) {
@@ -2789,7 +2800,7 @@ setup(void)
 	XChangeProperty(dpy, wmcheckwin, netatom[NetWMCheck], XA_WINDOW, 32,
 		PropModeReplace, (unsigned char *) &wmcheckwin, 1);
 	XChangeProperty(dpy, wmcheckwin, netatom[NetWMName], utf8string, 8,
-		PropModeReplace, (unsigned char *) "mwm", 3);
+		PropModeReplace, (unsigned char *) "glidewm", 7);
 	XChangeProperty(dpy, root, netatom[NetWMCheck], XA_WINDOW, 32,
 		PropModeReplace, (unsigned char *) &wmcheckwin, 1);
 	/* EWMH support per view */
@@ -3669,7 +3680,7 @@ void
 updatestatus(void)
 {
 	if (!gettextprop(root, XA_WM_NAME, stext, sizeof(stext)))
-		strcpy(stext, "mwm-"VERSION);
+		strcpy(stext, "glidewm-"VERSION);
 	drawbars();
 	updatesystray();
 }
@@ -3926,7 +3937,7 @@ xerrordummy(Display *dpy, XErrorEvent *ee)
 int
 xerrorstart(Display *dpy, XErrorEvent *ee)
 {
-	die("mwm: another window manager is already running");
+	die("glidewm: another window manager is already running");
 	return -1;
 }
 
@@ -3975,7 +3986,7 @@ int
 main(int argc, char *argv[])
 {
 	if (argc == 2 && !strcmp("-v", argv[1]))
-		die("mwm-"VERSION);
+		die("glidewm-"VERSION);
 	else if (argc == 2 && !strcmp("--dump-binds", argv[1])) {
 		dumpkeys();
 		return EXIT_SUCCESS;
@@ -3984,7 +3995,7 @@ main(int argc, char *argv[])
 	if (!setlocale(LC_CTYPE, "") || !XSupportsLocale())
 		fputs("warning: no locale support\n", stderr);
 	if (!(dpy = XOpenDisplay(NULL)))
-		die("mwm: cannot open display");
+		die("glidewm: cannot open display");
 	checkotherwm();
         XrmInitialize();
         loadxrdb();
@@ -4001,11 +4012,26 @@ main(int argc, char *argv[])
 	scan();
 	{ /* restored view after a restart */
 		Atom type; int fmt; unsigned long n, after; unsigned char *p = NULL;
-		if (XGetWindowProperty(dpy, root, XInternAtom(dpy, "_RICE_VIEW", False), 0, 1, True, XA_CARDINAL, &type, &fmt, &n, &after, &p) == Success && p) {
-			if (n == 1 && (*(long *)p & TAGMASK)) {
-				Arg va = {.ui = (unsigned int)(*(long *)p & TAGMASK)};
+		if (XGetWindowProperty(dpy, root, XInternAtom(dpy, "_RICE_VIEW", False), 0, 1 + 32, True, XA_CARDINAL, &type, &fmt, &n, &after, &p) == Success && p) {
+			long *v = (long *)p;
+			Monitor *vm, *keep = selmon;
+			if (n == 1 && (v[0] & TAGMASK)) { /* saved by an older build: the selected monitor's view */
+				Arg va = {.ui = (unsigned int)(v[0] & TAGMASK)};
 				swipedir = 0;
 				view(&va);
+			} else if (n >= 2) { /* selected monitor, then each monitor's view */
+				for (vm = mons; vm; vm = vm->next) {
+					if (vm->num == v[0])
+						keep = vm;
+					if (1 + vm->num < (int)n && (v[1 + vm->num] & TAGMASK)) {
+						Arg va = {.ui = (unsigned int)(v[1 + vm->num] & TAGMASK)};
+						selmon = vm;
+						swipedir = 0;
+						view(&va);
+					}
+				}
+				selmon = keep;
+				focus(NULL);
 			}
 			XFree(p);
 		}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hide Settings rows that cannot work on mwm/X11 (port.sh runs it on the built rice-settings).
+"""Hide Settings rows that cannot work on glidewm/X11 (port.sh runs it on the built rice-settings).
   hide-dead.py DIR [--report]
 A row (an element with a `label:`) is dead when its block calls a Hyprland/niri-only backend (DEAD), or when it is
 listed in EXTRA (file, label) / SECTIONS (file, section title). Dead elements get `visible: false` (an existing
