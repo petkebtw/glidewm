@@ -1,0 +1,15 @@
+/* injected into soundcloud's inner (iframe) pages: track, playlist, profile */
+html, body, div, section, main, article, nav, aside, footer, ul, ol, li, form, table, tr, td, header { background-color: transparent !important; }
+body { background: rgb(20 20 26 / .10) !important; color: #f1f1f5 !important; }
+div, span, p, h1, h2, h3, h4, h5, h6, li, label, td, th, em, strong, small, time { color: #f1f1f5 !important; }
+a { color: #f1f1f5 !important; }
+::-webkit-scrollbar { width: 8px; height: 8px; background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 8px; }
+button { -webkit-appearance: none; border-radius: 999px !important; }
+body *:not(button):not(input):not(textarea):not(svg):not(svg *):not(img):not(canvas):not([class*="badge" i]):not([class*="Badge"]) { background-color: transparent !important; }
+:root, html { background: transparent !important; }
+html, :root { color-scheme: normal !important; }
+[class*="fade" i], [class*="gradient" i], [class*="Fade"] { background-image: none !important; }
+/* sign-in / forms: keep text fields visible (wrapper backgrounds are transparent above) */
+input:not([type=checkbox]):not([type=radio]):not([type=range]), textarea { background: rgba(255,255,255,.10) !important; color: #fff !important; border: 1px solid rgba(255,255,255,.35) !important; border-radius: 12px !important; padding-left: 14px !important; opacity: 1 !important; visibility: visible !important; }
+input:focus { border-color: rgba(255,255,255,.7) !important; outline: none !important; }

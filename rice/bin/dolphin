@@ -1,0 +1,5 @@
+#!/bin/sh
+# dolphin with the wallpaper-derived stylesheet (hooks.qt writes it)
+Q="$HOME/.cache/theme/dolphin.qss"
+[ -f "$Q" ] && exec /usr/bin/dolphin -stylesheet "$Q" "$@"
+exec /usr/bin/dolphin "$@"

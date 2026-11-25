@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# border-sync: window borders in the colors of the wallpaper (unless you picked your own in Settings)
+[ -f "$HOME/.config/rice/border-custom" ] && exit 0
+f="$HOME/.config/hypr/border-colors.txt"
+[ -f "$f" ] || exit 0
+# niri: the colors are part of its config (rice-niri reads border-colors.txt)
+if [ "$("$HOME/.local/bin/rice-wm" 2>/dev/null)" = niri ]; then
+  exec "$HOME/.local/bin/rice-niri" apply
+fi
+c1=$(sed -n 1p "$f" | tr -d '#')
+c2=$(sed -n 2p "$f" | tr -d '#')
+# Minimal mode (rice-minimal): one plain color, no gradient
+if grep -q '"on": true' "$HOME/.config/rice/minimal.json" 2>/dev/null; then
+  a=ff
+  grep -q '"frame": "thin"' "$HOME/.config/rice/minimal.json" && a=b0
+  hyprctl eval "hl.config({ general = { col = { active_border = \"rgba(${c1}${a})\" } } })" >/dev/null
+  exit 0
+fi
+hyprctl eval "hl.config({ general = { col = { active_border = { colors = {\"rgba(${c1}ff)\", \"rgba(${c2}ff)\"}, angle = 45 } } } })" >/dev/null

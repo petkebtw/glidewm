@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""Theme picker: small pill pops out of the top, <- -> to switch (live), Enter keeps, Esc reverts.
+   theme-switch            open picker
+   theme-switch --restore  re-apply last theme at login
+   theme-switch --sync     pull new wallpapers (auto when online)
+   theme-switch NAME       apply theme/wallpaper by name"""
+import os, sys, math, signal, threading
+if len(sys.argv) == 1:      # interactive picker only: single instance, a second call closes it
+    import fcntl as _fc, signal as _sg
+    _cd = os.path.expanduser("~/.cache/rice"); os.makedirs(_cd, exist_ok=True)
+    _lk = open(os.path.join(_cd, "once-theme-switch.lock"), "w")
+    try:
+        _fc.flock(_lk, _fc.LOCK_EX | _fc.LOCK_NB)
+    except OSError:
+        try:
+            import time as _tm
+            if _tm.time() - os.path.getmtime(os.path.join(_cd, "once-theme-switch.pid")) > 1.2: os.kill(int(open(os.path.join(_cd, "once-theme-switch.pid")).read()), _sg.SIGTERM)
+        except Exception: pass
+        sys.exit(0)
+    open(os.path.join(_cd, "once-theme-switch.pid"), "w").write(str(os.getpid()))
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import warnings; warnings.filterwarnings("ignore")
+import themes
+
+def bg_sync():  # login: pull new wallpapers in the background when online
+    import subprocess
+    subprocess.Popen([sys.argv[0], "--sync"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--sync":
+    import settings
+    if settings.get("online"): themes.sync(10)
+    sys.exit(0)
+if len(sys.argv) > 1 and sys.argv[1] == "--restore":
+    import subprocess
+    bg_sync()
+    if os.path.exists(f"{themes.CACHE}/dwm.Xresources"):
+        subprocess.run(["xrdb", "-merge", f"{themes.CACHE}/dwm.Xresources"])
+    w = open(f"{themes.CACHE}/wall").read().strip() if os.path.exists(f"{themes.CACHE}/wall") else None
+    if w and os.path.exists(w):
+        subprocess.Popen(["feh", "--bg-fill", w])
+    themes.autocheck(10)          # after login settles (picom up, xrdb merged): verify and repair the theme
+    sys.exit(0)
+if len(sys.argv) > 1:
+    for it in themes.items():
+        if it["name"] == sys.argv[1] or it["wall"] == os.path.abspath(sys.argv[1]):
+            themes.apply(it); sys.exit(0)
+    p = os.path.abspath(sys.argv[1])
+    if os.path.exists(p):
+        themes.apply(dict(name=os.path.basename(p), wall=p, colors=None)); sys.exit(0)
+    sys.exit("unknown theme")
+
+import rice, favs
+from rice import Gtk, Gdk, GLib, cairo
+from gi.repository import GdkPixbuf
+
+RICEMODE = os.path.expanduser("~/.cache/rice/ricemode")
+
+
+def rice_on():
+    return os.path.exists(RICEMODE)
+
+
+PID = os.path.expanduser("~/.cache/rice/theme.pid")
+try:
+    old = int(open(PID).read())
+    if "theme-switch" in open(f"/proc/{old}/cmdline").read():
+        os.kill(old, signal.SIGTERM); sys.exit(0)
+except Exception:
+    pass
+open(PID, "w").write(str(os.getpid()))
+
+import settings, time, queue
+
+PINNED = themes._cur()
+ITEMS = themes.items(cur=PINNED)
+start = themes.current_item()
+orig = start
+idx = next((i for i, it in enumerate(ITEMS) if start and it["wall"] == start["wall"]), 0)
+if start is None:  # fall back to whatever wallpaper/colors are active now
+    try:
+        import json
+        orig = dict(name="previous", wall=open(f"{themes.CACHE}/wall").read().strip(),
+                    colors=json.load(open(f"{themes.CACHE}/colors.json")))
+    except Exception:
+        orig = None
+if not ITEMS and orig:
+    ITEMS = [orig]
+try:    # pin the revert target so a background sync/prune cannot delete it while previewing
+    open(os.path.expanduser("~/.cache/rice/pinned"), "w").write(orig["wall"] if orig else "")
+except Exception:
+    pass
+
+# ---- thumbnails load off the main thread; until then a shimmering skeleton card is drawn ------------------
+pix = {}          # wall -> pixbuf
+tq = queue.Queue()
+queued = set()
+
+
+def thumb_worker():
+    while True:
+        wall = tq.get()
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file(themes.thumb(wall))
+            sc = max(200 / pb.get_width(), 112 / pb.get_height())
+            pix[wall] = pb.scale_simple(int(pb.get_width() * sc) + 1, int(pb.get_height() * sc) + 1, GdkPixbuf.InterpType.BILINEAR)
+            GLib.idle_add(da.queue_draw)
+            themes.colors_for(dict(wall=wall, colors=None))   # warm the palette here, so draw() on the main thread never extracts
+        except Exception:
+            queued.discard(wall)
+
+
+for _ in range(2):
+    threading.Thread(target=thumb_worker, daemon=True).start()
+
+
+def want_thumbs():
+    """Queue thumbnails nearest the selection first."""
+    t = state["target"]
+    for i in sorted(range(max(0, t - 5), min(len(ITEMS), t + 6)), key=lambda i: abs(i - t)):
+        w = ITEMS[i]["wall"]
+        if w not in pix and w not in queued:
+            queued.add(w); tq.put(w)
+
+
+W, H = 760, 172
+win = rice.Card(W, H, radius=32, alpha=0.72)
+win.set_name("themepick")
+da = Gtk.DrawingArea(); win.add(da)
+state = dict(pos=float(idx), target=idx, sk=0)
+pending = [None]
+want_thumbs()
+
+
+CC = {}
+_on = [settings.get("online")]
+
+
+def skeleton(cr, x, y, w, h, r, t, a=1.0):
+    c = win.c
+    rice.rounded(cr, x, y, w, h, r)
+    cr.set_source_rgba(*rice.rgb(c["fg"], 0.07 * a)); cr.fill_preserve()
+    cr.save(); cr.clip()
+    ph = (time.time() * 0.9) % 1.6 - 0.3                      # shimmer band travels left to right
+    gx = x + (ph * 1.6 - 0.3) * w
+    lg = cairo.LinearGradient(gx - w * 0.35, y, gx + w * 0.35, y + h * 0.3)
+    lg.add_color_stop_rgba(0, *rice.rgb(c["fg"], 0)[:3], 0)
+    lg.add_color_stop_rgba(0.5, *rice.rgb(c["fg"])[:3], 0.16 * a)
+    lg.add_color_stop_rgba(1, *rice.rgb(c["fg"])[:3], 0)
+    cr.set_source(lg); cr.paint()
+    cr.restore()
+
+
+def draw(w, cr):
+    c = win.c
+    cur = ITEMS[state["target"]]
+    ck = (cur["wall"], win.glass)
+    if ck not in CC:
+        CC[ck] = themes.colors_for(cur)[0]
+    cc = CC[ck]
+    cr.save()
+    cr.set_operator(cairo.OPERATOR_SOURCE)
+    rice.rounded(cr, 0.5, 0.5, W - 1, H - 1, 32)
+    bg = rice.rgb(cc["bg"]); ac = rice.rgb(cc["accent"])
+    if win.glass:
+        cr.set_source_rgba(*rice.rgb(win.c["bg"])[:3], win.alpha)     # same flat glass as every other menu
+    else:
+        cr.set_source_rgba(*bg[:3], 1.0)
+    cr.fill_preserve()
+    cr.set_operator(cairo.OPERATOR_OVER)
+    cr.set_source_rgba(*ac[:3], 0.85); cr.set_line_width(2); cr.stroke()
+    cr.restore()
+    cx, cy = W / 2, 62
+    total = len(ITEMS) + state["sk"]
+    anysk = False
+    for i in range(total):
+        d = i - state["pos"]
+        if abs(d) > 3.3:
+            continue
+        t = max(0.0, 1 - abs(d))  # 1 at center
+        tw = 96 + 64 * t
+        th = tw * 9 / 16
+        x = cx + d * 112 - tw / 2
+        y = cy - th / 2
+        pb = pix.get(ITEMS[i]["wall"]) if i < len(ITEMS) else None
+        if pb is None:
+            anysk = True
+            skeleton(cr, x, y, tw, th, 12 + 4 * t, t, 0.5 + 0.5 * t)
+            continue
+        cr.save()
+        rice.rounded(cr, x, y, tw, th, 12 + 4 * t)
+        cr.clip()
+        cr.translate(x, y); cr.scale(tw / pb.get_width(), th / pb.get_height())
+        Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+        cr.paint_with_alpha(0.45 + 0.55 * t)
+        cr.restore()
+        if t > 0.5:
+            cr.set_line_width(3)
+            rice.rounded(cr, x - 4, y - 4, tw + 8, th + 8, 20)
+            cr.set_source_rgba(*rice.rgb(cc["accent"], t)); cr.stroke()
+    draw.sk = anysk or state["sk"] > 0
+    on = _on[0]
+    parts = [(f"{state['target'] + 1}/{len(ITEMS)}", False), ("Enter keep", False), ("/ search", False),
+             ("o " + ("ONLINE" if on else "offline"), on), ("g glass " + ("on" if win.glass else "off"), not win.glass),
+             ("r rice " + ("ON" if rice_on() else "off"), rice_on())]
+    if on:
+        parts.append(("s " + themes.source(), False))
+    isf = favs.has("themes", cur["wall"])
+    parts.append(("f " + ("FAVORITED" if isf else "favorite"), isf))
+    parts.append(("v " + ("FAVORITES" if favview[0] else "all"), favview[0]))
+    parts.append(("esc", False))
+    if S["edit"]:
+        parts = [("/ " + S["q"] + "▏", True), ("Enter search" + (" wallhaven" if on else " local"), False), ("esc cancel", False)]
+    elif S["active"]:
+        parts = [(f"{state['target'] + 1}/{len(ITEMS)}", False), ("results: " + S["q"], True),
+                 ((S["msg"] or "Enter keep"), bool(S["msg"])), ("esc clear", False)]
+    elif S["msg"]:
+        parts = [(S["msg"], True), ("/ search", False)]
+    cr.select_font_face(rice.FONT, 0, 0); cr.set_font_size(13)
+    nm = cur["name"].replace("_", " ").replace("-", " ")
+    nm = nm[:40]
+    nw = cr.text_extents(nm).x_advance + 28
+    rice.rounded(cr, W / 2 - nw / 2, 110, nw, 24, 12)
+    cr.set_source_rgba(*rice.rgb(cc["accent"], 0.9)); cr.fill()
+    cr.set_source_rgba(*rice.rgb(cc["bg"], 1)); cr.move_to(W / 2 - nw / 2 + 14, 127); cr.show_text(nm)
+    cr.set_font_size(11)
+    sep, pad = 6, 9
+    widths = [cr.text_extents(p[0]).x_advance + 2 * pad for p in parts]
+    tot = sum(widths) + sep * (len(parts) - 1)
+    if tot > W - 24:      # too many chips: shrink the gaps and the padding
+        sep, pad = 3, 5
+        widths = [cr.text_extents(p[0]).x_advance + 2 * pad for p in parts]
+        tot = sum(widths) + sep * (len(parts) - 1)
+    x = W / 2 - tot / 2
+    for (txt, hi), wd in zip(parts, widths):
+        rice.rounded(cr, x, H - 31, wd, 22, 11)
+        cr.set_source_rgba(*rice.rgb(cc["accent"] if hi else cc["fg"], 0.28 if hi else 0.09)); cr.fill()
+        cr.set_source_rgba(*rice.rgb(cc["accent2"] if hi else cc["fg"], 1 if hi else 0.7))
+        cr.move_to(x + pad, H - 16); cr.show_text(txt)
+        x += wd + sep
+
+
+draw.sk = False
+da.connect("draw", draw)
+g = rice.primary_geometry()
+X = g.x + (g.width - W) // 2
+YT = g.y + 58
+
+# ---- live preview: debounce, then apply on a worker thread so the carousel never stalls -------------
+applying = [None]
+dirty = [False]
+
+
+def apply_now():
+    pending[0] = None
+    if getattr(finish, "done", False):      # closing: never apply a preview after the revert
+        return False
+    if applying[0] and applying[0].is_alive():
+        dirty[0] = True
+        return False
+    item = ITEMS[state["target"]]
+
+    def work():
+        try:
+            themes.apply(item, final=False)
+        except Exception:
+            pass
+        if dirty[0] and not getattr(finish, "done", False):
+            dirty[0] = False
+            GLib.idle_add(apply_now)
+    applying[0] = threading.Thread(target=work, daemon=True)
+    applying[0].start()
+    return False
+
+
+def schedule():
+    if pending[0]:
+        GLib.source_remove(pending[0])
+    pending[0] = GLib.timeout_add(120, apply_now)
+
+
+syncing = [False]
+
+
+def sync_more():
+    """Online mode: download 10 more wallpapers in a thread; each one is spliced in as it lands."""
+    if syncing[0] or not _on[0]:
+        return
+    syncing[0] = True
+    state["sk"] = 10
+
+    def work():
+        try:
+            themes.sync(10, cb=lambda: GLib.idle_add(merge))
+        except Exception:
+            pass
+        GLib.idle_add(sync_done)
+    threading.Thread(target=work, daemon=True).start()
+
+
+def sync_done():
+    syncing[0] = False
+    state["sk"] = 0
+    da.queue_draw()
+    return False
+
+
+favview = [False]
+S = dict(edit=False, q="", active=False, msg="", paths=[], gen=0, page=1, busy=False, end=False)     # keyword search state
+
+
+def reload_items(keep=None):
+    cur = keep or ITEMS[state["target"]]["wall"]
+    its = themes.items(cur=PINNED) or ITEMS
+    if S["active"] and S["paths"]:
+        its = [themes.item_for(p) for p in S["paths"]]
+    elif favview[0]:
+        fl = favs.load().get("themes", [])
+        f = [it for it in its if it["wall"] in fl]
+        if f:
+            its = f
+        else:
+            favview[0] = False
+    ITEMS[:] = its
+    i = next((k for k, it in enumerate(ITEMS) if it["wall"] == cur), 0)
+    state["pos"] += i - state["target"]; state["target"] = i
+    want_thumbs()
+    da.queue_draw()
+
+
+mt = [None]
+
+
+def merge():
+    if state["sk"] > 0:
+        state["sk"] -= 1
+    if not mt[0]:
+        mt[0] = GLib.timeout_add(250, lambda: (mt.__setitem__(0, None), reload_items(), False)[2])
+    return False
+
+
+def search_run():
+    q = S["q"].strip()
+    if not q:
+        S["edit"] = False
+        return
+    ql = q.lower()
+    local = [it["wall"] for it in themes.items(cur=PINNED)
+             if ql in it["name"].lower() or ql in os.path.basename(it["wall"]).lower()]
+    S.update(edit=False, active=True, paths=list(local), msg="", gen=S["gen"] + 1, busy=False)
+    gen = S["gen"]
+    if local:
+        reload_items(); schedule()
+    if not _on[0]:
+        if not local:
+            S.update(active=False, msg="no local match, press o for online search")
+            da.queue_draw()
+        return
+    S.update(msg="searching…", page=0, end=False)
+    search_more(first_empty=not local)
+
+
+def search_more(first_empty=False):
+    """Fetch the next Wallhaven page of the active search (24 hits) and splice the hits in as they land."""
+    if S["busy"] or S["end"] or not _on[0] or not S["active"]:
+        return
+    S["busy"] = True; S["page"] += 1
+    gen, q, page = S["gen"], S["q"].strip(), S["page"]
+    state["sk"] = 6
+    first = [first_empty]
+
+    def land(p):
+        if S["gen"] != gen:
+            return
+        if p not in S["paths"]:
+            S["paths"].append(p)
+
+        def ui():
+            if S["gen"] != gen:
+                return False
+            if state["sk"] > 0:
+                state["sk"] -= 1
+            cur = ITEMS[state["target"]]["wall"]
+            reload_items(keep=cur if cur in S["paths"] else S["paths"][0])
+            if first[0]:
+                first[0] = False; schedule()
+            return False
+        GLib.idle_add(ui)
+
+    def work():
+        n = 0
+        try:
+            n = themes.search_wallhaven(q, 24, land, page)
+        except Exception:
+            pass
+
+        def done():
+            if S["gen"] == gen:
+                state["sk"] = 0
+                S["busy"] = False
+                if n < 0 or (n == 0 and page > 1):
+                    S["end"] = True
+                if not S["paths"]:
+                    S.update(active=False, msg="no results for " + q)
+                    reload_items()
+                else:
+                    S["msg"] = ""
+                da.queue_draw()
+            return False
+        GLib.idle_add(done)
+    threading.Thread(target=work, daemon=True).start()
+
+
+def search_clear():
+    S.update(edit=False, active=False, q="", msg="", paths=[], gen=S["gen"] + 1, busy=False, end=False)
+    state["sk"] = 0
+    reload_items(); schedule()
+
+
+def move(d):
+    n = max(0, min(len(ITEMS) - 1, state["target"] + d))      # clamp: never jump back to the start
+    state["target"] = n
+    want_thumbs()
+    if S["active"] and n >= len(ITEMS) - 6:
+        search_more()
+    if _on[0] and not favview[0] and not S["active"] and n >= len(ITEMS) - 8:
+        sync_more()
+    schedule()
+
+
+def tick():
+    changed = False
+    dp = state["target"] - state["pos"]
+    if abs(dp) > 0.002:
+        state["pos"] += dp * 0.28; changed = True
+    else:
+        state["pos"] = float(state["target"])
+    if changed or draw.sk:
+        da.queue_draw()
+    return True
+
+
+GHOST_K = 1.0      # measured: with the full alpha the growing ghost was ~3 brightness points lighter than the finished card (this card draws its own background)
+
+
+def ghost_fill():
+    bg = rice.rgb(win.c["bg"]); ac = rice.rgb(win.c["accent"])
+    if win.glass:
+        return tuple(rice.rgb(win.c["bg"])[:3]) + (win.alpha,)
+    return tuple(bg[:3]) + (1.0,)
+
+
+def restyle():
+    win.c = rice.colors(); win.glass = bool(win.c.get("glass", 1)); win.alpha = rice.glass_alpha(0.72) if win.glass else 1.0
+    win.fill_rgba = ghost_fill()
+    win.queue_draw()
+
+
+def toggle_glass():
+    settings.put("glass", not settings.get("glass"))
+    CC.clear()
+    themes.apply(ITEMS[state["target"]], final=False)      # recolours live
+    restyle()
+
+
+def toggle_online():
+    _on[0] = not _on[0]
+    settings.put("online", _on[0])
+    cur = ITEMS[state["target"]]["wall"]
+    ITEMS[:] = themes.items(cur=PINNED) or ITEMS
+    i = next((k for k, it in enumerate(ITEMS) if it["wall"] == cur), 0)
+    state["pos"], state["target"], state["sk"] = float(i), i, 0
+    want_thumbs()
+    sync_more()
+    da.queue_draw()
+
+
+def finish(keep):
+    if getattr(finish, "done", False):
+        return
+    finish.done = True
+    dirty[0] = False
+    if pending[0]:
+        GLib.source_remove(pending[0]); pending[0] = None
+    themes._log(f"finish keep={keep} orig={os.path.basename(orig['wall']) if orig else None}")
+    if keep:
+        it = ITEMS[state["target"]]
+        try:    # a kept online wallpaper is copied out of the rotating feed so prune() never deletes it
+            if os.path.dirname(it["wall"]) == themes.ONLINE:
+                import shutil
+                d = os.path.join(themes.WALLS, "saved"); os.makedirs(d, exist_ok=True)
+                dst = os.path.join(d, os.path.basename(it["wall"]))
+                if not os.path.exists(dst): shutil.copy2(it["wall"], dst)
+                it = dict(it, wall=dst, online=False)
+        except OSError:
+            pass
+        themes.apply(it)
+        if rice_on():  # rice mode: throw me into an empty workspace with the showcase apps
+            import subprocess
+            subprocess.Popen(["rice-scene"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif orig:
+        themes.apply(orig)
+    win.quit_anim()
+
+
+def key(w, e):
+    k = e.keyval
+    if S["edit"]:
+        if k == Gdk.KEY_Escape:
+            S.update(edit=False, q="")
+        elif k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            search_run()
+        elif k == Gdk.KEY_BackSpace:
+            S["q"] = S["q"][:-1]
+        elif k == Gdk.KEY_Right:
+            move(1)
+        elif k == Gdk.KEY_Left:
+            move(-1)
+        elif e.string and e.string.isprintable() and not (e.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK)):
+            S["q"] = (S["q"] + e.string)[:40]
+        da.queue_draw()
+        return True
+    if k == Gdk.KEY_slash:
+        S.update(edit=True, q="", msg="")
+        da.queue_draw()
+        return True
+    if k == Gdk.KEY_Escape and S["active"]:
+        search_clear()
+        return True
+    if k in (Gdk.KEY_Right, Gdk.KEY_l, Gdk.KEY_Down):
+        move(1)
+    elif k in (Gdk.KEY_Left, Gdk.KEY_h, Gdk.KEY_Up):
+        move(-1)
+    elif k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+        finish(True)
+    elif k == Gdk.KEY_Escape:
+        finish(False)
+    elif k == Gdk.KEY_s and _on[0]:
+        srcs = themes.SOURCES
+        themes.set_source(srcs[(srcs.index(themes.source()) + 1) % len(srcs)])
+        settings.put("source", themes.source())
+        reload_items()
+        sync_more()
+    elif k == Gdk.KEY_f:
+        favs.toggle("themes", ITEMS[state["target"]]["wall"])
+        if favview[0]:
+            reload_items()
+        da.queue_draw()
+    elif k == Gdk.KEY_v:
+        favview[0] = not favview[0]
+        reload_items()
+        schedule()
+    elif k == Gdk.KEY_o:
+        toggle_online()
+    elif k == Gdk.KEY_g:
+        toggle_glass()
+    elif k == Gdk.KEY_r:
+        settings.put("ricemode", not rice_on())
+        da.queue_draw()
+    return True
+
+
+def click(w, e):
+    d = round((e.x - W / 2) / 112)
+    if d == 0:
+        finish(True)
+    elif abs(d) <= 3:
+        move(d)
+    return True
+
+
+def scroll(w, e):
+    move(1 if e.direction in (Gdk.ScrollDirection.DOWN, Gdk.ScrollDirection.RIGHT) else -1)
+    return True
+
+
+win.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.SCROLL_MASK)
+win.connect("key-press-event", key)
+win.connect("button-press-event", click)
+win.connect("scroll-event", scroll)
+win.fill_rgba = ghost_fill()
+win.move(X, YT)
+win.show_all()
+
+
+def grab():
+    seat = Gdk.Display.get_default().get_default_seat()
+    r = seat.grab(win.get_window(), Gdk.SeatCapabilities.KEYBOARD, False, None, None, None)
+    if r == Gdk.GrabStatus.SUCCESS:
+        return False
+    grab.n += 1
+    return grab.n < 30
+
+
+grab.n = 0
+GLib.timeout_add(30, grab)
+GLib.timeout_add(16, tick)
+sync_more()  # online mode only: 10 on open
+signal.signal(signal.SIGTERM, lambda *a: finish(False))
+Gtk.main()
+for _f in (PID, os.path.expanduser("~/.cache/rice/pinned")):
+    try: os.remove(_f)
+    except OSError: pass

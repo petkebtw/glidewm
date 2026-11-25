@@ -1,0 +1,4 @@
+#!/bin/sh
+# Steam's CEF web views render on the GPU and make picom's animations choppy
+# (cards and windows drop to ~25 fps while the Steam window is open). Software web views fix it.
+exec /usr/bin/steam -cef-disable-gpu "$@"

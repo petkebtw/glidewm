@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""scglass: lightweight transparent SoundCloud client (GTK4 + WebKitGTK 6)."""
+import os, sys, json
+os.environ.setdefault("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+from urllib.parse import quote, urlparse
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("WebKit", "6.0")
+from gi.repository import Gtk, Gdk, GLib, Gio, WebKit
+
+ALPHA = float(os.environ.get("SCGLASS_ALPHA", "0.55"))  # panel opacity (0 clear, 1 solid)
+HOME = os.path.expanduser("~")
+DATA = os.path.join(HOME, ".local/share/scglass")
+CACHE = os.path.join(HOME, ".cache/scglass")
+STATE = os.path.join(CACHE, "state.json")
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+      "Version/18.0 Safari/605.1.15")
+INAPP = ("soundcloud.com", "sndcdn.com", "google.com", "gstatic.com", "apple.com",
+         "facebook.com", "recaptcha.net", "hcaptcha.com", "cloudflare.com")
+
+CSS = """
+:root { --g: rgba(16,16,22,__A__); --g2: rgba(255,255,255,.06); }
+html, body, #app, #content, .l-container, .l-product-banners, .l-fluid-fixed,
+.l-listen-hero, .l-main, .listenEngagement, .lazyLoadingList, .systemPlaylistBannerItem,
+.paging-eventually-loading, .sc-bg-white, .g-all-transitions-300 { background: transparent !important; }
+body { color: #eee !important; }
+
+/* force dark glass: strip solid backgrounds from structural elements (images/buttons keep theirs) */
+html, body, div, section, main, header, nav, aside, footer, article, ul, ol, li, form, table, tr, td { background-color: transparent !important; }
+div, span, p, h1, h2, h3, h4, h5, h6, li, label, td, th, a, em, strong, small, time { color: #ececf1 !important; }
+body { background: rgba(14,14,20,__A__) !important; }
+input, textarea { background: rgba(255,255,255,.08) !important; color: #fff !important; }
+
+/* header: slim glass bar */
+.header { background: var(--g) !important; border: 0 !important; box-shadow: none !important; }
+.header__logo, .header__logoLink { opacity: .9; }
+.header__upload, .header__goUpsell, .header__goPlus, .header__moreButton,
+.header__soundInput + .header__goUpsell, .upsellBanner, .l-product-banners,
+.header__navMenu li:nth-child(n+4):not(.header__userNavItem) { display: none !important; }
+.header__search, .header__searchBox, .headerSearch__input, .header__searchBox input {
+  background: var(--g2) !important; border: 0 !important; border-radius: 10px !important; color: #fff !important; }
+
+/* decruft: right sidebar, ads, promos, upsells, footer */
+.l-sidebar-right, .sidebarModule, .adBanner, .sc-ad, 
+.listenInfinite__sidebar, .footer, .l-footer, .announcements, .cookieBanner { display: none !important; }
+
+/* tidy header search */
+.header__search, .header__searchWrapper, .header__middle > * { background: transparent !important; box-shadow: none !important; }
+.headerSearch__input, .header__search input { background: rgba(255,255,255,.09) !important; border-radius: 999px !important; padding-left: 16px !important; }
+.compactTrackList, .compactTrackList__item, .compactTrackList__listContainer, .systemPlaylistTrackList {
+  background: rgba(255,255,255,.045) !important; border-radius: 12px !important; }
+.compactTrackList__item:hover { background: rgba(255,255,255,.09) !important; }
+.sc-artwork, .image__full, .image, .sound__artwork, .searchItem img { border-radius: 12px !important; }
+
+/* modern surfaces */
+.sound, .soundList__item, .trackItem, .userItem, .playlistItem, .systemPlaylistTrackList,
+.soundBadgeList__item, .compactTrackList__item {
+  border-radius: 12px !important; border-color: transparent !important; }
+.soundList__item, .trackList__item { background: var(--g2) !important; margin: 4px 0 !important;
+  padding: 8px 10px !important; }
+.soundList__item:hover, .trackList__item:hover { background: rgba(255,255,255,.11) !important; }
+.sc-artwork, .image__full, .image__lightOutline, .sound__artwork { border-radius: 10px !important; }
+.sc-border-light-bottom, .sc-border-light-top, .sc-border-light, hr { border-color: rgba(255,255,255,.07) !important; }
+.sc-text-primary, .soundTitle__title, .soundTitle__username, a { color: #f2f2f5 !important; }
+.sc-text-secondary, .sc-text-h4, .soundContext__usernameLink { color: #b9b9c6 !important; }
+button, .sc-button, .sc-button-small, .sc-button-medium, .sc-button-large, .sc-button-follow, a.sc-button {
+  background: rgba(255,255,255,.10) !important; border: 0 !important; border-radius: 999px !important;
+  color: #f2f2f5 !important; box-shadow: none !important; -webkit-appearance: none !important; appearance: none !important; }
+button:hover, .sc-button:hover { background: rgba(255,255,255,.18) !important; }
+.sc-button-selected, .sc-button-following { background: rgba(255,85,0,.25) !important; color: #ff8a4d !important; }
+.sc-button-cta, .sc-button-primary, .playButton.sc-button-play, .sc-button-play { background: #ff5500 !important; color: #fff !important; }
+.sc-classic .sc-button-like.sc-button-selected, .sc-button-selected { color: #ff5500 !important; }
+.waveform, .waveform__layer { opacity: .95; }
+
+/* bottom player: floating glass pill */
+.playControls { background: transparent !important; border: 0 !important; }
+.playControls__inner { background: rgba(16,16,22,.72) !important; border-radius: 16px !important;
+  margin: 0 12px 10px !important; max-width: none !important; height: 56px !important;
+  box-shadow: 0 6px 24px rgba(0,0,0,.35) !important; }
+.playControls__bg { background: transparent !important; }
+.playControls .playbackTimeline__progressBackground, .playbackTimeline__progressWrapper { border-radius: 4px !important; }
+.playControls .playbackSoundBadge__avatar, .playControls .sc-artwork { border-radius: 8px !important; }
+
+/* thin scrollbars */
+::-webkit-scrollbar { width: 8px; height: 8px; background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 8px; }
+""".replace("__A__", str(ALPHA))
+
+FOCUS_SEARCH = ("(()=>{const i=document.querySelector('.headerSearch__input,"
+                ".header__searchBox input,input[type=search]');if(i){i.focus();i.select();}})()")
+
+REJECT = """(()=>{const t=()=>{const b=[...document.querySelectorAll('button')].find(x=>/^\\s*reject all\\s*$/i.test(x.textContent));if(b){b.click();return true}};
+let n=0;const i=setInterval(()=>{if(t()||++n>40)clearInterval(i)},500)})()"""
+
+
+DUMP = """(()=>{const o=[];const w=(e,d)=>{if(d>5)return;const r=e.getBoundingClientRect();o.push(' '.repeat(d)+e.tagName.toLowerCase()+(e.id?'#'+e.id:'')+'.'+String(e.className).split(' ').slice(0,3).join('.')+' '+Math.round(r.width)+'x'+Math.round(r.height));[...e.children].slice(0,8).forEach(c=>w(c,d+1))};w(document.body,0);return o.join('\\n')})()"""
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {"w": 1100, "h": 760}
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="dev.scglass.App",
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.win = None
+
+    def do_command_line(self, cl):
+        args = cl.get_arguments()[1:]
+        self.activate()
+        if args:
+            self.view.load_uri("https://soundcloud.com/search?q=" + quote(" ".join(args)))
+        return 0
+
+    def do_activate(self):
+        if self.win:
+            self.win.present()
+            return
+        os.makedirs(DATA, exist_ok=True)
+        os.makedirs(CACHE, exist_ok=True)
+        st = load_state()
+
+        prov = Gtk.CssProvider()
+        prov.load_from_string("window.scglass, window.scglass > * { background: transparent; box-shadow: none; }")
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        session = WebKit.NetworkSession.new(DATA, CACHE)
+        session.get_cookie_manager().set_accept_policy(WebKit.CookieAcceptPolicy.ALWAYS)
+
+        ucm = WebKit.UserContentManager()
+        ucm.add_style_sheet(WebKit.UserStyleSheet.new(
+            CSS, WebKit.UserContentInjectedFrames.TOP_FRAME, WebKit.UserStyleLevel.USER, None, None))
+
+        ucm.add_script(WebKit.UserScript.new(
+            REJECT, WebKit.UserContentInjectedFrames.TOP_FRAME, WebKit.UserScriptInjectionTime.END, None, None))
+
+        v = WebKit.WebView(network_session=session, user_content_manager=ucm)
+        s = v.get_settings()
+        s.set_user_agent(UA)
+        s.set_enable_webgl(False)
+        s.set_enable_page_cache(False)
+        s.set_enable_developer_extras(False)
+        s.set_enable_smooth_scrolling(False)
+        s.set_enable_write_console_messages_to_stdout(False)
+        s.set_media_playback_requires_user_gesture(False)
+        clear = Gdk.RGBA()
+        clear.parse("rgba(0,0,0,0)")
+        v.set_background_color(clear)
+        v.connect("decide-policy", self.on_policy)
+        self.view = v
+
+        def kick(*_):
+            for ms in (300, 1200, 3500, 8000):
+                GLib.timeout_add(ms, lambda: (v.queue_draw(), False)[1])
+        v.connect("load-changed", lambda w, ev: kick() if ev in (
+            WebKit.LoadEvent.COMMITTED, WebKit.LoadEvent.FINISHED) else None)
+
+        win = Gtk.ApplicationWindow(application=self, title="SoundCloud")
+        win.add_css_class("scglass")
+        win.set_default_size(st.get("w", 1100), st.get("h", 760))
+        win.set_decorated(False)
+        win.set_child(v)
+        win.connect("close-request", self.on_close)
+
+        keys = Gtk.ShortcutController()
+        keys.set_scope(Gtk.ShortcutScope.GLOBAL)
+        def sc(trig, fn):
+            keys.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string(trig),
+                                               Gtk.CallbackAction.new(lambda *_: (fn(), True)[1])))
+        sc("<Control>k", lambda: v.evaluate_javascript(FOCUS_SEARCH, -1))
+        sc("slash", lambda: None)
+        sc("<Control>r", v.reload)
+        sc("<Alt>Left", v.go_back)
+        sc("<Alt>Right", v.go_forward)
+        sc("<Control>q", win.close)
+        win.add_controller(keys)
+
+        if os.environ.get("SCGLASS_DEBUG"):
+            def dbg():
+                v.evaluate_javascript(os.environ.get("SCGLASS_EVAL", DUMP), -1, None, None, None,
+                    lambda o, r, *a: print("DBG", o.evaluate_javascript_finish(r).to_string(), flush=True))
+                return True
+            GLib.timeout_add_seconds(6, dbg)
+        if os.environ.get("SCGLASS_SNAP"):
+            def snap():
+                js = os.environ.get("SCGLASS_JS")
+                if js:
+                    v.evaluate_javascript(js, -1)
+                def go():
+                    def done(o, r, *a):
+                        o.get_snapshot_finish(r).save_to_png(os.environ["SCGLASS_SNAP"])
+                        print("SNAP saved", flush=True)
+                        self.quit()
+                    v.get_snapshot(WebKit.SnapshotRegion.VISIBLE, WebKit.SnapshotOptions.NONE, None, done)
+                    return False
+                GLib.timeout_add_seconds(3, go)
+                return False
+            GLib.timeout_add_seconds(int(os.environ.get("SCGLASS_SNAPWAIT", "15")), snap)
+        v.load_uri("https://soundcloud.com/")
+        win.present()
+        self.win = win
+
+    def on_policy(self, view, decision, dtype):
+        if dtype == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
+            act = decision.get_navigation_action()
+            if act.is_user_gesture():
+                uri = act.get_request().get_uri()
+                host = urlparse(uri).hostname or ""
+                if not any(host == h or host.endswith("." + h) for h in INAPP) and uri.startswith("http"):
+                    Gio.AppInfo.launch_default_for_uri(uri, None)
+                    decision.ignore()
+                    return True
+        return False
+
+    def on_close(self, win):
+        try:
+            json.dump({"w": win.get_width(), "h": win.get_height()}, open(STATE, "w"))
+        except Exception:
+            pass
+        return False
+
+
+if __name__ == "__main__":
+    GLib.set_prgname("SCGlass")
+    GLib.set_application_name("SoundCloud")
+    sys.exit(App().run(sys.argv))

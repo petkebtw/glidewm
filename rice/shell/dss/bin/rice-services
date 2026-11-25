@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""rice-services: switch things on and off (Settings > Services).
+
+  rice-services state                     JSON for the settings app
+  rice-services set KEY on|off            wifi bluetooth sound mic airplane network dnd awake nightlight
+  rice-services unit NAME start|stop|restart
+  rice-services is KEY                    "true" / "false" (KEY, or profile:NAME), for the notification center
+  rice-services toggle KEY                flip a switch (the notification center buttons use this)
+  rice-services profile power-saver|balanced|performance|get
+  rice-services bar                       {network, wifi, bluetooth, dnd}: the little the bar shows, cheap (V4.96)
+  rice-services pp state|start            power modes: JSON {installed, running, profiles, active, why}; start the daemon
+  rice-services session lock|suspend|logout|reboot|poweroff   (the last three ask first)
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+BIN = HOME + "/.local/bin"
+NIGHT = HOME + "/.config/rice/nightlight"
+# shown in "System services": name, scope, label, what it does
+UNITS = [
+    ("NetworkManager", "system", "Network", "Wi-Fi and wired connections"),
+    ("bluetooth", "system", "Bluetooth", "Bluetooth devices"),
+    ("pipewire", "user", "Sound server", "PipeWire: all audio"),
+    ("wireplumber", "user", "Sound sessions", "WirePlumber: picks speakers and microphones"),
+    ("power-profiles-daemon", "system", "Power profiles", "Balanced, power saver, performance"),
+    ("cups", "system", "Printing", "CUPS print server"),
+]
+
+
+def run(cmd, timeout=6):
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def out(cmd, timeout=6):
+    r = run(cmd, timeout)
+    return r.stdout.strip() if r and r.returncode == 0 else ""
+
+
+def bg(cmd):
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
+def wifi_on():
+    return out(["nmcli", "radio", "wifi"]) == "enabled"
+
+
+def network_on():
+    return out(["nmcli", "networking"]) == "enabled"
+
+
+def bt_on():
+    return "Powered: yes" in out(["bluetoothctl", "show"], 4)
+
+
+def muted(target):
+    return "MUTED" in out(["wpctl", "get-volume", target])
+
+
+def shell_notify():
+    """the shell shows notifications itself (rice-cc engine shell): Do Not Disturb lives in cc.json"""
+    try:
+        return json.load(open(os.path.expanduser("~/.config/rice/cc.json"))).get("engine") == "shell"
+    except Exception:
+        return False
+
+
+def dnd_on():
+    if shell_notify():
+        try:
+            return json.load(open(os.path.expanduser("~/.config/rice/cc.json"))).get("dnd") is True
+        except Exception:
+            return False
+    return out(["swaync-client", "-D", "-sw"], 2) == "true"
+
+
+def awake_on():
+    st = out([BIN + "/rice-hotcorner", "state"], 6) if os.access(BIN + "/rice-hotcorner", os.X_OK) else ""
+    try:
+        return json.loads(st).get("awake") is True
+    except Exception:
+        return False
+
+
+NIRI = bool(os.environ.get("NIRI_SOCKET"))
+
+
+def night_on():
+    # Hyprland: hyprsunset; niri: gammastep (niri has the gamma protocol it uses, not Hyprland's)
+    for n in ("hyprsunset", "gammastep"):
+        r = run(["pgrep", "-x", n])
+        if r and r.returncode == 0:
+            return True
+    return False
+
+
+def unit_state(name, scope):
+    cmd = ["systemctl"] + (["--user"] if scope == "user" else []) + ["show", name, "-p", "LoadState,ActiveState,UnitFileState"]
+    r = run(cmd, 4)
+    if not r or r.returncode != 0:
+        return {"installed": False, "active": False, "enabled": False}
+    kv = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+    return {"installed": kv.get("LoadState") == "loaded", "active": kv.get("ActiveState") == "active",
+            "enabled": kv.get("UnitFileState") in ("enabled", "static", "alias", "indirect", "generated")}
+
+
+def state():
+    have = {t: shutil.which(t) is not None for t in ("nmcli", "bluetoothctl", "wpctl", "swaync-client", "hyprsunset", "systemctl")}
+    if NIRI:
+        have["hyprsunset"] = shutil.which("gammastep") is not None     # the night light (Settings shows it by this name)
+    s = {
+        "have": have,
+        "wifi": wifi_on() if have["nmcli"] else False,
+        "network": network_on() if have["nmcli"] else False,
+        "bluetooth": bt_on() if have["bluetoothctl"] else False,
+        "sound": (not muted("@DEFAULT_AUDIO_SINK@")) if have["wpctl"] else False,
+        "mic": (not muted("@DEFAULT_AUDIO_SOURCE@")) if have["wpctl"] else False,
+        "dnd": dnd_on() if (have["swaync-client"] or shell_notify()) else False,
+        "awake": awake_on(),
+        "nightlight": night_on(),
+    }
+    s["profile"] = profile_get()
+    # "powerprofilesctl": power modes work (over D-Bus too, so tuned-ppd counts)
+    s["have"]["powerprofilesctl"] = bool(s["profile"])
+    s["airplane"] = have["nmcli"] and not s["wifi"] and not s["bluetooth"] and out(["nmcli", "radio", "wwan"]) != "enabled"
+    try:
+        s["night_temp"] = int(open(NIGHT).read().strip() or 4500)
+    except Exception:
+        s["night_temp"] = 4500
+    s["units"] = []
+    for name, scope, label, desc in UNITS:
+        u = unit_state(name, scope) if have["systemctl"] else {"installed": False, "active": False, "enabled": False}
+        if u["installed"]:
+            s["units"].append(dict(u, name=name, scope=scope, label=label, desc=desc))
+    print(json.dumps(s))
+
+
+def bar_state():
+    """V4.96: what the bar, the side bar and the dock show (Wi-Fi, Bluetooth, Do not disturb), with two small asks
+    at most. The bar asked for the whole state every 8 seconds: about 18 programs (nmcli three times, bluetoothctl,
+    wpctl twice, systemctl six times, pgrep, busctl, rice-hotcorner ...)"""
+    s = {"network": False, "wifi": False, "bluetooth": False, "dnd": False}
+    if shutil.which("nmcli"):
+        g = out(["nmcli", "-t", "-f", "NETWORKING,WIFI", "general"], 4).split(":")
+        s["network"] = len(g) > 0 and g[0] == "enabled"
+        s["wifi"] = len(g) > 1 and g[1] == "enabled"
+    # Bluetooth: the adapter's Powered over D-Bus (bluetoothctl starts a whole session for it)
+    bt = ""
+    if shutil.which("busctl"):
+        try:
+            hcis = sorted(d for d in os.listdir("/sys/class/bluetooth") if d.startswith("hci") and ":" not in d)
+        except OSError:
+            hcis = []
+        if hcis:
+            bt = out(["busctl", "--system", "get-property", "org.bluez", "/org/bluez/" + hcis[0], "org.bluez.Adapter1", "Powered"], 3)
+            s["bluetooth"] = bt.strip() == "b true"
+    elif shutil.which("bluetoothctl"):
+        s["bluetooth"] = bt_on()
+    if shell_notify():
+        s["dnd"] = dnd_on()
+    elif shutil.which("swaync-client"):
+        s["dnd"] = dnd_on()
+    print(json.dumps(s))
+
+
+def setv(key, on):
+    if key == "wifi":
+        run(["nmcli", "radio", "wifi", "on" if on else "off"], 10)
+    elif key == "network":
+        run(["nmcli", "networking", "on" if on else "off"], 10)
+    elif key == "bluetooth":
+        if on and shutil.which("rfkill"):
+            run(["rfkill", "unblock", "bluetooth"])
+        run(["bluetoothctl", "power", "on" if on else "off"], 8)
+    elif key == "sound":
+        run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0" if on else "1"])
+    elif key == "mic":
+        run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "0" if on else "1"])
+    elif key == "airplane":
+        # everything wireless off (or back on)
+        run(["nmcli", "radio", "all", "off" if on else "on"], 10)
+        if on:
+            run(["bluetoothctl", "power", "off"], 8)
+        else:
+            if shutil.which("rfkill"):
+                run(["rfkill", "unblock", "bluetooth"])
+            run(["bluetoothctl", "power", "on"], 8)
+    elif key == "dnd":
+        if shell_notify():
+            run([BIN + "/rice-cc", "dnd", "on" if on else "off"])
+        else:
+            run(["swaync-client", "-dn" if on else "-df", "-sw"])
+    elif key == "awake":
+        if awake_on() != on:
+            run([BIN + "/rice-hotcorner", "awake"], 6)
+    elif key == "nightlight":
+        run(["pkill", "-x", "hyprsunset"])
+        run(["pkill", "-x", "gammastep"])
+        try:
+            t = int(open(NIGHT).read().strip() or 4500)
+        except Exception:
+            t = 4500
+        if on and NIRI and shutil.which("gammastep"):
+            bg(["gammastep", "-m", "wayland", "-O", str(t)])
+        elif on and shutil.which("hyprsunset"):
+            bg(["hyprsunset", "-t", str(t)])
+    else:
+        sys.exit("unknown switch: " + key)
+
+
+def is_on(key):
+    if key.startswith("profile:"):
+        return profile_get() == key.split(":", 1)[1]
+    f = {"wifi": wifi_on, "network": network_on, "bluetooth": bt_on, "dnd": dnd_on, "awake": awake_on, "nightlight": night_on,
+         "sound": lambda: not muted("@DEFAULT_AUDIO_SINK@"), "mic": lambda: not muted("@DEFAULT_AUDIO_SOURCE@")}.get(key)
+    try:
+        return bool(f()) if f else False
+    except Exception:
+        return False
+
+
+# power-profiles-daemon (or tuned-ppd, which answers the same way) over D-Bus with busctl: powerprofilesctl is a
+# Python script that breaks when python-gobject is missing, and tuned-ppd has none (V4.94: then Settings > Home
+# said "not running" and "Turn on" did nothing)
+PP_BUS = [("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles", "net.hadess.PowerProfiles"),
+          ("org.freedesktop.UPower.PowerProfiles", "/org/freedesktop/UPower/PowerProfiles",
+           "org.freedesktop.UPower.PowerProfiles")]
+PP_NAMES = ("power-saver", "balanced", "performance")
+
+
+def pp_bus(prop):
+    for name, path, iface in PP_BUS:
+        r = out(["busctl", "--system", "get-property", name, path, iface, prop], 4)
+        if r:
+            return r, (name, path, iface)
+    return "", None
+
+
+def pp_state():
+    import re
+    active, where = pp_bus("ActiveProfile")
+    profiles = []
+    if where:
+        allp, _ = pp_bus("Profiles")
+        profiles = [p for p in re.findall(r'"Profile" s "([a-z-]+)"', allp) if p in PP_NAMES]
+        m = re.search(r'"([a-z-]+)"', active)
+        active = m.group(1) if m else ""
+    elif shutil.which("powerprofilesctl"):
+        lst = out(["powerprofilesctl", "list"], 4)
+        profiles = re.findall(r"^[*\s]*(power-saver|balanced|performance):\s*$", lst, re.M)
+        active = out(["powerprofilesctl", "get"], 4) if profiles else ""
+    profiles = [p for p in PP_NAMES if p in profiles]
+    installed = bool(where or profiles or shutil.which("powerprofilesctl") or any(os.path.exists(f) for f in (
+        "/usr/lib/systemd/system/power-profiles-daemon.service", "/etc/systemd/system/power-profiles-daemon.service",
+        "/usr/libexec/power-profiles-daemon", "/usr/lib/power-profiles-daemon")))
+    why = ""
+    if installed and not profiles and os.path.isdir("/run/systemd/system"):
+        r = run(["systemctl", "is-enabled", "power-profiles-daemon.service"])
+        if r and r.stdout.strip() == "masked":
+            why = "masked"
+        for c in ("tlp", "auto-cpufreq", "tuned"):
+            r = run(["systemctl", "is-active", c + ".service"])
+            if r and r.stdout.strip() == "active":
+                why = c
+    return {"installed": installed, "running": bool(profiles), "profiles": profiles, "active": active, "why": why}
+
+
+def pp_start():
+    """turns power-profiles-daemon on now and at every start (asks for your password), then waits for it"""
+    import time
+    st = pp_state()
+    if st["running"]:
+        print("ok")
+        return
+    if st["why"] in ("tlp", "auto-cpufreq", "tuned"):
+        print("conflict:" + st["why"])
+        sys.exit(3)
+    if os.path.isdir("/run/systemd/system"):
+        cmd = ["pkexec", "sh", "-c", "systemctl unmask power-profiles-daemon.service >/dev/null 2>&1; "
+               "systemctl enable --now power-profiles-daemon.service"]
+    else:
+        cmd = ["pkexec", BIN + "/rice-sys", "service-enable", "power-profiles-daemon"]
+    # a password prompt needs a polkit agent: start one if none runs
+    if subprocess.run(["pgrep", "-u", str(os.getuid()), "-f", "polkit.*agent|hyprpolkitagent|polkit-gnome-authentication"],
+                      capture_output=True).returncode != 0:
+        r = run(["systemctl", "--user", "start", "hyprpolkitagent.service"], 8)
+        if r is None or r.returncode != 0:
+            for a in ("/usr/lib/hyprpolkitagent/hyprpolkitagent", "/usr/libexec/hyprpolkitagent",
+                      "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1",
+                      "/usr/libexec/polkit-gnome-authentication-agent-1", "/usr/lib/polkit-kde-authentication-agent-1"):
+                if os.access(a, os.X_OK):
+                    bg([a])
+                    break
+        time.sleep(0.8)
+    r = run(cmd, 120)
+    if r is None or r.returncode != 0:
+        print("fail:" + ((r.stderr.strip().splitlines() or [""])[-1] if r else "pkexec not found"))
+        sys.exit(1)
+    for _ in range(25):
+        if pp_state()["running"]:
+            print("ok")
+            return
+        time.sleep(0.2)
+    print("fail:the service started but gives no power modes")
+    sys.exit(1)
+
+
+def profile_get():
+    st = pp_state()
+    return st["active"] or ("balanced" if st["running"] else "")
+
+
+def profile_set(name):
+    if name not in ("power-saver", "balanced", "performance"):
+        sys.exit("profile: power-saver|balanced|performance")
+    if not pp_state()["running"]:
+        bg(["notify-send", "-a", "DarkShadow's Shell", "Power modes need power-profiles-daemon",
+            "Install it (Arch: power-profiles-daemon, NixOS: services.power-profiles-daemon.enable)"])
+        return
+    _, where = pp_bus("ActiveProfile")
+    if where:
+        r = run(["busctl", "--system", "set-property", where[0], where[1], where[2], "ActiveProfile", "s", name], 10)
+        if r and r.returncode == 0:
+            return
+    r = run(["powerprofilesctl", "set", name], 10)
+    if r is None or r.returncode != 0:
+        bg(["notify-send", "-a", "DarkShadow's Shell", "Could not switch the power mode",
+            (r.stderr.strip() if r else "") or "Is power-profiles-daemon running?"])
+
+
+def confirm(question):
+    """a small yes / no question (zenity); without zenity: yes"""
+    if not shutil.which("zenity"):
+        return True
+    try:
+        r = subprocess.run(["zenity", "--question", "--title", "DarkShadow's Shell", "--text", question, "--ok-label", "Yes",
+                            "--cancel-label", "No"], capture_output=True, timeout=60)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def session(what):
+    if not shell_notify():
+        run(["swaync-client", "-cp", "-sw"])     # close the notification center first
+    if what == "lock":
+        rp = os.path.expanduser("~/.local/bin/rice-power")
+        if os.path.exists(rp):
+            bg([rp, "lock"])
+        elif shutil.which("hyprlock"):
+            if out(["pidof", "hyprlock"]) == "":
+                bg(["hyprlock"])
+        else:
+            run(["loginctl", "lock-session"])
+    elif what == "suspend":
+        run([HOME + "/.local/bin/rice-sys", "suspend"], 10)
+    elif what == "logout":
+        if confirm("Log out?"):
+            run([os.path.expanduser("~/.local/bin/rice-wm"), "exit"])      # Hyprland or niri
+    elif what == "reboot":
+        if confirm("Restart?"):
+            run([HOME + "/.local/bin/rice-sys", "reboot"], 10)
+    elif what == "poweroff":
+        if confirm("Shut down?"):
+            run([HOME + "/.local/bin/rice-sys", "poweroff"], 10)
+    else:
+        sys.exit("session: lock|suspend|logout|reboot|poweroff")
+
+
+def main(a):
+    cmd = a[1] if len(a) > 1 else ""
+    if cmd == "state":
+        state()
+    elif cmd == "set" and len(a) > 3:
+        setv(a[2], a[3].lower() in ("1", "on", "true", "yes"))
+    elif cmd == "is" and len(a) > 2:
+        print("true" if is_on(a[2]) else "false")
+    elif cmd == "toggle" and len(a) > 2:
+        if a[2].startswith("profile:"):
+            # a power mode button: always switches to that mode (pressing the lit one keeps it)
+            profile_set(a[2].split(":", 1)[1])
+            return
+        st = os.environ.get("SWAYNC_TOGGLE_STATE", "")
+        setv(a[2], (st == "true") if st in ("true", "false") else not is_on(a[2]))
+    elif cmd == "profile" and len(a) > 2:
+        if a[2] == "get":
+            print(profile_get())
+        else:
+            profile_set(a[2])
+    elif cmd == "bar":
+        bar_state()
+    elif cmd == "pp" and len(a) > 2 and a[2] == "state":
+        print(json.dumps(pp_state()))
+    elif cmd == "pp" and len(a) > 2 and a[2] == "start":
+        pp_start()
+    elif cmd == "session" and len(a) > 2:
+        session(a[2])
+    elif cmd == "night-temp" and len(a) > 2:
+        t = max(2500, min(6500, int(float(a[2]))))
+        os.makedirs(os.path.dirname(NIGHT), exist_ok=True)
+        open(NIGHT, "w").write(str(t))
+        if night_on():
+            setv("nightlight", True)
+    elif cmd == "unit" and len(a) > 3 and a[3] in ("start", "stop", "restart"):
+        names = {u[0]: u[1] for u in UNITS}
+        if a[2] not in names:
+            sys.exit("unknown service: " + a[2])
+        # system services ask for your password (polkit); user services do not
+        cmd = ["systemctl"] + (["--user"] if names[a[2]] == "user" else []) + [a[3], a[2]]
+        r = run(cmd, 60)
+        if r is None or r.returncode != 0:
+            sys.exit((r.stderr.strip() if r else "systemctl not found") or "failed")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

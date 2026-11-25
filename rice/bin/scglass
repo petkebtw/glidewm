@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""scglass: transparent, blurred-glass SoundCloud client (PyQt6 + QtWebEngine)."""
+import os, re, sys, json, socket, struct, threading, time, itertools
+from urllib.parse import quote, urlparse
+
+ALPHA = float(os.environ.get("SCGLASS_ALPHA", "0.55"))  # panel opacity (0 clear, 1 solid)
+HOME = os.path.expanduser("~")
+DATA = os.path.join(HOME, ".local/share/scglass-qt")
+CACHE = os.path.join(HOME, ".cache/scglass")
+STATE = os.path.join(CACHE, "state.json")
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/130.0.0.0 Safari/537.36")
+INAPP = ("soundcloud.com", "sndcdn.com", "google.com", "gstatic.com", "apple.com",
+         "facebook.com", "recaptcha.net", "hcaptcha.com", "cloudflare.com")
+
+# low-RAM chromium flags
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", " ".join([
+    "--process-per-site", "--renderer-process-limit=2", "--disable-features=TranslateUI,MediaRouter,OptimizationHints",
+    "--disable-background-networking", "--disable-sync", "--no-first-run", "--disable-breakpad",
+    "--js-flags=--max-old-space-size=256"]))
+
+from PyQt6.QtCore import Qt, QUrl, QTimer, QDateTime
+from PyQt6.QtNetwork import QNetworkCookie
+from PyQt6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
+from PyQt6.QtWidgets import QApplication, QMainWindow
+from PyQt6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile, QWebEngineScript,
+                                   QWebEngineSettings)
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+THEME = os.path.join(os.path.dirname(os.path.realpath(__file__)), "scglass-theme.css")
+CSS = open(os.environ.get("SCGLASS_THEME", THEME)).read()
+SUBCSS = open(os.path.join(os.path.dirname(THEME), "scglass-sub.css")).read()
+
+REJECT = """(()=>{const t=()=>{const b=[...document.querySelectorAll('button')].find(x=>/^\\s*reject all\\s*$/i.test(x.textContent));if(b){b.click();return true}};
+let n=0;const i=setInterval(()=>{if(t()||++n>40)clearInterval(i)},500)})()"""
+
+FOCUS_SEARCH = ("(()=>{const i=document.querySelector('.headerSearch__input,"
+                ".header__searchBox input,input[type=search]');if(i){i.focus();i.select();}})()")
+
+
+# ---- Discord Rich Presence (raw IPC, no deps). Needs a Discord app id: env SCGLASS_DISCORD_ID or ~/.config/scglass/discord_id
+def _discord_id():
+    v = os.environ.get("SCGLASS_DISCORD_ID")
+    if v:
+        return v.strip()
+    try:
+        return open(os.path.join(HOME, ".config/scglass/discord_id")).read().strip()
+    except Exception:
+        return ""
+
+
+class DiscordRPC:
+    def __init__(self, cid):
+        self.cid, self.sock, self.lock, self.last = cid, None, threading.Lock(), None
+
+    def _paths(self):
+        base = [os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid(), "/tmp"]
+        for b in base:
+            for sub in ("", "app/com.discordapp.Discord/", "snap.discord/", ".flatpak/dev.vencord.Vesktop/xdg-run/"):
+                for i in range(10):
+                    yield "%s/%sdiscord-ipc-%d" % (b, sub, i)
+
+    def _send(self, op, data):
+        b = json.dumps(data).encode()
+        self.sock.sendall(struct.pack("<II", op, len(b)) + b)
+
+    def _recv(self):
+        h = self.sock.recv(8)
+        if len(h) < 8:
+            raise OSError("closed")
+        _, n = struct.unpack("<II", h)
+        buf = b""
+        while len(buf) < n:
+            c = self.sock.recv(n - len(buf))
+            if not c:
+                raise OSError("closed")
+            buf += c
+        return json.loads(buf)
+
+    def _connect(self):
+        for p in self._paths():
+            if not os.path.exists(p):
+                continue
+            try:
+                s = socket.socket(socket.AF_UNIX)
+                s.settimeout(3)
+                s.connect(p)
+                self.sock = s
+                self._send(0, {"v": 1, "client_id": self.cid})
+                self._recv()
+                return True
+            except Exception:
+                self.sock = None
+        return False
+
+    def set(self, activity):
+        """activity: dict or None (clear). Safe to call from any thread; never raises."""
+        with self.lock:
+            if activity == self.last:
+                return
+            for _ in range(2):
+                try:
+                    if not self.sock and not self._connect():
+                        return
+                    self._send(1, {"cmd": "SET_ACTIVITY", "nonce": str(time.time()),
+                                   "args": {"pid": os.getpid(), "activity": activity}})
+                    self._recv()
+                    self.last = activity
+                    return
+                except Exception:
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
+
+
+def _secs(t):
+    try:
+        parts = [int(x) for x in t.strip().split(":")]
+    except Exception:
+        return None
+    n = 0
+    for x in parts:
+        n = n * 60 + x
+    return n
+
+
+NOWPLAYING = """(()=>{const q=s=>document.querySelector(s);const b=q('.playbackSoundBadge');if(!b)return null;
+const t=q('.playbackSoundBadge__titleLink');if(!t)return null;
+const a=q('.playbackSoundBadge__lightLink');const art=q('.playbackSoundBadge .image__lightOutline span, .playbackSoundBadge .sc-artwork span');
+const m=art&&(art.style.backgroundImage||'').match(/url\\("?([^")]+)"?\\)/);
+const tx=s=>{const e=q(s+' span[aria-hidden=true]')||q(s);return e?e.textContent:''};
+return JSON.stringify({title:t.getAttribute('title')||t.textContent.trim(),artist:a?a.textContent.trim():'',
+url:t.href,art:m?m[1].replace(/-t\\d+x\\d+/,'-t500x500'):'',playing:!!q('.playControls__play.playing'),
+pos:tx('.playbackTimeline__timePassed'),dur:tx('.playbackTimeline__duration')})})()"""
+
+
+def start_rpc(page):
+    cid = _discord_id()
+    if not cid:
+        print("scglass: no Discord app id (set SCGLASS_DISCORD_ID or ~/.config/scglass/discord_id); RPC off", file=sys.stderr)
+        return None
+    rpc = DiscordRPC(cid)
+
+    def push(act):  # socket IO off the UI thread
+        threading.Thread(target=rpc.set, args=(act,), daemon=True).start()
+
+    def got(r):
+        try:
+            d = json.loads(r) if r else None
+        except Exception:
+            d = None
+        if not d or not d.get("playing"):
+            return push(None)
+        act = {"type": 2, "details": d["title"][:128], "state": ("by " + d["artist"])[:128] if d["artist"] else "SoundCloud",
+               "assets": {"large_text": "SoundCloud"}, "buttons": [{"label": "Listen on SoundCloud", "url": d["url"]}]}
+        if d.get("art", "").startswith("http"):
+            act["assets"]["large_image"] = d["art"]
+        pos, dur = _secs(d.get("pos", "")), _secs(d.get("dur", ""))
+        if pos is not None and dur:
+            now = int(time.time())
+            act["timestamps"] = {"start": now - pos, "end": now - pos + dur}
+        push(act)
+
+    t = QTimer(page)
+    t.timeout.connect(lambda: page.runJavaScript(NOWPLAYING, got))
+    t.start(5000)
+    QApplication.instance().aboutToQuit.connect(lambda: rpc.set(None))
+    return rpc
+
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {"w": 1100, "h": 760}
+
+
+class Page(QWebEnginePage):
+    def acceptNavigationRequest(self, url, typ, is_main):
+        host = url.host()
+        if (not self.popup and typ == QWebEnginePage.NavigationType.NavigationTypeLinkClicked and url.scheme().startswith("http")
+                and not any(host == h or host.endswith("." + h) for h in INAPP)):
+            QDesktopServices.openUrl(url)
+            return False
+        return super().acceptNavigationRequest(url, typ, is_main)
+
+    popup = False
+    _keep = []
+
+    def createWindow(self, _type):  # OAuth / target=_blank popups: real window, same profile (opener link kept)
+        v = QWebEngineView()
+        p = Page(self.profile(), v)
+        p.popup = True
+        v.setPage(p)
+        v.setWindowTitle("Sign in")
+        v.resize(520, 700)
+        Page._keep.append(v)
+        p.windowCloseRequested.connect(v.close)
+        v.destroyed.connect(lambda *_: Page._keep.remove(v) if v in Page._keep else None)
+        v.show()
+        return p
+
+
+def add_script(profile, name, src, when, sub=False):
+    sc = QWebEngineScript()
+    sc.setName(name)
+    sc.setSourceCode(src)
+    sc.setInjectionPoint(when)
+    sc.setWorldId(QWebEngineScript.ScriptWorldId.ApplicationWorld)
+    sc.setRunsOnSubFrames(sub)
+    profile.scripts().insert(sc)
+
+
+def main():
+    os.makedirs(DATA, exist_ok=True)
+    os.makedirs(CACHE, exist_ok=True)
+    app = QApplication(sys.argv)
+    app.setApplicationName("SCGlass")
+    app.setDesktopFileName("scglass")
+
+    profile = QWebEngineProfile("scglass", app)
+    profile.setPersistentStoragePath(DATA)
+    profile.setCachePath(os.path.join(CACHE, "web"))
+    profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+    profile.setHttpCacheMaximumSize(80 * 1024 * 1024)
+    profile.setHttpUserAgent(re.sub(r" QtWebEngine/\S+", "", profile.httpUserAgent()))  # keep real Chrome version, drop Qt token
+    st = profile.settings()
+    for a, v in ((QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False),
+                 (QWebEngineSettings.WebAttribute.WebGLEnabled, False),
+                 (QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, False),
+                 (QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False),
+                 (QWebEngineSettings.WebAttribute.ErrorPageEnabled, False)):
+        st.setAttribute(a, v)
+
+    style = ("(()=>{const s=document.createElement('style');s.id='scglass';if(!/(^|\\.)(soundcloud\\.com|sndcdn\\.com)$/.test(location.hostname))return;s.textContent=(window===window.top)?%s:%s;"
+             "(document.head||document.documentElement).appendChild(s)})()" % (json.dumps(CSS), json.dumps(SUBCSS)))
+    add_script(profile, "css", style, QWebEngineScript.InjectionPoint.DocumentReady, sub=True)
+    add_script(profile, "reject", REJECT, QWebEngineScript.InjectionPoint.DocumentReady)
+
+    imp = os.path.join(DATA, "import_cookies.json")  # one-shot cookie import (e.g. from Mullvad/Firefox)
+    if os.path.exists(imp):
+        try:
+            store = profile.cookieStore()
+            if os.environ.get('SCGLASS_EVAL'):
+                store.cookieAdded.connect(lambda c: print('ADDED', bytes(c.name()).decode(), c.domain(), flush=True))
+            for c in json.load(open(imp)):
+                ck = QNetworkCookie(c["name"].encode(), c["value"].encode())
+                ck.setDomain(c["domain"]); ck.setPath(c["path"])
+                ck.setSecure(c["secure"]); ck.setHttpOnly(c["httponly"])
+                exp = c["expiry"]
+                if exp > 1e11:
+                    exp //= 1000
+                if exp > 0:
+                    ck.setExpirationDate(QDateTime.fromSecsSinceEpoch(exp))
+                store.setCookie(ck, QUrl("https://" + c["domain"].lstrip(".") + "/"))
+            os.remove(imp)
+        except Exception as e:
+            print("cookie import failed:", e)
+
+    view = QWebEngineView()
+    page = Page(profile, view)
+    page.setBackgroundColor(QColor(0, 0, 0, 0))
+    view.setPage(page)
+    view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    view.setStyleSheet("background: transparent")
+
+    win = QMainWindow()
+    win.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    win.setWindowTitle("SoundCloud")
+    win.setCentralWidget(view)
+    s = load_state()
+    win.resize(max(s.get("w", 1100), 800), max(s.get("h", 760), 600))
+
+    def sc(keys, fn):
+        QShortcut(QKeySequence(keys), win).activated.connect(fn)
+    sc("Ctrl+K", lambda: page.runJavaScript(FOCUS_SEARCH))
+    sc("Ctrl+R", view.reload)
+    sc("Alt+Left", view.back)
+    sc("Alt+Right", view.forward)
+    sc("Ctrl+Q", win.close)
+
+    def save():
+        try:
+            json.dump({"w": win.width(), "h": win.height()}, open(STATE, "w"))
+        except Exception:
+            pass
+    app.aboutToQuit.connect(save)
+
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    view.load(QUrl(args[0] if args[0].startswith("http") else "https://soundcloud.com" + args[0]) if args and args[0].startswith(("http", "/"))
+              else QUrl("https://soundcloud.com/search?q=" + quote(" ".join(args))) if args
+              else QUrl("https://soundcloud.com/"))
+    if os.environ.get("SCGLASS_EVAL"):
+        QTimer.singleShot(int(os.environ.get("SCGLASS_WAIT", "12")) * 1000,
+                          lambda: page.runJavaScript(os.environ["SCGLASS_EVAL"], lambda r: (print("EVAL", r, flush=True), app.quit())))
+    if os.environ.get("SCGLASS_SHOT"):
+        def shot():
+            js = os.environ.get("SCGLASS_JS")
+            if js:
+                page.runJavaScript(js)
+            QTimer.singleShot(2500, lambda: (view.grab().save(os.environ["SCGLASS_SHOT"]), app.quit()))
+        QTimer.singleShot(int(os.environ.get("SCGLASS_WAIT", "14")) * 1000, shot)
+    start_rpc(page)
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

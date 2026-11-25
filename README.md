@@ -222,10 +222,11 @@ The whole desktop from the screenshots is in [`rice/`](rice):
 
 | Path | What |
 | --- | --- |
-| `rice/bin` | 41 commands: `rice-*`, `dwm-status`, `dwm-volume`, `audio-fix`, `clip-daemon`, `polkit-agent`, `rofi-launcher`, `screenshot.sh` ... |
+| `rice/bin` | 50 commands: `rice-*`, `theme-switch`, `scglass` (glass SoundCloud client), `dwm-status`, `dwm-volume`, `audio-fix`, `clip-daemon`, `polkit-agent`, `rofi-launcher`, `screenshot.sh`, `steam`/`dolphin` wrappers ... |
 | `rice/lib` | the Python library they share: `themes.py` (palette), `designs.py`, `hooks.py` (per-app theme apply), `rice.py`, `widgets.py`, `settings.py` ... |
 | `rice/shell` | `port.sh`, `dss-start`, `Wm.dwm.qml`, patches: builds DarkShadow's Shell for Quickshell on X11 |
-| `rice/config` | `rice.conf` (picom), `binds.conf` (runtime keys), `xprofile.example` |
+| `rice/shell/dss` | the shell itself (MIT, see its `LICENSE`): `quickshell/` QML for `rice-desktop` (bar, widgets, menus, panels), `rice-apps` (files, apps), `rice-settings`, `rice-lockscreen`, `rice-welcome`, `hyprquickpaper`; `bin/` helpers, `qml/` X11 shims, `sounds/` |
+| `rice/config` | `rice.conf` (picom), `binds.conf` (runtime keys), `rofi/*.rasi`, `xprofile.example` |
 
 ```sh
 sudo emerge dev-python/pygobject x11-misc/rofi x11-misc/picom   # or your distro's equivalents
@@ -236,9 +237,10 @@ cp config/xprofile.example ~/.xprofile   # then edit monitors, wallpaper, layout
 Needs Python 3, PyGObject (GTK 3), `python-pillow`, cairo bindings, `rofi`, `picom`, `feh`, `xdotool`, `maim`, `xclip`, `pipewire` with
 `wpctl`, `tesseract` (OCR) and `ffmpeg` (recorder, convert). The helpers need no build step.
 
-The QML shell is DarkShadow's Shell, which is not copied here. Put its source in `~/.local/share/dss/src`, install
-[Quickshell](https://quickshell.org) built for X11 (`gui-apps/quickshell` with `X`, without `layer-shell`), then run
-`~/.local/share/dss/port.sh`. It rebuilds `~/.config/quickshell` from that source with the X11 and mwm changes applied.
+The QML shell is a copy of [DarkShadow's Shell](https://github.com/shadowww-dev/DarkShadowShell) (MIT, by shadowww-dev) in
+`rice/shell/dss`; `install.sh` links it to `~/.local/share/dss`. Install [Quickshell](https://quickshell.org) built for X11
+(`gui-apps/quickshell` with `X`, without `layer-shell`), then run `~/.local/share/dss/port.sh`. It rebuilds
+`~/.config/quickshell` from that source with the X11 and mwm changes applied. Start it with `~/.local/share/dss/dss-start`.
 
 `rice-dl` needs a [cobalt](https://github.com/imputnet/cobalt) API URL: put it in `~/.cache/rice/cobalt_url`.
 

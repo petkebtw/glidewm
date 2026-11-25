@@ -1,0 +1,424 @@
+import Quickshell
+import Quickshell.Io
+import QtQuick
+
+// Settings > Desktop > Look & Feel: fastfetch (the logo and the info a terminal shows), the shell your terminals
+// start and the terminal the keys open (rice-look). The top shows your terminal with fastfetch in it, as it is.
+Item {
+    id: page
+    property var ctl
+    property var st: ({ fetch: {}, shell: { list: [] }, terminal: { list: [] } })
+    property var pv: ({ html: "", error: "", logo: "", bg: "#101014", fg: "#e5e3e3" })
+    readonly property var ff: st.fetch || {}
+    readonly property string shellNow: st.shell ? (st.shell.current || "") : ""
+    readonly property string termNow: st.terminal ? (st.terminal.current || "") : ""
+    readonly property string filesNow: st.files ? (st.files.current || "") : ""
+    readonly property var termInfo: {
+        const l = st.terminal && st.terminal.list ? st.terminal.list : []
+        for (let i = 0; i < l.length; i++) if (l[i].id === termNow) return l[i]
+        return null
+    }
+    property string busy: ""                 // what is being changed (its card shows a spinner)
+
+    // V4.98 Minimal mode (rice-minimal)
+    property var mn: ({ on: false, frame: "double", width: 3, solid: false, bar: true })
+    function setMin(args) {
+        const m = Object.assign({}, mn)
+        if (args[0] === "on" || args[0] === "off") m.on = args[0] === "on"
+        else if (args[0] === "set") m[args[1]] = args[1] === "width" ? Number(args[2]) : (args[1] === "frame" ? args[2] : args[2] === "on")
+        mn = m
+        if (args[0] === "on" || args[0] === "off") { M3.sq = m.on }      // Settings turns square at once
+        minSet.command = ["bash", "-c", "\"$HOME/.local/bin/rice-minimal\" \"$@\" 2>&1 | tail -1", "_"].concat(args.map(a => String(a)))
+        minSet.running = true
+    }
+    Process {
+        id: minState
+        command: ["bash", "-c", "\"$HOME/.local/bin/rice-minimal\" state"]
+        running: true
+        stdout: StdioCollector { onStreamFinished: { try { page.mn = JSON.parse(text) } catch (e) { } } }
+    }
+    Process {
+        id: minSet
+        onExited: minState.running = true
+        stdout: StdioCollector { onStreamFinished: if (text.trim()) page.ctl.status = text.trim() }
+    }
+
+    function look(args, what) {
+        busy = what || ""
+        setProc.command = ["bash", "-c", "\"$HOME/.local/bin/rice-look\" \"$@\" 2>&1", "_"].concat(args.map(a => String(a)))
+        setProc.running = true
+    }
+    function setFetch(k, v) {
+        const f = Object.assign({}, ff); f[k] = (k === "on_open") ? (v === "on") : v
+        const s = Object.assign({}, st); s.fetch = f; st = s
+        look(["fetch", k, v])
+    }
+    Process {
+        id: stateProc
+        command: ["bash", "-c", "\"$HOME/.local/bin/rice-look\" state"]
+        running: true
+        stdout: StdioCollector { onStreamFinished: { try { page.st = JSON.parse(text) } catch (e) { } } }
+    }
+    Process {
+        id: pvProc
+        command: ["bash", "-c", "\"$HOME/.local/bin/rice-look\" preview"]
+        running: true
+        stdout: StdioCollector { onStreamFinished: { try { page.pv = JSON.parse(text) } catch (e) { } } }
+    }
+    Process {
+        id: setProc
+        stdout: StdioCollector {
+            onStreamFinished: {
+                const l = text.trim().split("\n").pop()
+                if (l) page.ctl.status = l
+                page.busy = ""
+                again.restart()
+            }
+        }
+    }
+    Timer { id: again; interval: 250; onTriggered: { stateProc.running = true; if (!pvProc.running) pvProc.running = true } }
+    // after an install in the terminal: look again now and then while the page is open
+    Timer { interval: 5000; repeat: true; running: page.visible && page.waiting; onTriggered: stateProc.running = true }
+    property bool waiting: false
+
+    component Tile: Rectangle {
+        id: tl
+        property string name: ""
+        property string desc: ""
+        property string icon: ""
+        property string fallbackIcon: "utilities-terminal"
+        property string glyph: ""
+        property bool on: false
+        property bool installed: true
+        property bool working: false
+        signal picked()
+        signal install()
+        width: (parent.width - 2 * 10) / 3
+        height: 132
+        radius: M3.sq ? 0 : (on ? 28 * M3.shapeK : 18 * M3.shapeK)
+        Behavior on radius { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+        color: on ? M3.primaryContainer : (tm.containsMouse ? M3.surfaceHigh : M3.surfaceC)
+        Behavior on color { ColorAnimation { duration: 160 } }
+        border.width: on ? 2 : 0
+        border.color: M3.primary
+        Item {
+            id: ic
+            x: 16; y: 16; width: 40; height: 40
+            Image {
+                id: im
+                anchors.fill: parent
+                visible: tl.icon !== "" && status === Image.Ready
+                source: tl.icon !== "" ? Icons.get(tl.icon, tl.fallbackIcon) : ""
+                sourceSize.width: 80; sourceSize.height: 80
+                asynchronous: true
+                opacity: tl.installed ? 1 : 0.45
+            }
+            Rectangle {
+                anchors.fill: parent
+                visible: !im.visible
+                radius: M3.sq ? 0 : (12 * M3.shapeK)
+                color: tl.on ? M3.primary : M3.surfaceHighest
+                T { anchors.centerIn: parent; text: tl.glyph !== "" ? tl.glyph : tl.name.charAt(0).toUpperCase()
+                    font.family: tl.glyph !== "" ? Fonts.icons : Fonts.title; font.pixelSize: 20; font.weight: Font.Bold
+                    color: tl.on ? M3.inkPrimary : M3.ink }
+            }
+        }
+        // in use / install
+        Rectangle {
+            anchors.right: parent.right; anchors.rightMargin: 12; y: 18
+            height: 26; radius: M3.sq ? 0 : (13)
+            width: chip.implicitWidth + 20
+            visible: tl.on || !tl.installed
+            color: tl.on ? M3.primary : (im2.containsMouse ? M3.surfaceBright : M3.surfaceHighest)
+            T { id: chip; anchors.centerIn: parent; font.pixelSize: 11; font.weight: Font.DemiBold
+                text: tl.working ? "…" : (tl.on ? I18n.t("In use") : I18n.t("Install")); color: tl.on ? M3.inkPrimary : M3.ink }
+            MouseArea { id: im2; anchors.fill: parent; hoverEnabled: true; enabled: !tl.on && !tl.installed
+                cursorShape: Qt.PointingHandCursor; onClicked: tl.install() }
+        }
+        Column {
+            x: 16; y: 68; width: parent.width - 32
+            spacing: 2
+            T { text: tl.name; font.pixelSize: 15; font.weight: Font.DemiBold; color: tl.on ? M3.inkPrimaryC : M3.ink }
+            T { kind: "reading"; text: I18n.t(tl.desc); width: parent.width; wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
+                font.pixelSize: 12; color: tl.on ? M3.alpha(M3.inkPrimaryC, 0.8) : M3.inkDim }
+        }
+        MouseArea {
+            id: tm; anchors.fill: parent; z: -1; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+            onClicked: { if (tl.installed) tl.picked(); else tl.install() }
+        }
+    }
+
+    PageScroll {
+        anchors.fill: parent
+
+        // ---------- your terminal, as it is ----------
+        Rectangle {
+            id: hero
+            width: parent.width
+            height: Math.max(240, Math.min(470, out.contentHeight + 96))
+            radius: M3.sq ? 0 : (M3.rXL)
+            color: M3.primaryContainer
+            clip: true
+            Blob { width: 260; height: 260; x: parent.width - 190; y: -70; kind: "cookie"; color: M3.alpha(M3.inkPrimaryC, 0.06) }
+            T { x: 22; y: 16; text: I18n.t("YOUR TERMINAL"); font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1.2
+                color: M3.alpha(M3.inkPrimaryC, 0.75) }
+            Row {
+                anchors.right: parent.right; anchors.rightMargin: 16; y: 10
+                spacing: 8
+                Btn { text: I18n.t("Open it"); sym: "terminal"; icon: ""; primary: true; onClicked: page.look(["try"]) }
+            }
+            // the window
+            Rectangle {
+                id: twin
+                x: 18; y: 50
+                width: parent.width - 36; height: parent.height - 68
+                radius: M3.sq ? 0 : (14)
+                color: page.pv.bg || "#101014"
+                border.width: 1; border.color: M3.alpha("#ffffff", 0.08)
+                clip: true
+                Row {
+                    x: 14; y: 11; spacing: 7
+                    Repeater { model: ["#ff5f57", "#febc2e", "#28c840"]; Rectangle { width: 11; height: 11; radius: M3.sq ? 0 : (6); color: modelData; opacity: 0.85 } }
+                }
+                T { anchors.horizontalCenter: parent.horizontalCenter; y: 8; font.pixelSize: 12; color: M3.alpha(page.pv.fg || "#e5e3e3", 0.6)
+                    text: (page.termInfo ? page.termInfo.name : page.termNow) + "  ·  " + page.shellNow }
+                T {
+                    id: prompt
+                    x: 16; y: 34
+                    scaled: false
+                    font.family: Fonts.mono; font.pixelSize: 12
+                    color: page.pv.fg || "#e5e3e3"
+                    text: I18n.t("󰉋 ~> fastfetch")
+                }
+                Row {
+                    x: 16; y: prompt.y + prompt.height + 6
+                    width: parent.width - 32
+                    spacing: 18
+                    Rectangle {
+                        visible: page.pv.logo !== ""
+                        width: visible ? 150 : 0; height: 150; radius: M3.sq ? 0 : (16); clip: true; color: "transparent"
+                        Image { anchors.fill: parent; source: page.pv.logo !== "" ? "file://" + page.pv.logo : ""; cache: false
+                            fillMode: Image.PreserveAspectCrop; sourceSize.width: 300 }
+                    }
+                    Flickable {
+                        id: out
+                        width: parent.width - (page.pv.logo !== "" ? 168 : 0)
+                        height: twin.height - prompt.y - prompt.height - 18
+                        contentWidth: txt.implicitWidth; contentHeight: txt.implicitHeight
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        T {
+                            id: txt
+                            scaled: false
+                            textFormat: Text.RichText
+                            font.family: Fonts.mono; font.pixelSize: 12
+                            lineHeight: 1.05
+                            color: page.pv.fg || "#e5e3e3"
+                            text: page.pv.html !== "" ? page.pv.html
+                                : (page.pv.error !== "" ? page.pv.error : "Loading ...")
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------- Minimal mode (V4.98) ----------
+        SectionTitle { text: I18n.t("Minimal mode"); sub: I18n.t("Square corners everywhere and plain window frames, like a classic floating window manager.") }
+        ToggleRow {
+            label: I18n.t("Minimal mode")
+            desc: I18n.t("Square windows, bar, dock, panels, menus, widgets and apps, without shadows")
+            sym: "crop_square"; lit: page.mn.on === true
+            checked: page.mn.on === true
+            onToggled: function(v) { page.setMin([v ? "on" : "off"]) }
+        }
+        SegRow {
+            visible: page.mn.on === true
+            label: I18n.t("Window frame")
+            desc: page.mn.frame === "double" ? I18n.t("Your theme color with a dark line outside it")
+                : (page.mn.frame === "single" ? I18n.t("Your theme color only") : I18n.t("One quiet line"))
+            options: [{ label: I18n.t("Double"), value: "double" }, { label: I18n.t("Single"), value: "single" }, { label: I18n.t("Thin"), value: "thin" }]
+            current: page.mn.frame || "double"
+            onChosen: function(v) { page.setMin(["set", "frame", v]) }
+        }
+        SliderRow {
+            visible: page.mn.on === true && page.mn.frame !== "thin"
+            label: I18n.t("Frame width")
+            desc: I18n.t("How thick the color frame of the windows is")
+            from: 1; to: 8; step: 1; unit: " px"
+            value: page.mn.width || 3
+            onCommitted: function(v) { page.setMin(["set", "width", Math.round(v)]) }
+        }
+        ToggleRow {
+            visible: page.mn.on === true
+            label: I18n.t("Solid windows")
+            desc: I18n.t("No transparency and no blur anywhere (the terminal too); the blur settings wait until it is off")
+            checked: page.mn.solid === true
+            onToggled: function(v) { page.setMin(["set", "solid", v ? "on" : "off"]) }
+        }
+        ToggleRow {
+            visible: page.mn.on === true
+            label: I18n.t("Flat bar")
+            desc: I18n.t("A flat bar along the edge with numbered workspaces; your bar comes back when Minimal mode is off")
+            checked: page.mn.bar !== false
+            onToggled: function(v) { page.setMin(["set", "bar", v ? "on" : "off"]) }
+        }
+
+        // ---------- fastfetch ----------
+        SectionTitle { text: I18n.t("Fastfetch"); sub: I18n.t("The logo and the facts about your computer that a terminal shows.") }
+        Rectangle {
+            visible: page.ff.installed === false
+            width: parent.width; height: 60; radius: M3.sq ? 0 : (M3.rL)
+            color: M3.surfaceC
+            T { x: 18; anchors.verticalCenter: parent.verticalCenter; text: I18n.t("fastfetch is not installed"); font.pixelSize: 14 }
+            Btn { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                text: I18n.t("Install"); sym: "download"; icon: ""; onClicked: { page.waiting = true; page.look(["install", "fastfetch"]) } }
+        }
+        Rectangle {
+            visible: page.ff.own === true
+            width: parent.width; height: 68; radius: M3.sq ? 0 : (M3.rL)
+            color: M3.tertiaryContainer
+            T { x: 18; width: parent.width - 220; anchors.verticalCenter: parent.verticalCenter; wrapMode: Text.WordWrap
+                text: I18n.t("You use your own fastfetch config: the choices below are saved but not used.")
+                font.pixelSize: 13; color: M3.inkTertiaryC }
+            Btn { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                text: I18n.t("Use DarkShadow's"); sym: "restart_alt"; icon: ""; onClicked: page.look(["fetch-own"]) }
+        }
+        ToggleRow {
+            label: I18n.t("Show it when a terminal opens")
+            desc: I18n.t("Every new terminal starts with fastfetch (fish, zsh and bash)")
+            checked: page.ff.on_open === true
+            onToggled: function(v) { page.setFetch("on_open", v ? "on" : "off") }
+        }
+        SegRow {
+            label: I18n.t("Logo")
+            desc: page.ff.logo === "wallpaper" && page.termInfo && !page.termInfo.images
+                ? page.termNow + I18n.t(" cannot show pictures: the moon shows instead") : I18n.t("Your distro's, small like pfetch, DarkShadow's moon or black hole, or your wallpaper")
+            options: [{ label: I18n.t("Distro"), value: "distro" }, { label: "pfetch", value: "small" }, { label: I18n.t("Moon"), value: "darkshadow" }, { label: I18n.t("Black hole"), value: "blackhole" },
+                      { label: I18n.t("Wallpaper"), value: "wallpaper" }, { label: I18n.t("None"), value: "none" }]
+            current: page.ff.logo || "distro"
+            onChosen: function(v) { page.setFetch("logo", v) }
+        }
+        SegRow {
+            label: I18n.t("Info")
+            desc: page.ff.logo === "small" ? I18n.t("pfetch style: a small logo and a short list (os, host, kernel, uptime, pkgs, memory)") : I18n.t("How much it tells")
+            options: [{ label: I18n.t("Everything"), value: "full" }, { label: I18n.t("The main"), value: "compact" }, { label: I18n.t("A little"), value: "minimal" }]
+            current: page.ff.info || "full"
+            onChosen: function(v) { page.setFetch("info", v) }
+        }
+        SegRow {
+            label: I18n.t("Labels")
+            desc: I18n.t("Words, or icons with the words")
+            options: [{ label: I18n.t("Words"), value: "text" }, { label: I18n.t("Icons"), value: "icons" }]
+            current: page.ff.labels || "text"
+            onChosen: function(v) { page.setFetch("labels", v) }
+        }
+        ToggleRow {
+            label: I18n.t("Wallpaper colors")
+            desc: I18n.t("The logo and the labels take the colors of your wallpaper")
+            checked: (page.ff.colors || "wallpaper") === "wallpaper"
+            onToggled: function(v) { page.setFetch("colors", v ? "wallpaper" : "plain") }
+        }
+
+        // ---------- shell ----------
+        SectionTitle { text: I18n.t("Shell"); sub: I18n.t("What you type commands into. New terminals start it, with the same prompt and colors.") }
+        Flow {
+            width: parent.width
+            spacing: 10
+            Repeater {
+                model: page.st.shell ? page.st.shell.list : []
+                delegate: Tile {
+                    name: modelData.name; desc: modelData.desc
+                    glyph: modelData.id === "fish" ? "\udb80\ude3a" : (modelData.id === "zsh" ? "\ue795" : "\uebca")
+                    on: page.shellNow === modelData.id
+                    installed: modelData.installed
+                    working: page.busy === modelData.id
+                    onPicked: if (!on) page.look(["shell", modelData.id], modelData.id)
+                    onInstall: { page.waiting = true; page.look(["install", modelData.id], modelData.id) }
+                }
+            }
+        }
+        SettingRow {
+            visible: page.st.shell && page.st.shell.login !== "" && page.st.shell.login !== page.shellNow
+            label: I18n.t("Your login shell is ") + (page.st.shell ? page.st.shell.login : "")
+            desc: I18n.t("Terminals start ") + page.shellNow + I18n.t("; make it your login shell too (it asks your password)")
+            reserved: 210
+            Btn { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                text: I18n.t("Use ") + page.shellNow + I18n.t(" everywhere"); sym: "key"; icon: ""; variant: "tonal"
+                onClicked: { page.waiting = true; page.look(["login-shell"]) } }
+        }
+
+        // ---------- terminal ----------
+        SectionTitle { text: I18n.t("Terminal"); sub: I18n.t("The app Super + Return opens, also for the Wi-Fi menu and updates. It gets your wallpaper colors, font and see-through background.") }
+        Flow {
+            width: parent.width
+            spacing: 10
+            Repeater {
+                model: page.st.terminal ? page.st.terminal.list : []
+                delegate: Tile {
+                    name: modelData.name
+                    desc: modelData.desc
+                    icon: modelData.app
+                    on: page.termNow === modelData.id
+                    installed: modelData.installed
+                    working: page.busy === modelData.id
+                    onPicked: if (!on) page.look(["terminal", modelData.id], modelData.id)
+                    onInstall: { page.waiting = true; page.look(["install", modelData.id], modelData.id) }
+                }
+            }
+        }
+        T {
+            visible: page.termNow === "wezterm" || page.termNow === "konsole"
+            width: parent.width; wrapMode: Text.WordWrap; topPadding: 4
+            text: (page.termInfo ? page.termInfo.name : page.termNow) + I18n.t(" keeps its own look and starts your login shell.")
+            color: M3.inkDim; font.pixelSize: 12
+        }
+
+        // ---------- file manager ----------
+        SectionTitle { text: I18n.t("File manager"); sub: I18n.t("The app Super + E opens, and every \"open folder\" from your other apps.") }
+        Flow {
+            width: parent.width
+            spacing: 10
+            Repeater {
+                model: page.st.files ? page.st.files.list : []
+                delegate: Tile {
+                    name: modelData.name
+                    desc: modelData.desc
+                    icon: modelData.app
+                    fallbackIcon: "system-file-manager"
+                    on: page.filesNow === modelData.id
+                    installed: modelData.installed
+                    working: page.busy === "files-" + modelData.id
+                    onPicked: if (!on) page.look(["files", modelData.id], "files-" + modelData.id)
+                    onInstall: { page.waiting = true; page.look(["install", modelData.id], "files-" + modelData.id) }
+                }
+            }
+        }
+        ToggleRow {
+            label: I18n.t("Our Photos, Music and Videos for your files")
+            desc: I18n.t("Pictures open in Photos, music in Music and videos in Videos (off: the apps you had before)")
+            checked: !!page.st.files && page.st.files.apps === true
+            onToggled: function(v) {
+                const s2 = Object.assign({}, page.st); s2.files = Object.assign({}, page.st.files || {}); s2.files.apps = v; page.st = s2
+                page.look(["apps-default", v ? "on" : "off"])
+            }
+        }
+        ToggleRow {
+            label: I18n.t("Colors from the wallpaper")
+            desc: I18n.t("The file manager and your other apps (GTK and KDE) follow the wallpaper. Open them again to see it")
+            checked: !page.st.files || page.st.files.colors !== false
+            onToggled: function(v) {
+                const s2 = Object.assign({}, page.st); s2.files = Object.assign({}, page.st.files || {}); s2.files.colors = v; page.st = s2
+                page.look(["files-colors", v ? "on" : "off"])
+            }
+        }
+        ToggleRow {
+            label: I18n.t("Glass and Material 3 shapes")
+            desc: I18n.t("Files is see-through with the blur behind it, with round pill rows and buttons. Open it again to see it")
+            checked: !page.st.files || page.st.files.glass !== false
+            onToggled: function(v) {
+                const s2 = Object.assign({}, page.st); s2.files = Object.assign({}, page.st.files || {}); s2.files.glass = v; page.st = s2
+                page.look(["files-glass", v ? "on" : "off"])
+            }
+        }
+    }
+}

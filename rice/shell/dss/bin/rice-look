@@ -1,0 +1,1107 @@
+#!/usr/bin/env python3
+"""rice-look: Settings > Desktop > Look & Feel: fastfetch, your shell and your terminal.
+
+  rice-look state                  JSON for Settings
+  rice-look fetch KEY VALUE        on_open on|off, logo distro|small|darkshadow|blackhole|wallpaper|none,
+                                   info full|compact|minimal, labels text|icons, colors wallpaper|plain
+  rice-look fetch-own              use DarkShadow's fastfetch config again (instead of your own)
+  rice-look preview                fastfetch as HTML (the preview in Settings)
+  rice-look shell fish|zsh|bash    the shell your terminals start
+  rice-look login-shell            make it your login shell too (opens a terminal: chsh asks your password)
+  rice-look terminal NAME          the terminal the keys open (kitty, foot, alacritty, ghostty, wezterm, konsole)
+  rice-look files NAME             the file manager (darkshadow, nautilus, thunar, nemo, dolphin, pcmanfm): SUPER + E and every
+                                   "open folder" (xdg-mime) open it
+  rice-look apps-default on|off    pictures, music and videos open in our Photos, Music and Videos (rice-app defaults)
+  rice-look files-colors on|off    the file manager (and the other GTK apps, Dolphin) in the wallpaper's colors
+  rice-look files-glass on|off     Files see-through (the compositor blurs behind it) with Material 3 shapes
+  rice-look files-theme            write those colors again (the wallpaper changed)
+  rice-look install NAME           install a shell, terminal or file manager (opens a terminal with the package manager)
+  rice-look try                    open your terminal with fastfetch in it
+  rice-look colors                 the wallpaper changed: the terminals' colors, fastfetch's colors and logo
+  rice-look apply                  write everything again from the saved choices (the installer runs this)
+
+Your shell and terminal get the wallpaper's colors, the monospace font (Settings > Appearance > Fonts) and the
+see-through background of kitty. Files that are yours (a foot.ini, alacritty.toml, ghostty config you wrote) are
+kept: the DarkShadow look goes in its own file that yours includes.
+"""
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+CFG = os.environ.get("XDG_CONFIG_HOME") or HOME + "/.config"
+RICE = CFG + "/rice"
+STATE = RICE + "/look.json"
+TERMFILE = RICE + "/terminal"
+FETCH_ON = RICE + "/fetch-on-open"
+BIN = HOME + "/.local/bin"
+CACHE = HOME + "/.cache/rice"
+FF_DIR = CFG + "/fastfetch"
+FF_CFG = FF_DIR + "/config.jsonc"
+MARK = "DarkShadow's Shell"
+
+SHELLS = [
+    {"id": "fish", "name": "fish", "desc": "Friendly: suggestions as you type, colors, no setup"},
+    {"id": "zsh", "name": "zsh", "desc": "Powerful and loved by tinkerers (Oh My Zsh, plugins)"},
+    {"id": "bash", "name": "bash", "desc": "The classic one, on every Linux"},
+]
+TERMS = [
+    {"id": "kitty", "name": "kitty", "app": "kitty", "desc": "Fast, images, tabs and splits", "images": True},
+    {"id": "foot", "name": "foot", "app": "foot", "desc": "Tiny and very quick to open", "images": False},
+    {"id": "alacritty", "name": "Alacritty", "app": "Alacritty", "desc": "Simple and fast (no tabs)", "images": False},
+    {"id": "ghostty", "name": "Ghostty", "app": "com.mitchellh.ghostty", "desc": "Modern, native and fast, images", "images": True},
+    {"id": "wezterm", "name": "WezTerm", "app": "org.wezfurlong.wezterm", "desc": "Tabs, splits, set up in Lua, images", "images": True},
+    {"id": "konsole", "name": "Konsole", "app": "org.kde.konsole", "desc": "KDE's terminal", "images": False},
+]
+# file managers: the binary, its .desktop file (the default for folders), its icon and its toolkit
+FILES = [
+    {"id": "darkshadow", "name": "Files", "app": "darkshadow-files", "desktop": "darkshadow-files.desktop",
+     "kit": "qs", "desc": "Ours: Material 3 in your wallpaper's colors, quick look, drag and drop"},
+    {"id": "nautilus", "name": "Nautilus", "app": "org.gnome.Nautilus", "desktop": "org.gnome.Nautilus.desktop",
+     "kit": "gtk", "desc": "GNOME's: clean, tabs, quick search"},
+    {"id": "thunar", "name": "Thunar", "app": "org.xfce.thunar", "desktop": "thunar.desktop",
+     "kit": "gtk", "desc": "Xfce's: light, fast, your own actions"},
+    {"id": "nemo", "name": "Nemo", "app": "nemo", "desktop": "nemo.desktop",
+     "kit": "gtk", "desc": "Cinnamon's: two panes, many options"},
+    {"id": "dolphin", "name": "Dolphin", "app": "system-file-manager", "desktop": "org.kde.dolphin.desktop",
+     "kit": "qt", "desc": "KDE's: split view, a terminal panel"},
+    {"id": "pcmanfm", "name": "PCManFM", "app": "system-file-manager", "desktop": "pcmanfm.desktop",
+     "kit": "gtk", "desc": "Tiny and very quick"},
+]
+FILESFILE = RICE + "/files"
+DEFAULTS = {"files": "", "files_colors": True, "files_glass": True, "shell": "", "terminal": "", "on_open": False, "logo": "distro", "info": "full", "labels": "text",
+            "colors": "wallpaper"}
+
+# ---------------------------------------------------------------- small helpers
+
+
+def load():
+    try:
+        j = json.load(open(STATE))
+    except Exception:
+        j = {}
+    c = dict(DEFAULTS)
+    c.update({k: v for k, v in j.items() if k in DEFAULTS})
+    return c
+
+
+def save(c):
+    os.makedirs(RICE, exist_ok=True)
+    tmp = STATE + ".tmp"
+    json.dump(c, open(tmp, "w"), indent=1)
+    os.replace(tmp, STATE)
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        if open(path).read() == text:
+            return False
+    except Exception:
+        pass
+    tmp = path + ".rice-tmp"
+    open(tmp, "w").write(text)
+    os.replace(tmp, path)
+    return True
+
+
+def read(path):
+    try:
+        return open(path).read()
+    except Exception:
+        return ""
+
+
+def run(cmd, t=8, env=None):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=t, env=env).stdout
+    except Exception:
+        return ""
+
+
+def spawn(cmd):
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
+def distro():
+    s = read("/etc/os-release")
+    ids = " ".join(re.findall(r'^(?:ID|ID_LIKE)="?([^"\n]*)"?', s, re.M)).lower()
+    if "nixos" in ids:
+        return "nixos"
+    if "arch" in ids or "cachyos" in ids:
+        return "arch"
+    if "fedora" in ids or "rhel" in ids:
+        return "fedora"
+    if "debian" in ids or "ubuntu" in ids:
+        return "debian"
+    if "void" in ids.split():
+        return "void"
+    return "other"
+
+
+def login_shell():
+    try:
+        import pwd
+        return os.path.basename(pwd.getpwuid(os.getuid()).pw_shell or "")
+    except Exception:
+        return os.path.basename(os.environ.get("SHELL", ""))
+
+
+def current_shell(c):
+    if c["shell"] and shutil.which(c["shell"]):
+        return c["shell"]
+    # what kitty starts now (the shell's kitty.conf says fish), else your login shell
+    m = re.findall(r"^\s*shell\s+(\S+)", read(CFG + "/kitty/kitty.conf"), re.M)
+    if m and m[-1] != ".":
+        return os.path.basename(m[-1])
+    return login_shell() or "bash"
+
+
+def current_term(c):
+    t = read(TERMFILE).strip() or c["terminal"]
+    if t and shutil.which(t):
+        return t
+    for x in TERMS:
+        if shutil.which(x["id"]):
+            return x["id"]
+    return "kitty"
+
+
+def mono_font():
+    try:
+        f = json.load(open(RICE + "/fonts.json")).get("mono")
+        if f:
+            return f
+    except Exception:
+        pass
+    return "JetBrainsMono Nerd Font"
+
+
+def opacity():
+    """kitty's see-through background (Settings and Light mode change it): the other terminals follow it"""
+    m = re.findall(r"^\s*background_opacity\s+([0-9.]+)", read(CFG + "/kitty/kitty.conf"), re.M)
+    try:
+        return max(0.1, min(1.0, float(m[-1]))) if m else 0.85
+    except Exception:
+        return 0.85
+
+
+def palette():
+    """the wallpaper's colors: matugen writes them for kitty on every wallpaper change"""
+    s = read(CFG + "/kitty/current-theme.conf")
+    p = {}
+    for k, v in re.findall(r"^\s*(\w+)\s+(#[0-9a-fA-F]{6})", s, re.M):
+        p[k] = v.lower()
+    base = ["#1c1b1f", "#ffb4ab", "#a6d189", "#e5c890", "#8caaee", "#f4b8e4", "#81c8be", "#c6d0f5"]
+    for i in range(16):
+        p.setdefault("color%d" % i, base[i % 8])
+    p.setdefault("foreground", p["color7"])
+    p.setdefault("background", p["color0"])
+    p.setdefault("cursor", p["color3"])
+    p.setdefault("selection_background", p["color3"])
+    p.setdefault("selection_foreground", p["color0"])
+    # the roles (the kitty template: 3 = primary, 4 = secondary, 2 = tertiary)
+    p["primary"], p["secondary"], p["tertiary"] = p["color3"], p["color4"], p["color2"]
+    return p
+
+
+def rgb(h):
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def ansi(h):
+    return "38;2;%d;%d;%d" % rgb(h)
+
+
+def version_of(prog):
+    """"fish 4.0.2", "kitty 0.39.1" ..."""
+    if not shutil.which(prog):
+        return prog
+    m = re.search(r"\d+(?:\.\d+)+", run([prog, "--version"], 4))
+    return "%s %s" % (prog, m.group(0)) if m else prog
+
+
+def wallpaper():
+    out = run(["awww", "query"], 3)
+    m = re.search(r"image: (.+)", out)
+    w = m.group(1).strip() if m else read(HOME + "/.cache/hyprquickpaper-current").strip()
+    return w if w and os.path.exists(w) else ""
+
+
+# ---------------------------------------------------------------- fastfetch
+
+ICONS = {
+    "os": "", "host": "\U000f0322", "kernel": "", "uptime": "\U000f0150", "packages": "\U000f03d6",
+    "shell": "", "display": "\U000f0379", "de": "", "wm": "", "wmtheme": "\U000f03d8",
+    "theme": "\U000f03d8", "icons": "", "font": "", "cursor": "\U000f01bf", "terminal": "",
+    "terminalfont": "", "cpu": "", "gpu": "\U000f08ae", "memory": "\U000f035b", "disk": "\U000f02ca",
+    "locale": "", "battery": "",
+}
+NAMES = {"os": "OS", "host": "Host", "kernel": "Kernel", "uptime": "Uptime", "packages": "Packages", "shell": "Shell",
+         "display": "Display", "de": "DE", "wm": "WM", "wmtheme": "WM Theme", "theme": "Theme", "icons": "Icons",
+         "font": "Font", "cursor": "Cursor", "terminal": "Terminal", "terminalfont": "Terminal Font", "cpu": "CPU",
+         "gpu": "GPU", "memory": "Memory", "disk": "Disk", "locale": "Locale", "battery": "Battery"}
+INFO = {
+    "full": ["title", "separator", "os", "host", "kernel", "uptime", "packages", "shell", "display", "de", "wm",
+             "wmtheme", "theme", "icons", "font", "cursor", "terminal", "terminalfont", "cpu", "gpu", "memory",
+             "disk", "locale", "break", "colors"],
+    "compact": ["title", "separator", "os", "kernel", "uptime", "packages", "shell", "wm", "terminal", "cpu", "gpu",
+                "memory", "break", "colors"],
+    "minimal": ["title", "os", "wm", "shell", "terminal", "memory"],
+}
+# DarkShadow's own logo: a crescent moon and a few stars ($1 the wallpaper's main color, $2 the second one)
+# DarkShadow's own logo: a crescent moon with craters and a few stars, about as big as a distro logo
+# ($1 the wallpaper's main color, $2 the second one for the craters, $3 the stars)
+DS_LOGO = "\n".join([
+    '    $3·         $1▄▄▄▄▄▄',
+    '         $1▄▄██████▀             $3✦',
+    '      $1▄▄███████▀',
+    '     $1███████$2██$1▀                   $3·',
+    '   $1▄███████$2██▀',
+    '   $1█████████$2█',
+    '  $1████$2██$1█████                $3·',
+    '  $1███████████',
+    '  $1███████$2█$1███▄',
+    '  $1█████$2█████$1██▄                   $3✧',
+    '  $1▀████$2█████$1███▄',
+    '   $1██████$2█$1███████▄',
+    '    $1▀████████$2███$1████▄▄      $3·',
+    '     $1▀███████$2███$1████████████▀',
+    '        $1▀████████████████▀       $3*',
+    '           $1▀▀▀██████▀▀▀',
+    '  $3·',
+])
+# DarkShadow's own logo: a black hole, its glowing disk in front of the shadow and a bright ring around it
+# ($1 the wallpaper's main color: the disk, $2 the second one: the ring, $3 the stars)
+BH_LOGO = "\n".join([
+    '                           $3·',
+    '  $3·                    $2▄▄▄▒▒▒▒▄▄▄',
+    '                    $2▄▒▒██████████▒▒▄                 $3✦',
+    '                  $2▄▒████▀▀    ▀▀████▒▄',
+    '     $3·           $2▄▒███▀          ▀███▒▄         $3*',
+    '      $1▄▄▄▄▄▄▄░░░░▒▒▒$2█              █$1▒▒▒░░░░▄▄▄▄▄▄▄',
+    ' $1▄░░░░▒▒▒▒▓▓▓█████$2██                ██$1█████▓▓▓▒▒▒▒░░░░▄',
+    ' $1▀░░░░▒▒▒▒▓▓▓████$2▒██$1▄▄            ▄▄$2██▒$1████▓▓▓▒▒▒▒░░░░▀',
+    '      $1▀▀▀▀▀▀▀░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░▀▀▀▀▀▀▀    $3·',
+    '  $3·              $2▀▒███▄          ▄███▒▀',
+    '                  $2▀▒████▄▄    ▄▄████▒▀',
+    '                    $2▀▒▒██████████▒▒▀',
+    '       $3✧               $2▀▀▀▒▒▒▒▀▀▀                 $3·',
+    '            $3·          ·                  ·',
+])
+# Small: like pfetch, a small logo and a few lines in lowercase
+PFETCH = ["title", "os", "host", "kernel", "uptime", "packages", "memory", "shell", "wm"]
+PF_KEYS = {"os": "os", "host": "host", "kernel": "kernel", "uptime": "uptime", "packages": "pkgs",
+           "memory": "memory", "shell": "shell", "wm": "wm"}
+LOGO_PNG = CACHE + "/fetch-logo.png"
+
+
+def is_ours(text):
+    """a fastfetch config the shell may write: none yet, ours, or the one older versions installed"""
+    if not text.strip():
+        return True
+    if MARK in text:
+        return True
+    try:
+        j = json.loads(re.sub(r"^\s*//.*$", "", text, flags=re.M))
+        return list(j.keys()) == ["$schema", "modules"] and j["modules"] == INFO["full"]
+    except Exception:
+        return False
+
+
+def make_logo_png(c):
+    w = wallpaper()
+    if not w:
+        return False
+    os.makedirs(CACHE, exist_ok=True)
+    vf = "crop='min(iw,ih)':'min(iw,ih)',scale=360:360"
+    if shutil.which("ffmpeg"):
+        run(["ffmpeg", "-y", "-loglevel", "error", "-i", w, "-vf", vf, "-frames:v", "1", LOGO_PNG], 20)
+    elif shutil.which("magick") or shutil.which("convert"):
+        m = shutil.which("magick") or shutil.which("convert")
+        run([m, w + "[0]", "-gravity", "center", "-thumbnail", "360x360^", "-extent", "360x360", LOGO_PNG], 20)
+    return os.path.exists(LOGO_PNG)
+
+
+def fetch_config(c, term, for_preview=False):
+    p = palette()
+    j = {"$schema": "https://github.com/fastfetch-cli/fastfetch/raw/master/doc/json_schema.json"}
+    logo = {"padding": {"top": 1, "right": 3, "left": 1}}
+    lg = c["logo"]
+    if lg == "wallpaper" and not (next((t["images"] for t in TERMS if t["id"] == term), False) and
+                                  (os.path.exists(LOGO_PNG) or make_logo_png(c))):
+        lg = "darkshadow"           # the terminal cannot show pictures
+    if for_preview and lg == "wallpaper":
+        lg = "none"                 # Settings shows the picture itself
+    if lg == "small":
+        logo["type"] = "small"
+    elif lg == "none":
+        logo = {"type": "none"}
+    elif lg == "darkshadow":
+        logo.update({"type": "data", "source": DS_LOGO})
+    elif lg == "blackhole":
+        logo.update({"type": "data", "source": BH_LOGO})
+    elif lg == "wallpaper":
+        logo.update({"type": "kitty-direct", "source": LOGO_PNG, "width": 28, "height": 14})
+    if c["colors"] == "wallpaper" and lg != "none":
+        logo["color"] = {"1": ansi(p["primary"]), "2": ansi(p["secondary"]), "3": ansi(p["tertiary"])}
+    j["logo"] = logo
+    disp = {"separator": "  " if c["labels"] == "icons" else ": "}
+    if c["colors"] == "wallpaper":
+        disp["color"] = {"keys": ansi(p["primary"]), "title": ansi(p["tertiary"])}
+    j["display"] = disp
+    mods = []
+    small = lg == "small"
+    if small:
+        disp["separator"] = "  "
+    for m in (PFETCH if small else INFO.get(c["info"], INFO["full"])):
+        if small and m in PF_KEYS:
+            k = PF_KEYS[m].ljust(7)
+            key = ("%s %s" % (ICONS[m], k)) if c["labels"] == "icons" else k
+        else:
+            key = "%s  %s" % (ICONS[m], NAMES[m]) if c["labels"] == "icons" and m in ICONS else None
+        if for_preview and m in ("shell", "terminal"):
+            # Settings runs fastfetch, not your terminal: show what a terminal will say
+            v = version_of(current_shell(c) if m == "shell" else term)
+            mods.append({"type": "custom", "key": key or NAMES[m], "format": v})
+        elif key:
+            mods.append({"type": m, "key": key})
+        else:
+            mods.append(m)
+    j["modules"] = mods
+    return "// %s: Settings > Desktop > Look & Feel writes this file. Your own: remove this line.\n%s\n" % (
+        MARK, json.dumps(j, indent=2, ensure_ascii=False))
+
+
+def apply_fetch(c, force=False):
+    term = current_term(c)
+    if c["logo"] == "wallpaper":
+        make_logo_png(c)
+    cur = read(FF_CFG)
+    if force or is_ours(cur):
+        write(FF_CFG, fetch_config(c, term))
+    # fastfetch when a terminal opens
+    if c["on_open"]:
+        write(FETCH_ON, "1\n")
+        apply_shell_files(current_shell(c))          # the shell's part that runs it
+    elif os.path.exists(FETCH_ON):
+        os.remove(FETCH_ON)
+    # older versions colored fastfetch with a fish function: the config does it now
+    old = CFG + "/fish/conf.d/matugen-fastfetch.fish"
+    if os.path.exists(old) and "command fastfetch" in read(old):
+        os.remove(old)
+
+
+SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def to_html(text, p):
+    """fastfetch's colored output as rich text for Settings"""
+    out = []
+    fg = bg = None
+    bold = False
+    pos = 0
+    names = [p["color%d" % i] for i in range(16)]
+
+    def emit(s):
+        if not s:
+            return
+        s = html.escape(s).replace(" ", "&nbsp;")
+        st = []
+        if fg:
+            st.append("color:" + fg)
+        if bg:
+            st.append("background-color:" + bg)
+        if bold:
+            st.append("font-weight:bold")
+        out.append('<span style="%s">%s</span>' % (";".join(st), s) if st else s)
+
+    text = re.sub(r"\x1b\[[0-9;?]*[A-HJKSTfhlsu]", "", text)          # cursor moves
+    for m in SGR_RE.finditer(text):
+        emit(text[pos:m.start()])
+        pos = m.end()
+        codes = [int(x) if x.isdigit() else 0 for x in (m.group(1) or "0").split(";")]
+        i = 0
+        while i < len(codes):
+            k = codes[i]
+            if k == 0:
+                fg = bg = None
+                bold = False
+            elif k == 1:
+                bold = True
+            elif k == 22:
+                bold = False
+            elif 30 <= k <= 37:
+                fg = names[k - 30]
+            elif 90 <= k <= 97:
+                fg = names[k - 90 + 8]
+            elif 40 <= k <= 47:
+                bg = names[k - 40]
+            elif 100 <= k <= 107:
+                bg = names[k - 100 + 8]
+            elif k == 39:
+                fg = None
+            elif k == 49:
+                bg = None
+            elif k in (38, 48) and i + 1 < len(codes):
+                if codes[i + 1] == 2 and i + 4 < len(codes):
+                    col = "#%02x%02x%02x" % tuple(codes[i + 2:i + 5])
+                    i += 4
+                elif codes[i + 1] == 5 and i + 2 < len(codes):
+                    n = codes[i + 2]
+                    col = names[n] if n < 16 else None
+                    i += 2
+                else:
+                    col = None
+                if k == 38:
+                    fg = col
+                else:
+                    bg = col
+            i += 1
+    emit(text[pos:])
+    return "".join(out).replace("\n", "<br>")
+
+
+def preview():
+    c = load()
+    if not shutil.which("fastfetch"):
+        return {"html": "", "error": "fastfetch is not installed"}
+    p = palette()
+    os.makedirs(CACHE, exist_ok=True)
+    cur = read(FF_CFG)
+    if is_ours(cur):
+        path = CACHE + "/fetch-preview.jsonc"
+        write(path, fetch_config(c, current_term(c), for_preview=True))
+    else:
+        path = FF_CFG
+    env = dict(os.environ, COLUMNS="140", TERM="xterm-256color", COLORTERM="truecolor")
+    t = run(["fastfetch", "-c", path, "--pipe", "false"], 12, env)
+    t = t.rstrip("\n")
+    return {"html": to_html(t, p), "error": "" if t else "fastfetch printed nothing",
+            "logo": LOGO_PNG if c["logo"] == "wallpaper" and os.path.exists(LOGO_PNG) else "",
+            "bg": p["background"], "fg": p["foreground"]}
+
+
+# ---------------------------------------------------------------- shells
+
+RC_POSIX = r'''# {mark} (Settings > Desktop > Look & Feel). This file is written again by the shell: your own
+# settings go in your {rc}, after the line that loads this one.
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+case $- in *i*) ;; *) return ;; esac
+{body}
+if [ -e "{on}" ] && [ "$TERM_PROGRAM" != vscode ] && command -v fastfetch >/dev/null 2>&1; then
+  fastfetch
+fi
+'''
+ZSH_BODY = r'''HISTFILE="$HOME/.zsh_history"; HISTSIZE=10000; SAVEHIST=10000
+setopt share_history hist_ignore_dups auto_cd interactive_comments
+bindkey -e
+autoload -Uz compinit && compinit -d "${XDG_CACHE_HOME:-$HOME/.cache}/zcompdump"
+zstyle ':completion:*' menu select
+zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
+# the same prompt as fish: a folder, where you are, >
+PROMPT='%F{magenta}󰉋%f %~> '
+'''
+BASH_BODY = r'''HISTSIZE=10000; HISTCONTROL=ignoredups:erasedups
+shopt -s histappend autocd 2>/dev/null
+bind 'set completion-ignore-case on' 2>/dev/null
+# the same prompt as fish: a folder, where you are, >
+PS1='\[\e[35m\]󰉋\[\e[0m\] \w> '
+'''
+FISH_RC = '''# {mark} (Settings > Desktop > Look & Feel): fastfetch when a terminal opens
+if status is-interactive; and test -e "{on}"; and test "$TERM_PROGRAM" != vscode; and type -q fastfetch
+    fastfetch
+end
+'''
+
+
+def hook_rc(rc, line, top):
+    """the line in your .zshrc / .bashrc that loads ours (added once, your own lines stay)"""
+    s = read(rc)
+    if MARK in s:
+        return
+    if top:
+        s = line + "\n" + s
+    else:
+        s = s.rstrip("\n") + ("\n\n" if s.strip() else "") + line + "\n"
+    write(rc, s)
+
+
+def apply_shell_files(sh):
+    on = FETCH_ON
+    write(CFG + "/fish/conf.d/rice-look.fish", FISH_RC.format(mark=MARK, on=on))
+    d = RICE + "/shell"
+    write(d + "/rice.zsh", RC_POSIX.format(mark=MARK, rc="~/.zshrc", body=ZSH_BODY, on=on))
+    write(d + "/rice.bash", RC_POSIX.format(mark=MARK, rc="~/.bashrc", body=BASH_BODY, on=on))
+    if sh == "zsh":
+        # at the top: Oh My Zsh and your own prompt, further down, still win
+        hook_rc(HOME + "/.zshrc", '[ -f "$HOME/.config/rice/shell/rice.zsh" ] && source "$HOME/.config/rice/shell/rice.zsh"  # %s' % MARK, True)
+    elif sh == "bash":
+        hook_rc(HOME + "/.bashrc", '[ -f "$HOME/.config/rice/shell/rice.bash" ] && . "$HOME/.config/rice/shell/rice.bash"  # %s' % MARK, False)
+
+
+# ---------------------------------------------------------------- terminals
+
+def own_file(path, include_line, check):
+    """the main config of a terminal: made if it is missing; yours gets one line that includes ours"""
+    s = read(path)
+    if not os.path.exists(path):
+        write(path, "# %s: the look comes from the included file (Settings > Desktop > Look & Feel).\n"
+                    "# Your own settings go below.\n%s\n" % (MARK, include_line))
+        return "made"
+    if check in s:
+        return "linked"
+    return "own"
+
+
+def apply_terms(c):
+    p = palette()
+    font = mono_font()
+    op = opacity()
+    sh = current_shell(c)
+    shp = shutil.which(sh) or sh
+    res = {}
+    # kitty: the shell (kitty.conf has "shell fish"; ours comes last and wins)
+    kc = CFG + "/kitty/kitty.conf"
+    if os.path.exists(kc):
+        write(CFG + "/kitty/rice-shell.conf", "# %s\nshell %s\n" % (MARK, shp))
+        s = read(kc)
+        if "rice-shell.conf" not in s:
+            write(kc, s.rstrip("\n") + "\ninclude rice-shell.conf\n")
+        res["kitty"] = "linked"
+    term = current_term(c)
+
+    def wanted(t, main):
+        return t == term or "darkshadow" in read(main)
+
+    # foot
+    if wanted("foot", CFG + "/foot/foot.ini"):
+        cols = ["foreground=%s" % p["foreground"][1:], "background=%s" % p["background"][1:], "alpha=%s" % round(op, 2)]
+        cols += ["regular%d=%s" % (i, p["color%d" % i][1:]) for i in range(8)]
+        cols += ["bright%d=%s" % (i, p["color%d" % (i + 8)][1:]) for i in range(8)]
+        cols += ["selection-foreground=%s" % p["selection_foreground"][1:],
+                 "selection-background=%s" % p["selection_background"][1:]]
+        # foot 1.26 renamed [colors] to [colors-dark] (and moved the cursor colors into it); 1.28 refuses the old name.
+        # An older foot only knows the old one.
+        new_foot = True
+        try:
+            m = re.search(r"(\d+)\.(\d+)", subprocess.run(["foot", "--version"], capture_output=True, text=True, timeout=5).stdout)
+            if m:
+                new_foot = (int(m.group(1)), int(m.group(2))) >= (1, 26)
+        except Exception:
+            pass
+        if new_foot:
+            colors = "[colors-dark]\n%s\ncursor=%s %s\n" % ("\n".join(cols), p["background"][1:], p["cursor"][1:])
+        else:
+            colors = "[colors]\n%s\n\n[cursor]\ncolor=%s %s\n" % ("\n".join(cols), p["background"][1:], p["cursor"][1:])
+        write(CFG + "/foot/darkshadow.ini",
+              "# %s: written again when the wallpaper changes\nfont=%s:size=11\npad=10x10\nshell=%s\n\n%s" % (MARK, font, shp, colors))
+        main = CFG + "/foot/foot.ini"
+        st = own_file(main, "include=~/.config/foot/darkshadow.ini", "darkshadow.ini")
+        if st == "own":
+            # foot reads an include line anywhere in the main part: at the top yours still wins
+            write(main, "include=~/.config/foot/darkshadow.ini\n" + read(main))
+            st = "linked"
+        res["foot"] = st
+    # alacritty
+    if wanted("alacritty", CFG + "/alacritty/alacritty.toml"):
+        cn = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+        t = ["# %s: written again when the wallpaper changes" % MARK,
+             "[window]", "opacity = %s" % round(op, 2), "padding = { x = 10, y = 10 }", "",
+             "[font]", 'normal = { family = "%s" }' % font, "size = 11", "",
+             "[terminal]", 'shell = { program = "%s" }' % shp, "",
+             "[colors.primary]", 'background = "%s"' % p["background"], 'foreground = "%s"' % p["foreground"], "",
+             "[colors.cursor]", 'cursor = "%s"' % p["cursor"], 'text = "%s"' % p["background"], "",
+             "[colors.normal]"] + ['%s = "%s"' % (n, p["color%d" % i]) for i, n in enumerate(cn)] + \
+            ["", "[colors.bright]"] + ['%s = "%s"' % (n, p["color%d" % (i + 8)]) for i, n in enumerate(cn)]
+        write(CFG + "/alacritty/darkshadow.toml", "\n".join(t) + "\n")
+        main = CFG + "/alacritty/alacritty.toml"
+        st = own_file(main, '[general]\nimport = ["~/.config/alacritty/darkshadow.toml"]', "darkshadow.toml")
+        if st == "own" and not re.search(r"^\s*\[general\]", read(main), re.M):
+            write(main, '[general]\nimport = ["~/.config/alacritty/darkshadow.toml"]\n\n' + read(main))
+            st = "linked"
+        res["alacritty"] = st
+    # ghostty
+    if wanted("ghostty", CFG + "/ghostty/config"):
+        t = ["# %s: written again when the wallpaper changes" % MARK,
+             "font-family = %s" % font, "font-size = 11", "window-padding-x = 10", "window-padding-y = 10",
+             "background-opacity = %s" % round(op, 2), "command = %s" % shp,
+             "background = %s" % p["background"], "foreground = %s" % p["foreground"],
+             "cursor-color = %s" % p["cursor"], "selection-background = %s" % p["selection_background"],
+             "selection-foreground = %s" % p["selection_foreground"]] + \
+            ["palette = %d=%s" % (i, p["color%d" % i]) for i in range(16)]
+        write(CFG + "/ghostty/darkshadow", "\n".join(t) + "\n")
+        main = CFG + "/ghostty/config"
+        st = own_file(main, "config-file = darkshadow", "config-file = darkshadow")
+        if st == "own":
+            write(main, read(main).rstrip("\n") + "\n\n# %s\nconfig-file = darkshadow\n" % MARK)
+            st = "linked"
+        res["ghostty"] = st
+    # running terminals read their config again
+    run(["pkill", "-USR1", "-x", "kitty"], 2)
+    run(["pkill", "-USR1", "-x", ".kitty-wrapped"], 2)
+    run(["pkill", "-USR2", "-x", "ghostty"], 2)
+    return res
+
+
+def apply_term_choice(c):
+    t = c["terminal"]
+    if t:
+        write(TERMFILE, t + "\n")
+    # niri: the keys are in its config (rice-niri writes them with rice-term); Hyprland calls rice-term itself
+    if os.environ.get("NIRI_SOCKET") and os.access(BIN + "/rice-niri", os.X_OK):
+        spawn([BIN + "/rice-niri", "apply"])
+
+
+def apply_all(c, force_fetch=False):
+    apply_shell_files(current_shell(c))
+    apply_terms(c)
+    apply_fetch(c, force_fetch)
+
+
+# ---------------------------------------------------------------- file managers
+
+def files_installed(f):
+    if f["id"] == "darkshadow":
+        # ours: rice-app and its Quickshell folder
+        return os.access(BIN + "/rice-app", os.X_OK) and os.path.exists(CFG + "/quickshell/rice-apps/shell.qml")
+    return bool(shutil.which(f["id"]))
+
+
+def apps_default():
+    """are pictures, music and videos opened in our Photos, Music and Videos"""
+    if not shutil.which("xdg-mime"):
+        return False
+    try:
+        r = subprocess.run(["xdg-mime", "query", "default", "image/png"], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() == "darkshadow-photos.desktop"
+    except Exception:
+        return False
+
+
+def current_files(c):
+    t = read(FILESFILE).strip() or c["files"]
+    for f in FILES:
+        if f["id"] == t and files_installed(f):
+            return t
+    for f in FILES:
+        if files_installed(f):
+            return f["id"]
+    return ""
+
+
+def m3():
+    """the wallpaper's Material colors (matugen writes palette.json); without them: the terminal's colors"""
+    try:
+        j = json.load(open(RICE + "/palette.json"))
+    except Exception:
+        j = {}
+    p = palette()
+    d = {"surface": p["background"], "surface_low": p["background"], "surface_container": p["color8"],
+         "surface_high": p["color8"], "surface_highest": p["color8"], "on_surface": p["foreground"],
+         "on_surface_variant": p["color7"], "outline": p["color8"], "outline_variant": p["color8"],
+         "primary": p["primary"], "on_primary": p["background"], "primary_container": p["color8"],
+         "on_primary_container": p["foreground"], "secondary": p["secondary"], "secondary_container": p["color8"],
+         "tertiary": p["tertiary"], "error": p["color1"]}
+    for k in d:
+        v = str(j.get(k, ""))
+        if re.match(r"^#[0-9a-fA-F]{6}$", v):
+            d[k] = v.lower()
+    return d
+
+
+def gtk_css(c, gtk3):
+    head = "/* %s: your file manager and the other GTK apps in the wallpaper's colors (Settings > Desktop >\n" \
+           "   Look & Feel). Written again when the wallpaper changes: put your own CSS in gtk.css. */\n" % MARK
+    if not c["files_colors"]:
+        return head + "/* off */\n"
+    m = m3()
+    names = [
+        ("accent_color", "primary"), ("accent_bg_color", "primary"), ("accent_fg_color", "on_primary"),
+        ("window_bg_color", "surface"), ("window_fg_color", "on_surface"),
+        ("view_bg_color", "surface_low"), ("view_fg_color", "on_surface"),
+        ("headerbar_bg_color", "surface_container"), ("headerbar_fg_color", "on_surface"),
+        ("headerbar_backdrop_color", "surface"), ("headerbar_border_color", "outline_variant"),
+        ("sidebar_bg_color", "surface_container"), ("sidebar_fg_color", "on_surface"),
+        ("sidebar_backdrop_color", "surface_low"), ("sidebar_border_color", "outline_variant"),
+        ("secondary_sidebar_bg_color", "surface_low"), ("secondary_sidebar_fg_color", "on_surface"),
+        ("card_bg_color", "surface_high"), ("card_fg_color", "on_surface"),
+        ("popover_bg_color", "surface_high"), ("popover_fg_color", "on_surface"),
+        ("dialog_bg_color", "surface_container"), ("dialog_fg_color", "on_surface"),
+        ("thumbnail_bg_color", "surface_high"), ("thumbnail_fg_color", "on_surface"),
+        ("destructive_color", "error"),
+    ]
+    if gtk3:
+        # Adwaita (GTK 3) and the themes made like it
+        names += [("theme_bg_color", "surface"), ("theme_fg_color", "on_surface"), ("theme_base_color", "surface_low"),
+                  ("theme_text_color", "on_surface"), ("theme_selected_bg_color", "primary"),
+                  ("theme_selected_fg_color", "on_primary"), ("insensitive_bg_color", "surface_container"),
+                  ("insensitive_fg_color", "on_surface_variant"), ("borders", "outline_variant"),
+                  ("theme_unfocused_bg_color", "surface"), ("theme_unfocused_fg_color", "on_surface"),
+                  ("theme_unfocused_base_color", "surface_low"), ("theme_unfocused_text_color", "on_surface"),
+                  ("theme_unfocused_selected_bg_color", "primary"), ("theme_unfocused_selected_fg_color", "on_primary")]
+    glass = c.get("files_glass", True) is not False and not gtk3
+
+    def col(k, a=None):
+        # glass: the surfaces are a little see-through, so the compositor's blur shows behind the window
+        if not glass or a is None:
+            return m[k]
+        h = m[k]
+        return "rgba(%d, %d, %d, %s)" % (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16), a)
+
+    alpha = {"window_bg_color": 0.80, "view_bg_color": 0.74, "headerbar_bg_color": 0.86, "headerbar_backdrop_color": 0.80,
+             "sidebar_bg_color": 0.84, "sidebar_backdrop_color": 0.78, "secondary_sidebar_bg_color": 0.78}
+    out = head + "".join("@define-color %s %s;\n" % (n, col(k, alpha.get(n))) for n, k in names)
+    if gtk3:
+        return out
+    # Material 3 shapes for the GTK 4 / libadwaita apps (Files): pill rows and buttons, rounded cards, the selected
+    # row in the secondary container color
+    sc, oc = m["secondary_container"], m["on_primary_container"]
+    out += """
+/* Material 3 look */
+.navigation-sidebar > row, .navigation-sidebar row { border-radius: 24px; margin: 2px 10px; min-height: 40px; }
+.navigation-sidebar > row:selected, .navigation-sidebar row:selected { background-color: %s; color: %s; }
+.navigation-sidebar > row:hover:not(:selected) { background-color: alpha(%s, 0.10); }
+headerbar button, headerbar .pill, .path-bar button, .linked > button { border-radius: 20px; }
+headerbar entry, headerbar searchentry, searchbar entry { border-radius: 22px; min-height: 40px; }
+gridview > child, gridview child { border-radius: 20px; margin: 4px; padding: 6px; }
+gridview > child:selected, gridview child:selected { background-color: %s; color: %s; }
+listview > row, columnview row { border-radius: 14px; margin: 1px 4px; }
+listview > row:selected, columnview row:selected { background-color: %s; color: %s; }
+popover > contents, menu, .menu { border-radius: 22px; }
+.card, .view { border-radius: 16px; }
+scrollbar slider { border-radius: 8px; min-width: 6px; min-height: 6px; }
+""" % (sc, oc, m["on_surface"], sc, oc, sc, oc)
+    return out
+
+
+IMPORT = '@import url("darkshadow.css");'
+
+
+def link_gtk(d):
+    """gtk.css loads darkshadow.css: added on top of yours (a backup is kept); a gtk.css that is a link
+    (another theming tool owns it) is left alone"""
+    main = d + "/gtk.css"
+    if os.path.islink(main):
+        return "own"
+    t = read(main)
+    if IMPORT in t:
+        return "linked"
+    if t.strip() and not os.path.exists(main + ".bak-darkshadow"):
+        write(main + ".bak-darkshadow", t)
+    write(main, IMPORT + "\n" + t)
+    return "linked"
+
+
+def kde_rgb(h):
+    r, g, b = rgb(h)
+    return "%d,%d,%d" % (r, g, b)
+
+
+def kde_groups(m):
+    """a KDE color scheme from the wallpaper's colors (Dolphin and the other KDE apps)"""
+    def grp(bg, alt, fg):
+        return [("BackgroundNormal", kde_rgb(m[bg])), ("BackgroundAlternate", kde_rgb(m[alt])),
+                ("ForegroundNormal", kde_rgb(m[fg])), ("ForegroundInactive", kde_rgb(m["on_surface_variant"])),
+                ("ForegroundActive", kde_rgb(m["primary"])), ("ForegroundLink", kde_rgb(m["primary"])),
+                ("ForegroundVisited", kde_rgb(m["tertiary"])), ("ForegroundNegative", kde_rgb(m["error"])),
+                ("ForegroundNeutral", kde_rgb(m["tertiary"])), ("ForegroundPositive", kde_rgb(m["secondary"])),
+                ("DecorationFocus", kde_rgb(m["primary"])), ("DecorationHover", kde_rgb(m["primary"]))]
+    return [
+        ("Colors:Window", grp("surface", "surface_container", "on_surface")),
+        ("Colors:View", grp("surface_low", "surface", "on_surface")),
+        ("Colors:Button", grp("surface_high", "surface_container", "on_surface")),
+        ("Colors:Header", grp("surface_container", "surface", "on_surface")),
+        ("Colors:Tooltip", grp("surface_highest", "surface_high", "on_surface")),
+        ("Colors:Complementary", grp("surface_container", "surface", "on_surface")),
+        ("Colors:Selection", [("BackgroundNormal", kde_rgb(m["primary"])), ("BackgroundAlternate", kde_rgb(m["primary"])),
+                              ("ForegroundNormal", kde_rgb(m["on_primary"])), ("ForegroundInactive", kde_rgb(m["on_primary"])),
+                              ("ForegroundActive", kde_rgb(m["on_primary"])), ("DecorationFocus", kde_rgb(m["primary"])),
+                              ("DecorationHover", kde_rgb(m["primary"]))]),
+    ]
+
+
+def ini_set(path, groups):
+    """put these groups (name, [(key, value)]) in a KDE ini file: other groups, and keys of these groups that are
+    not set here, are kept as they are"""
+    lines = read(path).split("\n")
+    out, cur, seen = [], None, set()
+    want = {g: dict(kv) for g, kv in groups}
+
+    def flush_missing(g):
+        if g in want and g not in seen:
+            seen.add(g)
+            # the keys this group did not have yet go at its end, before the empty line that ends it
+            blank = 0
+            while out and out[-1] == "" and blank < len(out):
+                out.pop()
+                blank += 1
+            for k, v in want[g].items():
+                if not done.get((g, k)):
+                    out.append("%s=%s" % (k, v))
+            out.extend([""] * blank)
+    done = {}
+    for ln in lines:
+        m = re.match(r"^\[(.+)\]\s*$", ln)
+        if m:
+            flush_missing(cur)
+            cur = m.group(1)
+            out.append(ln)
+            continue
+        km = re.match(r"^([^=#;\[]+?)\s*=", ln)
+        if cur in want and km and km.group(1) in want[cur]:
+            done[(cur, km.group(1))] = True
+            out.append("%s=%s" % (km.group(1), want[cur][km.group(1)]))
+            continue
+        out.append(ln)
+    flush_missing(cur)
+    while out and out[-1] == "":
+        out.pop()
+    for g, kv in groups:
+        if g not in seen and not any(re.match(r"^\[%s\]\s*$" % re.escape(g), x) for x in out):
+            out += ["", "[%s]" % g] + ["%s=%s" % (k, v) for k, v in kv]
+    text = "\n".join(out) + "\n"
+    if read(path) != text:
+        if os.path.exists(path) and not os.path.exists(path + ".bak-darkshadow"):
+            write(path + ".bak-darkshadow", read(path))
+        write(path, text)
+
+
+def apply_files_theme(c):
+    res = {}
+    restart = False
+    for d, g3 in ((CFG + "/gtk-4.0", False), (CFG + "/gtk-3.0", True)):
+        old, new = read(d + "/darkshadow.css"), gtk_css(c, g3)
+        # a Files that is already running (it stays in the background after you close its window) keeps the CSS it
+        # started with: it has to be quit once when the look itself (glass, shapes) changes, not for every new color
+        if not g3 and old != new and (("Material 3 look" in old) != ("Material 3 look" in new) or ("rgba(" in old) != ("rgba(" in new)):
+            restart = True
+        write(d + "/darkshadow.css", new)
+        res["gtk4" if not g3 else "gtk3"] = link_gtk(d)
+    if restart and shutil.which("nautilus"):
+        run(["nautilus", "-q"], 5)
+    # KDE apps (Dolphin): a color scheme, used by Dolphin and written into kdeglobals for the others
+    if c["files_colors"] and (shutil.which("dolphin") or os.path.exists(CFG + "/kdeglobals")):
+        m = m3()
+        groups = kde_groups(m)
+        scheme = HOME + "/.local/share/color-schemes/DarkShadow.colors"
+        write(scheme, "# %s: the wallpaper's colors (rice-look)\n[General]\nName=DarkShadow\nColorScheme=DarkShadow\n\n" % MARK +
+              "\n\n".join("[%s]\n" % g + "\n".join("%s=%s" % kv for kv in kv_) for g, kv_ in groups) + "\n")
+        ini_set(CFG + "/kdeglobals", groups + [("General", [("ColorScheme", "DarkShadow")])])
+        if not re.search(r"^\[Icons\]", read(CFG + "/kdeglobals"), re.M):
+            ini_set(CFG + "/kdeglobals", [("Icons", [("Theme", "Papirus-Dark")])])
+        ini_set(CFG + "/dolphinrc", [("UiSettings", [("ColorScheme", "DarkShadow")])])
+        res["kde"] = "on"
+    return res
+
+
+def desktop_exists(name):
+    dirs = [HOME + "/.local/share/applications", "/usr/share/applications", "/usr/local/share/applications",
+            "/var/lib/flatpak/exports/share/applications", HOME + "/.local/share/flatpak/exports/share/applications",
+            "/run/current-system/sw/share/applications", HOME + "/.nix-profile/share/applications"]
+    return any(os.path.exists(d + "/" + name) for d in dirs)
+
+
+def apply_files_choice(c):
+    f = current_files(c)
+    if not f:
+        return ""
+    write(FILESFILE, f + "\n")
+    info = next(x for x in FILES if x["id"] == f)
+    if os.access(BIN + "/rice-app", os.X_OK):
+        if f == "darkshadow":
+            run([BIN + "/rice-app", "install"], 10)      # its entry in the app menu (the default for folders needs it)
+        # ours picked: the old file manager leaves the app menu (it comes back when you pick it again)
+        run([BIN + "/rice-app", "hide-old", "on" if f == "darkshadow" else "off"], 10)
+    # every "open folder" (the browser's downloads, other apps) opens it too
+    if shutil.which("xdg-mime") and desktop_exists(info["desktop"]):
+        run(["xdg-mime", "default", info["desktop"], "inode/directory"], 5)
+    # niri: SUPER + E is in its config
+    if os.environ.get("NIRI_SOCKET") and os.access(BIN + "/rice-niri", os.X_OK):
+        spawn([BIN + "/rice-niri", "apply"])
+    return f
+
+
+# ---------------------------------------------------------------- install / open
+
+PKGS = {"arch": {"wezterm": "wezterm", "ghostty": "ghostty", "pcmanfm": "pcmanfm-gtk3"}, "void": {"fish": "fish-shell"},
+        "fedora": {"ghostty": "ghostty", "wezterm": "wezterm", "thunar": "Thunar"}}
+
+
+def term_cmd(script):
+    """run a little shell script in your terminal; it waits for Enter at the end"""
+    s = script + '\necho; read -r -p "Press Enter to close " _'
+    return [BIN + "/rice-term", "--class", "rice-look", "-e", "bash", "-c", s]
+
+
+def install(name):
+    d = distro()
+    if name not in [x["id"] for x in SHELLS + TERMS + FILES]:
+        sys.exit("unknown: " + name)
+    pkg = PKGS.get(d, {}).get(name, name)
+    if d == "arch":
+        s = 'echo "Installing %s ..."; sudo pacman -S --needed %s' % (name, pkg)
+    elif d == "fedora":
+        s = 'echo "Installing %s ..."; sudo dnf install -y %s' % (name, pkg)
+    elif d == "debian":
+        s = 'echo "Installing %s ..."; sudo apt install -y %s' % (name, pkg)
+    elif d == "void":
+        s = 'echo "Installing %s ..."; sudo xbps-install -y %s' % (name, pkg)
+    elif d == "nixos":
+        s = ('echo "On NixOS, add %s to your configuration:"; echo; echo "  environment.systemPackages = [ pkgs.%s ];"; '
+             'echo; echo "then: sudo nixos-rebuild switch"' % (name, pkg))
+    else:
+        s = 'echo "Install %s with your package manager."' % name
+    spawn(term_cmd(s))
+    print("Installing %s in a terminal" % name)
+
+
+# ---------------------------------------------------------------- state
+
+def state():
+    c = load()
+    sh = current_shell(c)
+    term = current_term(c)
+    res = {}
+    for t in ("foot", "alacritty", "ghostty"):
+        s = read({"foot": CFG + "/foot/foot.ini", "alacritty": CFG + "/alacritty/alacritty.toml",
+                  "ghostty": CFG + "/ghostty/config"}[t])
+        res[t] = "darkshadow" in s
+    ff = read(FF_CFG)
+    return {
+        "fetch": {"on_open": c["on_open"], "logo": c["logo"], "info": c["info"], "labels": c["labels"],
+                  "colors": c["colors"], "installed": bool(shutil.which("fastfetch")), "own": not is_ours(ff)},
+        "shell": {"current": sh, "login": login_shell(),
+                  "list": [dict(x, installed=bool(shutil.which(x["id"])), path=shutil.which(x["id"]) or "")
+                           for x in SHELLS]},
+        "terminal": {"current": term,
+                     "list": [dict(x, installed=bool(shutil.which(x["id"])),
+                                   look=(x["id"] == "kitty" or res.get(x["id"], False)))
+                              for x in TERMS]},
+        "files": {"current": current_files(c), "colors": c["files_colors"], "glass": c["files_glass"], "apps": apps_default(),
+                  "list": [dict(x, installed=files_installed(x)) for x in FILES]},
+        "distro": distro(),
+        "wallpaper": wallpaper(),
+    }
+
+
+def main(a):
+    cmd = a[1] if len(a) > 1 else "state"
+    c = load()
+    if cmd == "state":
+        print(json.dumps(state()))
+    elif cmd == "fetch" and len(a) == 4:
+        k, v = a[2], a[3]
+        allowed = {"on_open": ("on", "off"), "logo": ("distro", "small", "darkshadow", "blackhole", "wallpaper", "none"),
+                   "info": ("full", "compact", "minimal"), "labels": ("text", "icons"), "colors": ("wallpaper", "plain")}
+        if k not in allowed or v not in allowed[k]:
+            sys.exit("usage: rice-look fetch KEY VALUE")
+        c[k] = (v == "on") if k == "on_open" else v
+        save(c)
+        apply_fetch(c)
+        print({"on_open": "Fastfetch when a terminal opens: " + v}.get(k, "Fastfetch: " + v))
+    elif cmd == "fetch-own":
+        apply_fetch(c, True)
+        print("Fastfetch uses DarkShadow's look again")
+    elif cmd == "preview":
+        print(json.dumps(preview()))
+    elif cmd == "shell" and len(a) == 3:
+        if a[2] not in [x["id"] for x in SHELLS]:
+            sys.exit("unknown shell")
+        if not shutil.which(a[2]):
+            sys.exit("%s is not installed" % a[2])
+        c["shell"] = a[2]
+        save(c)
+        apply_shell_files(a[2])
+        apply_terms(c)
+        print("New terminals start %s" % a[2])
+    elif cmd == "login-shell":
+        sh = current_shell(c)
+        path = shutil.which(sh)
+        if not path:
+            sys.exit("%s is not installed" % sh)
+        s = ('echo "Making %s your login shell (it asks your password) ..."; '
+             'grep -qx "%s" /etc/shells || echo "%s" | sudo tee -a /etc/shells >/dev/null; '
+             'chsh -s "%s" && echo "Done: log out and back in once."' % (sh, path, path, path))
+        spawn(term_cmd(s))
+        print("Opening a terminal for chsh")
+    elif cmd == "terminal" and len(a) == 3:
+        if a[2] not in [x["id"] for x in TERMS]:
+            sys.exit("unknown terminal")
+        if not shutil.which(a[2]):
+            sys.exit("%s is not installed" % a[2])
+        c["terminal"] = a[2]
+        save(c)
+        apply_term_choice(c)
+        apply_terms(c)
+        apply_fetch(c)
+        print("The terminal is now %s" % a[2])
+    elif cmd == "files" and len(a) == 3:
+        f = next((x for x in FILES if x["id"] == a[2]), None)
+        if not f:
+            sys.exit("unknown file manager")
+        if not files_installed(f):
+            sys.exit("%s is not installed" % f["name"])
+        c["files"] = a[2]
+        save(c)
+        apply_files_choice(c)
+        apply_files_theme(c)
+        print("Files open in %s" % f["name"])
+    elif cmd == "apps-default" and len(a) == 3 and a[2] in ("on", "off"):
+        if not os.access(BIN + "/rice-app", os.X_OK):
+            sys.exit("rice-app is missing (run rice-update)")
+        print(run([BIN + "/rice-app", "defaults", a[2]], 20).strip() or a[2])
+    elif cmd == "files-colors" and len(a) == 3 and a[2] in ("on", "off"):
+        c["files_colors"] = a[2] == "on"
+        save(c)
+        apply_files_theme(c)
+        print("File manager colors: " + ("from the wallpaper (open it again)" if c["files_colors"] else "its own"))
+    elif cmd == "files-glass" and len(a) == 3 and a[2] in ("on", "off"):
+        c["files_glass"] = a[2] == "on"
+        save(c)
+        apply_files_theme(c)
+        print("Files: " + ("see-through, blurred" if c["files_glass"] else "solid"))
+    elif cmd == "files-theme":
+        apply_files_theme(c)
+    elif cmd == "install" and len(a) == 3:
+        install(a[2])
+    elif cmd == "try":
+        sh = current_shell(c)
+        shp = shutil.which(sh) or "bash"
+        if sh == "fish":
+            spawn([BIN + "/rice-term", "-e", shp, "-C", "fastfetch"])
+        else:
+            spawn([BIN + "/rice-term", "-e", "sh", "-c", 'fastfetch; exec "$0"', shp])
+        print("Opened %s" % current_term(c))
+    elif cmd == "colors":
+        apply_files_theme(c)
+        apply_terms(c)
+        if c["logo"] == "wallpaper":
+            make_logo_png(c)
+        apply_fetch(c)
+    elif cmd == "apply":
+        if c["terminal"]:
+            write(TERMFILE, c["terminal"] + "\n")
+        apply_all(c)
+        # the default for folders only once you picked one in Settings (an update does not change yours)
+        if c["files"]:
+            apply_files_choice(c)
+        apply_files_theme(c)
+        print("Look & Feel applied")
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

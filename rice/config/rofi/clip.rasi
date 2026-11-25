@@ -1,0 +1,17 @@
+@import "~/.cache/theme/colors.rasi"
+
+configuration { }
+
+window {
+    location: north; anchor: north; y-offset: 45px; width: 640px; background-color: @bga; border: 1.5px; border-color: @accent;
+    border-radius: 26px; padding: 16px;
+}
+mainbox { background-color: transparent; spacing: 10px; children: [ inputbar, listview ]; }
+inputbar { background-color: @bg2; border-radius: 12px; padding: 8px 12px; spacing: 10px; children: [ searchicon, entry ]; }
+searchicon { expand: false; str: ""; font: "Symbols Nerd Font 13"; vertical-align: 0.5; background-color: transparent; text-color: @accent; }
+entry  { background-color: transparent; text-color: @fg; }
+listview { background-color: transparent; lines: 9; spacing: 4px; scrollbar: false; cycle: true; }
+element { padding: 8px 12px; border-radius: 12px; background-color: transparent; text-color: @fg; spacing: 10px; }
+element selected.normal { background-color: @accent; text-color: @bg; }
+element-icon { size: 2.4em; background-color: transparent; }
+element-text { background-color: transparent; text-color: inherit; vertical-align: 0.5; }
