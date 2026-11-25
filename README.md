@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="logo/glidewm-banner.png" alt="glidewm" width="640">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="logo/glidewm-light.svg">
+  <img src="logo/glidewm.svg" alt="glidewm" width="300">
+</picture>
 
 **glide window manager**
 
@@ -12,8 +15,8 @@ Glass bar · smooth animations · infinite canvas · tiny IPC · one C file.
 [![License](https://img.shields.io/badge/license-MIT%2FX-8ad7eb?style=for-the-badge&labelColor=1e202b)](LICENSE)
 [![Language](https://img.shields.io/badge/C99-single%20file-86dbd7?style=for-the-badge&logo=c&logoColor=white&labelColor=1e202b)](dwm.c)
 [![Base](https://img.shields.io/badge/based%20on-dwm%206.8-f2b8a0?style=for-the-badge&labelColor=1e202b)](https://git.suckless.org/dwm)
-[![Last commit](https://img.shields.io/github/last-commit/petkebtw/mwm?style=for-the-badge&color=c6b6f2&labelColor=1e202b)](https://github.com/petkebtw/mwm/commits/main)
-[![Stars](https://img.shields.io/github/stars/petkebtw/mwm?style=for-the-badge&color=f2e0a0&labelColor=1e202b)](https://github.com/petkebtw/mwm/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/petkebtw/glidewm?style=for-the-badge&color=c6b6f2&labelColor=1e202b)](https://github.com/petkebtw/glidewm/commits/main)
+[![Stars](https://img.shields.io/github/stars/petkebtw/glidewm?style=for-the-badge&color=f2e0a0&labelColor=1e202b)](https://github.com/petkebtw/glidewm/stargazers)
 
 <br>
 
@@ -121,7 +124,7 @@ The screenshots show glidewm with a full desktop shell on top. It lives in [`ric
 ### ⚡ One command
 
 ```sh
-git clone https://github.com/petkebtw/mwm.git glidewm && cd glidewm
+git clone https://github.com/petkebtw/glidewm.git && cd glidewm
 ./install.sh --check     # what is installed, what is missing (with the package names for your distro)
 ./install.sh             # pick the parts (arrow keys, Space, Enter on Submit), then install
 ```
@@ -177,7 +180,7 @@ Required at runtime: `xrdb` and a terminal (default `konsole`, change `termcmd` 
 ### 2. Build glidewm
 
 ```sh
-git clone https://github.com/petkebtw/mwm.git glidewm
+git clone https://github.com/petkebtw/glidewm.git
 cd glidewm
 cp config.def.h config.h     # edit to taste
 make

@@ -577,7 +577,7 @@ if [ $APPS = 1 ]; then
   for sz in 16 32 48 64 128 256; do
     run install -Dm644 "$R/logo/icon-$sz.png" "$HOME/.local/share/icons/hicolor/${sz}x${sz}/apps/glidewm.png"
   done
-  run install -Dm644 "$R/logo/glidewm.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/glidewm.svg"
+  run install -Dm644 "$R/logo/glidewm-icon.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/glidewm.svg"
   # file|Name|Comment|Exec|Icon|Keywords|Categories
   ENTRIES="
 glidewm-settings|glidewm Settings|Display, keyboard, gaps, network, shortcuts|$L/rice-settings|glidewm|settings;display;keyboard;network;shortcuts;|Settings;DesktopSettings;

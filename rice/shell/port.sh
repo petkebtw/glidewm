@@ -225,7 +225,7 @@ assert n == len(gone), n
 open(p, "w").write(s)
 p = q + "/AboutPage.qml"; s = open(p).read()
 sub('{ n: "Hyprland", u: "https://hypr.land" }, { n: "niri", u: "https://github.com/niri-wm/niri" }',
-    '{ n: "glidewm", u: "https://github.com/petkebtw/mwm" }, { n: "dwm", u: "https://dwm.suckless.org" }')
+    '{ n: "glidewm", u: "https://github.com/petkebtw/glidewm" }, { n: "dwm", u: "https://dwm.suckless.org" }')
 sub('n: page.info.wm || "Hyprland"', 'n: page.info.wm || "glidewm"')
 open(p, "w").write(s)
 PY
