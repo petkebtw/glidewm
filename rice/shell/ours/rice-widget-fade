@@ -6,6 +6,12 @@ LOCK="${XDG_RUNTIME_DIR:-/tmp}/rice-widget-fade.lock"
 exec 9>"$LOCK"; flock -n 9 || exit 0
 declare -A state mon_busy
 wins=(); lastscan=0
+# Settings > Home / Desktop > Auto-hide widgets (desktop-set auto-hide on|off -> "autoHide" in desktop.json)
+CFG="$HOME/.config/rice/desktop.json"; cfg_m=""; autohide=1
+read_cfg() {
+  local m; m=$(stat -c %Y "$CFG" 2>/dev/null); [ "$m" = "$cfg_m" ] && return; cfg_m=$m
+  if grep -Eq '"autoHide": *false' "$CFG" 2>/dev/null; then autohide=0; else autohide=1; fi
+}
 mons=()   # "x y w h"
 scan_mons() {
   mons=()
@@ -46,7 +52,7 @@ apply() {
     for m in "${mons[@]}"; do
       read -r mx my mw mh <<<"$m"
       if [ "$cx" -ge "$mx" ] && [ "$cx" -lt $((mx + mw)) ] && [ "$cy" -ge "$my" ] && [ "$cy" -lt $((my + mh)) ]; then
-        [ -n "${mon_busy["$mx $my"]:-}" ] && want=1
+        [ "$autohide" = 1 ] && [ -n "${mon_busy["$mx $my"]:-}" ] && want=1
       fi
     done
     [ "${state[$w]:-}" = "$want" ] && continue
@@ -57,14 +63,14 @@ apply() {
 }
 cleanup() { local e w; for e in "${wins[@]}"; do read -r w _ <<<"$e"; xprop -id "$w" -remove _NET_WM_WINDOW_OPACITY 2>/dev/null; done; }
 trap cleanup EXIT
-scan_mons; scan_wins; read_busy; apply
+read_cfg; scan_mons; scan_wins; read_busy; apply
 exec 8< <(exec xprop -root -spy _RICE_MONS 9>&-)
 while pgrep -x qs >/dev/null; do
-  if read -r -t 3 -u 8 _; then
+  if read -r -t 1 -u 8 _; then
     (( SECONDS - lastscan > 3 )) && scan_wins
   else
     [ $? -gt 128 ] || exit 0      # 8 closed: X went away
-    scan_wins                      # timeout: pick up widgets that appeared
+    (( SECONDS - lastscan >= 3 )) && scan_wins   # quiet: pick up widgets that appeared
   fi
-  read_busy; apply
+  read_cfg; read_busy; apply
 done

@@ -1,0 +1,21 @@
+#!/bin/sh
+# mwm routing: the shell's screenshot and record actions (control centre, game bar, island, Print in the shell) run our
+# tools in ~/.local/bin (rice-shot, rice-record); every other rice-hotcorner command goes to the shell's own script.
+# port.sh renames the shell's script to rice-hotcorner.dss and puts this one in its place.
+L="$HOME/.local/bin"
+O="$HOME/.local/share/dss/bin/rice-hotcorner.dss"
+case "$1" in
+  shot)
+    case "$2" in
+      full) [ -x "$L/rice-shot" ] && exec "$L/rice-shot" full ;;
+      ""|region|window) [ -x "$L/rice-shot" ] && exec "$L/rice-shot" ;;
+    esac ;;
+  record)
+    case "$2" in
+      ""|full|region) [ -x "$L/rice-record" ] && exec "$L/rice-record" ;;   # running: a second call stops it
+      stop)
+        p=$(cat "$HOME/.cache/rice/record.pid" 2>/dev/null)
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then kill "$p"; exit 0; fi ;;   # ours is not recording: the shell's might be
+    esac ;;
+esac
+exec "$O" "$@"

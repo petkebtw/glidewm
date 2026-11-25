@@ -519,11 +519,14 @@ def items(online=None, cur=None):
     cur = cur or _cur()
     src = source()
     out = []
+    import wallcheck                          # screenshots, icons, tall or tiny pictures are not wallpapers
     for root, dirs, files in os.walk(WALLS):
         dirs.sort()
         for f in sorted(files):
             if f.lower().endswith(EXT) and not f.startswith("."):
                 p = os.path.realpath(os.path.join(root, f))
+                if p != cur and not wallcheck.is_wallpaper(p):
+                    continue
                 isonl = root == ONLINE
                 if isonl and src != "both" and origin(p) != src and p != cur:
                     continue
@@ -534,6 +537,10 @@ def items(online=None, cur=None):
                 name = os.path.splitext(f)[0]
                 name = name.split("-", 1)[1] if isonl and "-" in name else name
                 out.append(dict(name=name.replace("_", " ")[:28], wall=p, colors=None, online=isonl))
+    # one copy of each picture: the best quality one (wallcheck.dedupe)
+    best = set(wallcheck.dedupe([o["wall"] for o in out], keep=[cur]))
+    out = [o for o in out if o["wall"] in best]
+    wallcheck.save()
     def _mt(path):
         try:
             return os.path.getmtime(path)

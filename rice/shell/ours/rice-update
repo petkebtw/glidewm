@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""rice-update: updates for the mwm rice. Replaces DarkShadow's Shell updater, which wants ~/shadows-shell and its
+Hyprland install.sh. One update does both halves:
+
+  1. mwm: pulls your mwm clone (github.com/petkebtw/mwm), fast-forward only.
+  2. the shell: pulls DarkShadow's Shell (github.com/shadowww-dev/DarkShadowShell) into ~/.local/share/dss/upstream and
+     puts its quickshell/, bin/ and sounds/ in src/, bin-src/ and sounds/.
+  Then port.sh rebuilds ~/.config/quickshell with the X11 and mwm changes. If port.sh fails on a new shell version (a
+  patch no longer applies), the previous shell files are put back and rebuilt, so the shell keeps working.
+
+  rice-update                 update in a terminal
+  rice-update check [--json] [--offline]   compare with GitHub
+  rice-update watch [on|off|state]          background check after login and once a day
+  rice-update notify          show the update notification now
+  rice-update gui             background update for Settings > Update Center
+                              (steps: ~/.cache/rice/update-live.log, state: ~/.cache/rice/update-live.json)
+  rice-update center          open Settings > Update Center
+
+The mwm repo is the first of: the path in ~/.config/rice/repo, ~/mwm, ~/dwm that holds rice/shell/port.sh.
+The shell commit in use is in ~/.local/share/dss/upstream.rev (seeded from the repo's rice/shell/dss/UPSTREAM).
+"""
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+DIR = HOME + "/.config/rice"
+CACHE = HOME + "/.cache/rice"
+STATE = CACHE + "/update.json"
+NOTIFIED = CACHE + "/update-notified"
+LIVE_LOG = CACHE + "/update-live.log"
+LIVE = CACHE + "/update-live.json"
+UPDATE_CFG = DIR + "/update.json"
+DSS = HOME + "/.local/share/dss"
+UP = DSS + "/upstream"
+UP_REV = DSS + "/upstream.rev"
+UP_URL = "https://github.com/shadowww-dev/DarkShadowShell.git"
+UP_PARTS = (("quickshell", "src"), ("bin", "bin-src"), ("sounds", "sounds"))   # upstream dir -> dss dir
+DEFAULTS = {"watch": True, "every_minutes": 1440}
+FIRST_WAIT = 45
+TICK = 30
+URL = "https://github.com/petkebtw/mwm"
+NO_REPO = ("Could not find your mwm clone. Clone it and run its installer:\n"
+           "      git clone %s ~/mwm && cd ~/mwm/rice && ./install.sh\n"
+           "      (or put the clone's path in ~/.config/rice/repo)" % URL)
+
+
+def cfg():
+    c = dict(DEFAULTS)
+    try:
+        raw = json.load(open(UPDATE_CFG))
+        if isinstance(raw, dict):
+            c.update({k: raw[k] for k in DEFAULTS if k in raw})
+        c["every_minutes"] = max(60, min(10080, int(c["every_minutes"])))
+    except Exception:
+        pass
+    return c
+
+
+def save_cfg(c):
+    os.makedirs(DIR, exist_ok=True)
+    tmp = UPDATE_CFG + ".tmp"
+    json.dump(c, open(tmp, "w"))
+    os.replace(tmp, UPDATE_CFG)
+
+
+def repo():
+    cands = []
+    try:
+        cands.append(open(DIR + "/repo").read().strip())
+    except OSError:
+        pass
+    cands += [HOME + "/mwm", HOME + "/dwm"]
+    for r in cands:
+        if r and os.path.isfile(r + "/rice/shell/port.sh") and os.path.isdir(r + "/.git"):
+            return r
+    return None
+
+
+def git(r, *a, timeout=25):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="true", SSH_ASKPASS="true", GCM_INTERACTIVE="never")
+    return subprocess.run(["git", "-c", "credential.helper=", "-C", r] + list(a), capture_output=True, text=True,
+                          timeout=timeout, env=env)
+
+
+def upstream(r):
+    u = git(r, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", timeout=5)
+    return u.stdout.strip() if u.returncode == 0 and u.stdout.strip() else "origin/main"
+
+
+def short(r, ref):
+    s = git(r, "rev-parse", "--short", ref, timeout=5)
+    return s.stdout.strip() if s.returncode == 0 else ""
+
+
+# ---------- the shell (DarkShadow's Shell upstream) ----------
+
+def up_rev():
+    """the upstream commit src/ was taken from"""
+    for p in [UP_REV] + ([repo() + "/rice/shell/dss/UPSTREAM"] if repo() else []):
+        try:
+            v = open(p).read().split()[0]
+            if re.fullmatch(r"[0-9a-f]{7,40}", v):
+                return v
+        except (OSError, IndexError):
+            pass
+    return ""
+
+
+def up_fetch():
+    """private clone of the shell; returns an error string or ''"""
+    if not os.path.isdir(UP + "/.git"):
+        shutil.rmtree(UP, ignore_errors=True)
+        c = subprocess.run(["git", "-c", "credential.helper=", "clone", "--quiet", "--filter=blob:none", UP_URL, UP],
+                           capture_output=True, text=True, timeout=600,
+                           env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never"))
+        if c.returncode != 0:
+            shutil.rmtree(UP, ignore_errors=True)
+            return (c.stderr.strip().splitlines() or ["git clone failed"])[-1]
+        return ""
+    f = git(UP, "fetch", "--quiet", "origin", timeout=180)
+    return "" if f.returncode == 0 else (f.stderr.strip().splitlines() or ["git fetch failed"])[-1]
+
+
+def up_version(ref):
+    s = git(UP, "show", ref + ":VERSION", timeout=5)
+    return s.stdout.strip().lstrip("vV") if s.returncode == 0 else ""
+
+
+def up_news(have, ref="origin/main"):
+    """the release titles (V5.04: ...) between the shell in use and the newest one"""
+    rng = (have + ".." + ref) if have else ref
+    lg = git(UP, "log", "--format=%s", "-n", "30", rng, "--", "quickshell", "bin", "sounds", timeout=10)
+    rel = [ln for ln in lg.stdout.splitlines() if re.match(r"V\d+\.\d+", ln)]
+    return rel or [ln for ln in lg.stdout.splitlines() if ln.strip()]
+
+
+def up_pending(have):
+    """commits that touch the shell parts and are not in use yet; -1 = unknown"""
+    if not have:
+        return -1
+    n = git(UP, "rev-list", "--count", have + "..origin/main", "--", "quickshell", "bin", "sounds", timeout=10)
+    return int(n.stdout.strip() or 0) if n.returncode == 0 else -1
+
+
+def up_sync(say):
+    """put upstream origin/main in src/, bin-src/, sounds/; returns the backup dict for up_restore"""
+    git(UP, "reset", "--quiet", "--hard", "origin/main", timeout=120)
+    bak = {}
+    for frm, to in UP_PARTS:
+        dst = DSS + "/" + to
+        if not os.path.isdir(UP + "/" + frm):
+            continue
+        old = dst + ".old"
+        shutil.rmtree(old, ignore_errors=True)
+        if os.path.islink(dst):   # linked into the mwm repo by install.sh: leave the repo alone, use a real copy now
+            bak[to] = ("link", os.readlink(dst))
+            os.unlink(dst)
+        elif os.path.exists(dst):
+            os.rename(dst, old)
+            bak[to] = ("dir", old)
+        else:
+            bak[to] = ("none", None)
+        shutil.copytree(UP + "/" + frm, dst, symlinks=True)
+    return bak
+
+
+def up_restore(bak):
+    for to, (kind, v) in bak.items():
+        dst = DSS + "/" + to
+        shutil.rmtree(dst, ignore_errors=True)
+        if kind == "link":
+            os.symlink(v, dst)
+        elif kind == "dir":
+            os.rename(v, dst)
+
+
+def up_drop_backup(bak):
+    for kind, v in bak.values():
+        if kind == "dir":
+            shutil.rmtree(v, ignore_errors=True)
+
+
+# ---------- check ----------
+
+def check(offline=False):
+    r = repo()
+    out = {"installed": "?", "latest": "?", "update": False, "changes": 0, "commit": "", "news": [],
+           "checked": int(time.time()), "error": ""}
+    if not shutil.which("git"):
+        out["error"] = "git is not installed"
+    else:
+        errs, mw_new, mw_have, mw_n, news = [], "", "", 0, []
+        if r:
+            try:
+                if not offline:
+                    f = git(r, "fetch", "--quiet", "origin")
+                    if f.returncode != 0:
+                        errs.append((f.stderr.strip().splitlines() or ["git fetch failed"])[-1])
+                ref = upstream(r)
+                mw_have = short(r, "HEAD")
+                mw_new = short(r, ref) or mw_have
+                n = git(r, "rev-list", "--count", "HEAD.." + ref, timeout=5)
+                mw_n = int(n.stdout.strip() or 0) if n.returncode == 0 else 0
+                if mw_n:
+                    lg = git(r, "log", "--format=%s", "-n", "3", "HEAD.." + ref, timeout=5)
+                    news += ["mwm: " + ln for ln in lg.stdout.splitlines() if ln.strip()]
+            except Exception as e:
+                errs.append(str(e))
+        else:
+            errs.append("no mwm clone found (see rice-update --help)")
+        have = up_rev()
+        try:
+            if not offline:
+                e = up_fetch()
+                if e:
+                    errs.append(e)
+            if os.path.isdir(UP + "/.git"):
+                sh_n = up_pending(have)
+                sh_have = up_version(have) if have else ""
+                sh_new = up_version("origin/main")
+                if sh_n != 0:
+                    news = up_news(have) + news
+            else:
+                sh_n, sh_have, sh_new = 0, "", ""
+        except Exception as e:
+            errs.append(str(e))
+            sh_n, sh_have, sh_new = 0, "", ""
+        out["installed"] = "%s · mwm %s" % (sh_have or "?", mw_have or "?")
+        out["latest"] = "%s · mwm %s" % (sh_new or sh_have or "?", mw_new or mw_have or "?")
+        out["changes"] = mw_n + max(sh_n, 0)
+        out["update"] = mw_n > 0 or sh_n != 0
+        out["commit"] = "%s %s" % (short(UP, "origin/main") if os.path.isdir(UP + "/.git") else "", mw_new)
+        out["news"] = news[:4]
+        out["error"] = "; ".join(errs)
+    os.makedirs(CACHE, exist_ok=True)
+    try:
+        json.dump(out, open(STATE, "w"))
+    except OSError:
+        pass
+    return out
+
+
+# ---------- update ----------
+
+def update(r, log):
+    """pull mwm (fast-forward only, local edits are never overwritten), pull the shell, rebuild, restart the shell"""
+    def say(s):
+        log.write(s + "\n")
+        log.flush()
+    def step(cmd, **kw):
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kw)
+        for ln in p.stdout.splitlines():
+            say("      " + ln)
+        return p.returncode
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+    if r:
+        old = short(r, "HEAD")
+        say("    → Pulling " + URL + " into " + r)
+        if step(["git", "-c", "credential.helper=", "-C", r, "pull", "--ff-only", "--quiet"], env=env, timeout=180) != 0:
+            say("    ✘ git pull failed. Local changes or a diverged branch: run  git -C %s status" % r)
+            return 1
+        new = short(r, "HEAD")
+        if old == new:
+            say("    ✔ mwm is up to date (%s)" % new)
+        else:
+            say("    ✔ mwm %s → %s" % (old, new))
+            ch = git(r, "diff", "--name-only", old, new, timeout=10).stdout.split()
+            if any(f.endswith((".c", ".h", ".mk")) and "/" not in f for f in ch):
+                say("    ℹ mwm itself changed: run  cd %s && make && sudo make install, then Mod+Shift+q" % r)
+        # files new in this version get their links (install.sh skips everything that exists)
+        if os.access(r + "/rice/install.sh", os.X_OK):
+            say("    → Linking new files (install.sh)")
+            step([r + "/rice/install.sh"], cwd=r + "/rice", timeout=60)
+    else:
+        say("    ℹ No mwm clone found, updating the shell only")
+
+    say("    → Fetching DarkShadow's Shell")
+    e = up_fetch()
+    if e:
+        say("    ✘ " + e)
+        return 1
+    have, tip = up_rev(), git(UP, "rev-parse", "origin/main", timeout=5).stdout.strip()
+    bak = None
+    if have and git(UP, "rev-parse", have, timeout=5).stdout.strip() == tip:
+        say("    ✔ The shell is up to date (V%s)" % up_version("origin/main"))
+    elif up_pending(have) == 0:
+        say("    ✔ The shell is up to date (V%s, no shell files changed)" % up_version("origin/main"))
+        open(UP_REV, "w").write(tip + "\n")
+    else:
+        say("    → Shell V%s → V%s" % (up_version(have) if have else "?", up_version("origin/main")))
+        for n in up_news(have)[:6]:
+            say("      " + n)
+        bak = up_sync(say)
+
+    port = DSS + "/port.sh"
+    if not os.access(port, os.X_OK) and r:
+        port = r + "/rice/shell/port.sh"
+    say("    → Rebuilding the shell (port.sh)")
+    if step(["bash", port], timeout=300) != 0:
+        if bak is None:
+            say("    ✘ port.sh failed")
+            return 1
+        say("    ✘ port.sh failed on the new shell (an X11 patch no longer applies). Putting the old shell back.")
+        up_restore(bak)
+        if step(["bash", port], timeout=300) != 0:
+            say("    ✘ port.sh failed on the old shell too: see the lines above")
+        else:
+            say("    ✔ Old shell rebuilt, nothing changed. port.sh needs a fix for the new version.")
+        return 1
+    if bak is not None:
+        up_drop_backup(bak)
+        open(UP_REV, "w").write(tip + "\n")
+    say("    ✔ Shell rebuilt")
+    start = DSS + "/dss-start"
+    desk = []   # only the desktop shell: Settings (where this update may run from) stays open
+    for p in subprocess.run(["pgrep", "-x", "qs"], capture_output=True, text=True).stdout.split():
+        try:
+            if HOME + "/.config/quickshell/rice-desktop" in open("/proc/%s/cmdline" % p).read():
+                desk.append(int(p))
+        except (OSError, ValueError):
+            pass
+    if os.access(start, os.X_OK) and desk:
+        say("    → Restarting the shell")
+        for p in desk:
+            try:
+                os.kill(p, 15)
+            except OSError:
+                pass
+        time.sleep(1)
+        subprocess.Popen([start], start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    say("    ✔ Done")
+    return 0
+
+
+def live():
+    try:
+        return json.load(open(LIVE))
+    except (OSError, ValueError):
+        return {}
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def put_live(**kw):
+    os.makedirs(CACHE, exist_ok=True)
+    tmp = LIVE + ".new"
+    with open(tmp, "w") as f:
+        json.dump(kw, f)
+    os.replace(tmp, LIVE)
+
+
+def gui():
+    os.makedirs(CACHE, exist_ok=True)
+    lk = open(CACHE + "/update.lock", "w")
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("already updating")
+        return 0
+    st = live()
+    if st.get("state") == "running" and alive(st.get("pid")):
+        print("already updating")
+        return 0
+    r = repo()
+    t0 = int(time.time())
+    if os.fork() != 0:
+        return 0
+    os.setsid()
+    if os.fork() != 0:
+        os._exit(0)
+    log = open(LIVE_LOG, "w", buffering=1)
+    was = check(offline=True).get("installed", "")
+    put_live(state="running", code=-1, started=t0, ended=0, pid=os.getpid(), was=was)
+    try:
+        code = update(r, log)
+    except Exception as e:
+        log.write("    ✘ %s\n" % e)
+        code = 1
+    try:
+        now = check(offline=True).get("installed", "")
+    except Exception:
+        now = ""
+    put_live(state="done" if code == 0 else "failed", code=code, started=t0, ended=int(time.time()), pid=0,
+             was=was, now=now)
+    os._exit(0)
+
+
+def run():
+    r = repo()
+    if not r:
+        print(NO_REPO.replace("      ", "  "))
+        print()
+    code = update(r, sys.stdout)
+    print()
+    try:
+        input("Press Enter to close")
+    except EOFError:
+        pass
+    return code
+
+
+def open_center():
+    rs = DSS + "/bin/rice-settings"
+    if os.access(rs, os.X_OK):
+        subprocess.Popen([rs, "35"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        t = os.environ.get("TERMINAL") or "konsole"
+        subprocess.Popen([t, "-e", os.path.abspath(__file__)], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def notify(st):
+    if not shutil.which("notify-send"):
+        return
+    body = "<b>%d new change%s</b>" % (st["changes"], "" if st["changes"] == 1 else "s")
+    for n in st.get("news", [])[:3]:
+        body += "\n•  " + n.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    try:
+        r = subprocess.run(["notify-send", "-a", "mwm", "-i", "system-software-update", "-t", "20000",
+                            "-A", "default=Update now", "-A", "later=Later", "--wait", "mwm update available", body],
+                           capture_output=True, text=True, timeout=6 * 3600)
+        if r.stdout.strip() == "default":
+            open_center()
+    except Exception:
+        pass
+
+
+def notify_bg(st):
+    if os.fork() == 0:
+        os.setsid()
+        notify(st)
+        os._exit(0)
+
+
+def maybe_notify(st):
+    if not st or not st.get("update"):
+        return
+    try:
+        told = open(NOTIFIED).read().strip()
+    except OSError:
+        told = ""
+    if told != st.get("commit", ""):
+        open(NOTIFIED, "w").write(st.get("commit", ""))
+        notify_bg(st)
+
+
+def watch():
+    if cfg().get("watch") is False:
+        return
+    os.makedirs(CACHE, exist_ok=True)
+    lk = open(CACHE + "/update-watch.lock", "w")
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    time.sleep(FIRST_WAIT)
+    last = 0.0
+    while True:
+        c = cfg()
+        if c.get("watch") is False:
+            return
+        try:
+            if time.time() - last >= int(c["every_minutes"]) * 60:
+                last = time.time()
+                maybe_notify(check())
+        except Exception:
+            pass
+        time.sleep(TICK)
+
+
+# ---------- what's new (Settings shows the shell's CHANGELOG entry once after an update) ----------
+
+SEEN = DIR + "/whatsnew-seen"
+
+
+def md_line(t):
+    """a CHANGELOG line for Settings (Qt's StyledText): **bold**, `code`, the rest escaped"""
+    t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    return re.sub(r"`(.+?)`", r"<i>\1</i>", t)
+
+
+def shell_version():
+    """the shell version in use (VERSION of the synced upstream commit)"""
+    rev = up_rev()
+    return up_version(rev) if rev and os.path.isdir(UP + "/.git") else ""
+
+
+def whatsnew(ver=None):
+    inst = shell_version()
+    ver = ver or inst
+    text = ""
+    if os.path.isdir(UP + "/.git"):
+        c = git(UP, "show", (up_rev() or "origin/main") + ":CHANGELOG.md", timeout=5)
+        text = c.stdout if c.returncode == 0 else ""
+    title, items, found = "", [], False
+    for line in text.splitlines():
+        m = re.match(r"^##\s+V([\d.]+)\s*:?\s*(.*)$", line)
+        if m:
+            if found:
+                break
+            found = m.group(1) == ver
+            title = m.group(2).strip() if found else ""
+            title = title[:1].upper() + title[1:]
+            continue
+        if found and line.startswith("- "):
+            items.append(md_line(line[2:].strip()))
+    try:
+        seen = open(SEEN).read().strip()
+    except OSError:
+        seen = ""
+    first = not os.path.exists(DIR + "/welcome-seen") and not seen
+    if first and inst:
+        try:
+            open(SEEN, "w").write(inst + "\n")
+        except OSError:
+            pass
+    print(json.dumps({"version": ver, "title": title, "items": items[:16], "more": max(0, len(items) - 16),
+                      "show": bool(items) and not first and seen != ver and ver == inst}))
+
+
+def main(a):
+    cmd = a[1] if len(a) > 1 else ""
+    if cmd == "whatsnew":
+        whatsnew(a[2] if len(a) > 2 else None)
+        return
+    if cmd == "whatsnew-seen":
+        try:
+            open(SEEN, "w").write(shell_version() + "\n")
+        except OSError:
+            pass
+        return
+    if cmd == "check":
+        st = check(offline="--offline" in a)
+        if "--json" in a:
+            print(json.dumps(st))
+        elif st["update"]:
+            print("Update available: %d new change%s (you have %s). Run: rice-update"
+                  % (st["changes"], "" if st["changes"] == 1 else "s", st["installed"]))
+            for n in st["news"]:
+                print("  - " + n)
+        else:
+            print("Up to date: V%s%s" % (st["installed"], ("  (could not check: %s)" % st["error"]) if st["error"] else ""))
+    elif cmd == "watch":
+        if len(a) > 2 and a[2] == "state":
+            c = cfg()
+            print(json.dumps({"watch": c.get("watch") is not False, "every_minutes": c["every_minutes"]}))
+        elif len(a) > 2 and a[2] in ("on", "off"):
+            c = cfg()
+            c["watch"] = a[2] == "on"
+            save_cfg(c)
+            print("Background update checks: " + ("on" if c["watch"] else "off"))
+            if c["watch"]:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__), "watch"], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
+        else:
+            watch()
+    elif cmd == "notify":
+        st = check(offline="--offline" in a)
+        if not st["news"]:
+            st["news"] = ["This is how the update notification looks"]
+        st["changes"] = st["changes"] or 1
+        notify_bg(st)
+    elif cmd == "gui":
+        sys.exit(gui())
+    elif cmd == "center":
+        open_center()
+    elif cmd in ("-h", "--help", "help"):
+        print(__doc__)
+    elif cmd in ("", "run"):
+        sys.exit(run())
+    else:
+        # never update on a command this updater does not know (a newer Settings may call one): that rebuilt the
+        # shell under a running Settings and crashed it
+        print("rice-update: unknown command %r (see rice-update --help)" % cmd, file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

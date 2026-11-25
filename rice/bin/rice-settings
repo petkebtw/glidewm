@@ -602,7 +602,7 @@ os.makedirs(os.path.dirname(BINDS), exist_ok=True)
 
 
 def seed():
-    for exe in (f"{HOME}/dwm/dwm", "dwm"):
+    for exe in (f"{HOME}/dwm/mwm", "/usr/local/bin/mwm", "mwm", f"{HOME}/dwm/dwm", "dwm"):
         o = out(exe, "--dump-binds", t=3)
         if o.count("=") > 10:
             open(BINDS, "w").write(o + "\n")

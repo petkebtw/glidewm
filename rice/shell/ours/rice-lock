@@ -1,0 +1,8 @@
+#!/bin/sh
+# mwm routing: "lock now" (power menu, idle, the shell's keys) runs our X11 lock screen (~/.local/bin/rice-lock); the
+# shell's own lock screen needs WlSessionLock (Wayland). Settings commands (state, set, preview ...) go to the shell's script.
+L="$HOME/.local/bin/rice-lock"
+case "$1" in
+  now|test) [ -x "$L" ] && exec "$L" ;;
+esac
+exec "$HOME/.local/share/dss/bin/rice-lock.dss" "$@"
