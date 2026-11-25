@@ -306,7 +306,7 @@ PART_DESC=("build, sudo make install -> /usr/local/bin/mwm"
 blocked() { case $1 in 0) echo "$NOBUILD" ;; 2) echo "$NOSHELL" ;; *) echo "" ;; esac; }
 [ -n "$NOSHELL" ] && [ "$SHELL_" = 1 ] && { SHELL_=0; warn "Shell left out: $NOSHELL"; }
 
-menu() {
+menu_plain() {
   local i v ans k
   while :; do
     printf '\n%sChoose what to install%s  %s(numbers toggle, a = all, n = none, Enter = start, q = quit)%s\n' "$B" "$N" "$D" "$N"
@@ -334,6 +334,63 @@ menu() {
   if [ "$SHELL_" = 1 ] && [ "$RICE" = 0 ] && [ ! -e "$HOME/.local/share/dss/src" ]; then
     warn "the shell needs the rice part once (it links the shell files): Rice is turned on"; RICE=1
   fi
+}
+
+# arrow-key picker (like Claude Code): up/down or j/k move, Space toggles, Enter toggles a part or submits on Submit,
+# a = all, n = none, Esc / q quits
+menu() {
+  case "${TERM:-dumb}" in dumb|"") menu_plain; return ;; esac
+  local cur=0 key rest i v msg="" first=1 rows=9
+  printf '\e[?25l'; trap 'printf "\e[?25h"' EXIT
+  trap 'printf "\e[?25h\n"; echo "Nothing changed."; exit 130' INT
+  toggle() {
+    if [ -n "$(blocked "$1")" ]; then msg="${PART_NAME[$1]} cannot be installed: $(blocked "$1")"; return; fi
+    eval "${PART_VAR[$1]}=$(( 1 - ${!PART_VAR[$1]} ))"
+  }
+  while :; do
+    [ $first = 1 ] || printf '\e[%dA' $rows; first=0
+    printf '\e[2K%sChoose what to install%s\n' "$B" "$N"
+    for i in 0 1 2 3 4; do
+      v=${!PART_VAR[i]}
+      local mark="[ ]" col="" ptr="  "
+      [ "$v" = 1 ] && mark="[x]" col=$G
+      [ $i = $cur ] && ptr="${B}❯${N} "
+      if [ -n "$(blocked $i)" ]; then
+        printf '\e[2K %s%s[-] %-17s %s%s\n' "$ptr" "$D" "${PART_NAME[i]}" "$(blocked $i)" "$N"
+      elif [ $i = $cur ]; then
+        printf '\e[2K %s%s%s%s %s%-17s%s %s%s%s\n' "$ptr" "$col" "$mark" "$N" "$B" "${PART_NAME[i]}" "$N" "$D" "${PART_DESC[i]}" "$N"
+      else
+        printf '\e[2K %s%s%s%s %-17s %s%s%s\n' "$ptr" "$col" "$mark" "$N" "${PART_NAME[i]}" "$D" "${PART_DESC[i]}" "$N"
+      fi
+    done
+    printf '\e[2K\n'
+    if [ $cur = 5 ]; then printf '\e[2K %s❯ %sSubmit%s\n' "$B" "$G" "$N"; else printf '\e[2K   Submit\n'; fi
+    if [ -n "$msg" ]; then printf '\e[2K %s%s%s\n' "$Y" "$msg" "$N"; msg=""
+    else printf '\e[2K %s↑/↓ move · Space toggle · Enter select · a all · n none · Esc quit%s\n' "$D" "$N"; fi
+    IFS= read -rsn1 key || { printf '\e[?25h'; exit 0; }
+    case "$key" in
+      $'\e')
+        rest=""; IFS= read -rsn2 -t 0.05 rest
+        case "$rest" in
+          '[A'|'OA') cur=$(( (cur + 5) % 6 )) ;;
+          '[B'|'OB') cur=$(( (cur + 1) % 6 )) ;;
+          '') printf '\e[?25h'; echo "Nothing changed."; exit 0 ;;
+        esac ;;
+      k) cur=$(( (cur + 5) % 6 )) ;;
+      j|$'\t') cur=$(( (cur + 1) % 6 )) ;;
+      ' ') [ $cur -lt 5 ] && toggle $cur ;;
+      '') if [ $cur = 5 ]; then break; else toggle $cur; fi ;;
+      a|A) for i in 0 1 2 3 4; do [ -z "$(blocked $i)" ] && eval "${PART_VAR[i]}=1"; done ;;
+      n|N) for i in 0 1 2 3 4; do eval "${PART_VAR[i]}=0"; done ;;
+      q|Q) printf '\e[?25h'; echo "Nothing changed."; exit 0 ;;
+    esac
+  done
+  printf '\e[?25h'; trap - INT
+  [ $((BUILD + RICE + SHELL_ + SESSION + APPS)) -eq 0 ] && { echo "Nothing chosen, nothing changed."; exit 0; }
+  if [ "$SHELL_" = 1 ] && [ "$RICE" = 0 ] && [ ! -e "$HOME/.local/share/dss/src" ]; then
+    warn "the shell needs the rice part once (it links the shell files): Rice is turned on"; RICE=1
+  fi
+  return 0
 }
 
 if [ "$YES" = 0 ] && [ "$ONLY" = 0 ] && [ -t 0 ]; then

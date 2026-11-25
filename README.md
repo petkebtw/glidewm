@@ -107,16 +107,19 @@ The screenshots show mwm with a full desktop shell on top. It lives in [`rice/`]
 ```sh
 git clone https://github.com/petkebtw/mwm.git && cd mwm
 ./install.sh --check     # what is installed, what is missing (with the package names for your distro)
-./install.sh             # pick the parts in a menu, then install
+./install.sh             # pick the parts (arrow keys, Space, Enter on Submit), then install
 ```
 
 ```
-Choose what to install  (numbers toggle, a = all, n = none, Enter = start, q = quit)
-  1  [x] mwm                build, sudo make install -> /usr/local/bin/mwm
-  2  [x] Rice               rice-* helpers, Python library, picom/rofi/keys configs, ~/.xprofile
-  3  [x] Shell              Quickshell: widgets, control centre, launcher, settings, lock
-  4  [x] Login session      "mwm" at the SDDM / LightDM / GDM login, ~/.xinitrc for startx (sudo)
-  5  [x] App menu entries   Settings, Theme Switcher, Screenshot, Recorder ... in your app launcher
+Choose what to install
+ ❯ [x] mwm               build, sudo make install -> /usr/local/bin/mwm
+   [x] Rice              rice-* helpers, Python library, picom/rofi/keys configs, ~/.xprofile
+   [x] Shell             Quickshell: widgets, control centre, launcher, settings, lock
+   [x] Login session     "mwm" at the SDDM / LightDM / GDM login, ~/.xinitrc for startx (sudo)
+   [x] App menu entries  Settings, Theme Switcher, Screenshot, Recorder ... in your app launcher
+
+   Submit
+ ↑/↓ move · Space toggle · Enter select · a all · n none · Esc quit
 ```
 
 - 🔍 **Checks first:** every dependency (build, rice, shell, optional) with the install command for Gentoo, Arch, Debian or Fedora. A part whose dependencies are missing is greyed out.
