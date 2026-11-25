@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """glidewm logo, dwm style: lowercase letters on a unit grid, strokes one unit thick, square corners.
 x-height 5 units (rows 2-6), ascenders rows 0-1, descender rows 7-8; w and m share a stem like dwm's d, w, m.
-Writes glidewm.svg (dark ink), glidewm-light.svg (light ink, for dark backgrounds), glidewm-icon.svg (the g on a
+Writes glidewm.svg (black ink), glidewm-light.svg (light ink, for dark backgrounds), glidewm-icon.svg (the g on a
 rounded square) and PNGs. Run: python3 make.py"""
 import subprocess
 
@@ -56,8 +56,8 @@ def svg(cs, ink, w, h, pad=0, bg=None, rx=0, scale=U, title="glidewm"):
 
 glyphs()
 W = max(c for c, _ in cells) + 1; H = 9
-open("glidewm.svg", "w").write(svg(cells, "#222222", W, H))
-open("glidewm-light.svg", "w").write(svg(cells, "#eeeeee", W, H))
+open("glidewm.svg", "w").write(svg(cells, "#000000", W, H))
+open("glidewm-light.svg", "w").write(svg(cells, "#ffffff", W, H))
 g = {(c, r) for c, r in cells if c <= 3}                                 # the g alone, centred in a square
 # icon: 13x13 units, g (4x9) centred, dark rounded square
 gi = {(c + 3, r - 2 + 1.5) for c, r in g}                               # g is 4x7 (rows 2-8): centred in 10x10
