@@ -458,6 +458,8 @@ def maybe_notify(st):
 
 
 def watch():
+    """the background check. Python is not kept resident for a check a day (it held ~8 MB the whole session):
+    a sh loop keeps the lock and sleeps, and starts `watch-once` when a check may be due (2026-11-26)"""
     if cfg().get("watch") is False:
         return
     os.makedirs(CACHE, exist_ok=True)
@@ -466,19 +468,27 @@ def watch():
         fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return
-    time.sleep(FIRST_WAIT)
-    last = 0.0
-    while True:
-        c = cfg()
-        if c.get("watch") is False:
-            return
+    os.set_inheritable(lk.fileno(), True)    # the lock stays held by the sh loop below
+    loop = ('py=$2 me=$3 last=0; sleep "$1"; while :; do r=$("$py" "$me" watch-once "$last") || exit 0; '
+            'set -- $r; [ -n "$2" ] || exit 0; last=$1; sleep "$2"; done')
+    os.execvp("sh", ["sh", "-c", loop, "rice-update-watch", str(FIRST_WAIT), sys.executable, os.path.abspath(__file__)])
+
+
+def watch_once(last):
+    """one step of the watch loop: checks when due, prints "<last check> <seconds to sleep>"; exit 1 = stop"""
+    c = cfg()
+    if c.get("watch") is False:
+        sys.exit(1)
+    now = time.time()
+    every = int(c["every_minutes"]) * 60
+    if now - last >= every:
+        last = now
         try:
-            if time.time() - last >= int(c["every_minutes"]) * 60:
-                last = time.time()
-                maybe_notify(check())
+            maybe_notify(check())
         except Exception:
             pass
-        time.sleep(TICK)
+    # wake up at least every 5 minutes, so "watch off" or a new interval in Settings is seen
+    print("%d %d" % (last, max(TICK, min(300, int(last + every - now)))))
 
 
 # ---------- what's new (Settings shows the shell's CHANGELOG entry once after an update) ----------
@@ -568,6 +578,8 @@ def main(a):
                                  stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
         else:
             watch()
+    elif cmd == "watch-once":
+        watch_once(float(a[2]) if len(a) > 2 else 0.0)
     elif cmd == "notify":
         st = check(offline="--offline" in a)
         if not st["news"]:

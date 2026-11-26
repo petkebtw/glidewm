@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Themed polkit password dialog (GTK3), started by polkit-agent (C) only while a request is open.
+
+polkit-dialog MESSAGE      reads lines from polkit-agent on stdin:  PROMPT <text>, ERROR <text>, INFO <text>, QUIT
+                           writes to stdout:  PASS <password>  or  CANCEL
+The window is the one the Python agent drew before 2026-11-26 (the agent itself is C now: it stays resident at
+about 1 MB instead of ~18 MB of Python and GTK)."""
+import os, sys
+sys.path.insert(0, os.path.expanduser("~/.local/lib/rice"))
+import rice
+from rice import Gtk, Gdk, GLib
+
+
+class Dialog(Gtk.Window):
+    def __init__(self, message, on_pass, on_cancel):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.set_wmclass("RiceAuth", "RiceAuth")
+        self.set_title("Authentication required")
+        self.set_default_size(420, 200)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_keep_above(True)
+        self.set_decorated(False)
+        self.set_app_paintable(True)
+        vis = self.get_screen().get_rgba_visual()
+        if vis: self.set_visual(vis)
+        self.c = rice.colors()
+        self.connect("draw", self._draw)
+        css = Gtk.CssProvider()
+        c = self.c
+        css.load_from_data(f"""
+        * {{ font-family: '{rice.FONT}'; color: {c['fg']}; }}
+        window {{ background: transparent; }}
+        entry {{ background: {c['bg2']}; border: 1px solid {c['border']}; border-radius: 10px; padding: 9px 12px; }}
+        entry:focus {{ border-color: {c['accent']}; }}
+        button {{ background: {c['bg2']}; border: none; border-radius: 10px; padding: 8px 18px; box-shadow: none; }}
+        button.ok {{ background: {c['accent']}; color: {c['bg']}; }}
+        button.ok label {{ color: {c['bg']}; }}
+        .dim {{ color: {c['dim']}; }}
+        """.encode())
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for m in ("start", "end", "top", "bottom"):
+            getattr(box, f"set_margin_{m}")(22)
+        self.add(box)
+        h = Gtk.Label(xalign=0); h.set_markup("<b>  Authentication required</b>")
+        box.pack_start(h, False, False, 0)
+        msg = Gtk.Label(label=message, xalign=0, wrap=True); msg.set_max_width_chars(42); msg.get_style_context().add_class("dim")
+        box.pack_start(msg, False, False, 0)
+        self.prompt = Gtk.Label(label="Password:", xalign=0); box.pack_start(self.prompt, False, False, 0)
+        self.entry = Gtk.Entry(); self.entry.set_visibility(False)
+        self.entry.connect("activate", lambda e: on_pass(e.get_text()))
+        box.pack_start(self.entry, False, False, 0)
+        self.err = Gtk.Label(label="", xalign=0); box.pack_start(self.err, False, False, 0)
+        row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel"); cancel.connect("clicked", lambda b: on_cancel())
+        ok = Gtk.Button(label="Authenticate"); ok.get_style_context().add_class("ok")
+        ok.connect("clicked", lambda b: on_pass(self.entry.get_text()))
+        row.pack_start(cancel, False, False, 0); row.pack_start(ok, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        self.connect("key-press-event", lambda w, e: on_cancel() if e.keyval == Gdk.KEY_Escape else None)
+
+    def _draw(self, w, cr):
+        import cairo
+        a = self.get_allocation()
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        rice.rounded(cr, 0.5, 0.5, a.width - 1, a.height - 1, 22)
+        cr.set_source_rgba(*rice.rgb(self.c["bg"], 0.92)); cr.fill_preserve()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        cr.set_source_rgba(*rice.rgb(self.c["accent"], 0.7)); cr.set_line_width(1.5); cr.stroke()
+
+
+def say(line):
+    try:
+        sys.stdout.write(line + "\n"); sys.stdout.flush()
+    except OSError:
+        Gtk.main_quit()
+
+
+def main():
+    message = sys.argv[1] if len(sys.argv) > 1 else ""
+    dlg = Dialog(message, lambda pw: (dlg.err.set_text(""), say("PASS " + pw.replace("\n", " "))),
+                 lambda: (say("CANCEL"), Gtk.main_quit()))
+    dlg.connect("delete-event", lambda *a: (say("CANCEL"), Gtk.main_quit()))
+
+    buf = [b""]
+
+    def line_in(src, cond):
+        try:
+            data = os.read(src, 4096)
+        except OSError:
+            data = b""
+        if not data:
+            Gtk.main_quit()
+            return False
+        buf[0] += data
+        while b"\n" in buf[0]:
+            line, buf[0] = buf[0].split(b"\n", 1)
+            cmd, _, text = line.decode(errors="replace").partition(" ")
+            if cmd == "QUIT":
+                Gtk.main_quit()
+                return False
+            if cmd == "PROMPT":
+                dlg.prompt.set_text(text); dlg.entry.set_text(""); dlg.entry.grab_focus()
+            elif cmd in ("ERROR", "INFO"):
+                dlg.err.set_text(text)
+        return True
+
+    GLib.io_add_watch(sys.stdin.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, line_in)
+    if rice.anim_on():
+        dlg.get_child().set_opacity(0.0)
+    dlg.show_all(); dlg.entry.grab_focus()
+    if rice.anim_on():
+        rice.fade_child(dlg, 1.0, 170, 170)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

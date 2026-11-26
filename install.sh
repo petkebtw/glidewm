@@ -66,6 +66,9 @@ build|Xft headers|pc:xft|x11-libs/libXft|libxft|libxft-dev|libXft-devel
 build|Xinerama headers|pc:xinerama|x11-libs/libXinerama|libxinerama|libxinerama-dev|libXinerama-devel
 build|XTest headers|pc:xtst|x11-libs/libXtst|libxtst|libxtst-dev|libXtst-devel
 build|Xext headers|pc:xext|x11-libs/libXext|libxext|libxext-dev|libXext-devel
+core|XRandR headers (rice-busy, rice-widget-fade)|pc:xrandr|x11-libs/libXrandr|libxrandr|libxrandr-dev|libXrandr-devel
+core|XFixes headers (clip-daemon)|pc:xfixes|x11-libs/libXfixes|libxfixes|libxfixes-dev|libXfixes-devel
+core|polkit agent headers (polkit-agent)|pc:polkit-agent-1|sys-auth/polkit|polkit|libpolkit-agent-1-dev|polkit-devel
 build|cairo (xlib)|pc:cairo-xlib|x11-libs/cairo|cairo|libcairo2-dev|cairo-devel
 build|fontconfig|pc:fontconfig|media-libs/fontconfig|fontconfig|libfontconfig1-dev|fontconfig-devel
 build|freetype|pc:freetype2|media-libs/freetype|freetype2|libfreetype-dev|freetype-devel
@@ -131,6 +134,7 @@ have() {
     py:*) python3 -c "import ${how#py:}" 2>/dev/null ;;
     font:*) fc-list 2>/dev/null | grep -qi "${how#font:}" ;;
     polkit-agent-any)
+      [ -x "$R/rice/lean/polkit-agent" ] && return 0   # the rice's own (rice/lean, C)
       for p in /usr/lib*/polkit-kde-authentication-agent-1 /usr/libexec/polkit-kde-authentication-agent-1 \
                /usr/lib*/polkit-gnome/polkit-gnome-authentication-agent-1 /usr/libexec/polkit-gnome-authentication-agent-1; do
         [ -x "$p" ] && return 0

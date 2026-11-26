@@ -4,4 +4,10 @@ export QML_IMPORT_PATH="$HOME/.local/share/dss/qml${QML_IMPORT_PATH:+:$QML_IMPOR
 export PATH="$HOME/.local/share/dss/bin:$PATH"
 # vsync on for every shell window (the desktop shell too since 2026-11-25: 165 fps menus instead of 60-120).
 export __GL_SYNC_TO_VBLANK=1
+# glibc gives every thread its own malloc arena; the shell runs ~20 threads and the heap fragmented to
+# 650+ MB over a session. Two arenas and earlier trimming keep it small (no visual or speed change).
+export MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=4194304
+# no transparent huge pages (2026-11-26): the kernel default "always" put ~170 MB of mostly empty 2 MB pages
+# into the shell heap; ~/.local/bin/nothp (rice/nothp) turns them off for it
+if [ -x "$HOME/.local/bin/nothp" ]; then exec "$HOME/.local/bin/nothp" /usr/bin/qs "$@"; fi
 exec /usr/bin/qs "$@"

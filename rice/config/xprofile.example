@@ -12,19 +12,21 @@ theme-switch --restore || feh --bg-fill ~/Pictures/wall.jpg &
 # one unless told otherwise (75 fps instead of 165 measured). Name the fast output here and uncomment.
 # export __GL_SYNC_DISPLAY_DEVICE=DP-1
 
+# nothp (rice/lean): the session daemons run without transparent huge pages, which held ~250 MB of mostly
+# empty 2 MB pages at login. Apps started from glidewm keep them.
 # compositor (NVIDIA + mixed refresh rates: sync to the fast output)
-# __GL_SYNC_DISPLAY_DEVICE=DP-1 picom --config ~/.config/picom/rice.conf &
-picom --config ~/.config/picom/rice.conf &
+# __GL_SYNC_DISPLAY_DEVICE=DP-1 nothp picom --config ~/.config/picom/rice.conf &
+nothp picom --config ~/.config/picom/rice.conf &
 
-rice-supervise dwm-status &
-rice-supervise clip-daemon &
-rice-supervise polkit-agent &
-~/.local/share/dss/dss-start &          # Quickshell shell, after you build it with port.sh
+nothp rice-supervise dwm-status &
+nothp rice-supervise clip-daemon &
+nothp rice-supervise polkit-agent &
+nothp ~/.local/share/dss/dss-start &          # Quickshell shell, after you build it with port.sh
 
 setxkbmap us
 xset s off; xset s noblank; xset -dpms
 export XCURSOR_THEME=Adwaita XCURSOR_SIZE=24
 export NO_AT_BRIDGE=1
 
-(sleep 2; pipewire-pulse) &
+(sleep 2; exec nothp pipewire-pulse) &
 (sleep 3; rice-apply) &

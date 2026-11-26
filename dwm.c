@@ -265,7 +265,10 @@ static int avatard(void);
 static int traymirrorclick(Monitor *m, XButtonPressedEvent *ev);
 static void syncptrmon(void);
 static void rlayout(int bw, int *acx, int *ckx, int *ckw, int *icx, int *hasicon);
-static Atom ricecmd;
+static Atom ricecmd, ricehover;
+static int hovertag = -1;   /* tag under the pointer on hovermon's bar (-1: none), published in root _RICE_HOVER */
+static Monitor *hovermon;
+static double lastanim;
 static int tagstyle = 0, showtitle = 1, showlayout = 1; /* bar options, IPC 11 */
 #define LTW(m) (showlayout ? TEXTW(layoutlabel(m)) : 0)
 static void ricecmdrun(void);
@@ -295,6 +298,8 @@ static void maprequest(XEvent *e);
 static int isshellwin(Window w);
 static void monocle(Monitor *m);
 static void motionnotify(XEvent *e);
+static void leavenotify(XEvent *e);
+static void taghover(Monitor *m, int x, int in);
 static void movemouse(const Arg *arg);
 static Client *nexttiled(Client *c);
 static void pop(Client *c);
@@ -391,6 +396,7 @@ static void (*handler[LASTEvent]) (XEvent *) = {
 	[Expose] = expose,
 	[FocusIn] = focusin,
 	[KeyPress] = keypress,
+	[LeaveNotify] = leavenotify,
 	[MappingNotify] = mappingnotify,
 	[MapRequest] = maprequest,
 	[MotionNotify] = motionnotify,
@@ -2058,6 +2064,48 @@ monocle(Monitor *m)
 		resize(c, m->wx + gp(m), m->wy + gp(m), m->ww - 2 * gp(m) - 2 * c->bw, m->wh - 2 * gp(m) - 2 * c->bw, 0);
 }
 
+/* The tag under the pointer on a bar: root _RICE_HOVER (CARDINAL) = {tag 1-9, x of the tag's middle, bottom of the
+ * bar, monitor number, the windows on that tag ...}, or {0} when the pointer is on no tag. The shell's TagPeek card
+ * shows what is on that tag. */
+static void
+taghover(Monitor *m, int x, int in)
+{
+	long d[4 + 60];
+	int i = -1, n = 0, x0 = TAGX0, k;
+	Client *c;
+
+	if (in && x >= TAGX0)
+		for (k = 0; k < LENGTH(tags); k++) {
+			if (x < x0 + tagw(0)) { i = k; break; }
+			x0 += tagw(0);
+		}
+	if (i == hovertag && (i < 0 || m == hovermon))
+		return;
+	hovertag = i; hovermon = m;
+	if (i < 0)
+		d[n++] = 0;
+	else {
+		d[n++] = i + 1;
+		d[n++] = m->wx + spa(m) + x0 + tagw(0) / 2;
+		d[n++] = m->by + bh;
+		d[n++] = m->num;
+		for (c = m->clients; c && n < (int)LENGTH(d); c = c->next)
+			if (c->tags & 1 << i)
+				d[n++] = (long)c->win;
+	}
+	XChangeProperty(dpy, root, ricehover, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)d, n);
+}
+
+void
+leavenotify(XEvent *e)
+{
+	Monitor *m;
+
+	for (m = mons; m; m = m->next)
+		if (e->xcrossing.window == m->barwin)
+			taghover(m, 0, 0);
+}
+
 void
 motionnotify(XEvent *e)
 {
@@ -2065,8 +2113,12 @@ motionnotify(XEvent *e)
 	Monitor *m;
 	XMotionEvent *ev = &e->xmotion;
 
-	if (ev->window != root)
+	if (ev->window != root) {
+		for (m = mons; m; m = m->next)
+			if (ev->window == m->barwin)
+				taghover(m, ev->x, 1);
 		return;
+	}
 	if ((m = recttomon(ev->x_root, ev->y_root, 1, 1)) != mon && mon) {
 		unfocus(selmon->sel, 1);
 		selmon = m;
@@ -2529,6 +2581,12 @@ run(void)
 	/* main event loop */
 	XSync(dpy, False);
 	while (running) {
+		/* a steady stream of events (the pointer moving over a bar) must not hold the animation back: step at least
+		 * every 6 ms */
+		if (baranim && nowsec() - lastanim >= 0.006) {
+			animstep();
+			lastanim = nowsec();
+		}
 		if (baranim && !XPending(dpy)) {
 			fd_set fds;
 			struct timeval tv = { 0, 5000 }; /* 200 steps/s: every 165 Hz frame gets a new position (8 ms capped the slide at 125 fps) */
@@ -2536,6 +2594,7 @@ run(void)
 			FD_SET(ConnectionNumber(dpy), &fds);
 			if (select(ConnectionNumber(dpy) + 1, &fds, NULL, NULL, &tv) == 0) {
 				animstep();
+				lastanim = nowsec();
 				continue;
 			}
 		}
@@ -2767,6 +2826,9 @@ setup(void)
 	wmatom[WMTakeFocus] = XInternAtom(dpy, "WM_TAKE_FOCUS", False);
 	netatom[NetActiveWindow] = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
 	ricecmd = XInternAtom(dpy, "_RICE_CMD", False);
+	hovertag = -1; hovermon = NULL;
+	ricehover = XInternAtom(dpy, "_RICE_HOVER", False);
+	{ long z = 0; XChangeProperty(dpy, root, ricehover, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&z, 1); }
 	netatom[NetSupported] = XInternAtom(dpy, "_NET_SUPPORTED", False);
 	netatom[NetSystemTray] = XInternAtom(dpy, "_NET_SYSTEM_TRAY_S0", False);
 	netatom[NetSystemTrayOP] = XInternAtom(dpy, "_NET_SYSTEM_TRAY_OPCODE", False);
@@ -3493,7 +3555,7 @@ updatebars(void)
 	XSetWindowAttributes wa = {
 		.override_redirect = True,
 		.background_pixmap = ParentRelative,
-		.event_mask = ButtonPressMask|ExposureMask
+		.event_mask = ButtonPressMask|ExposureMask|PointerMotionMask|LeaveWindowMask   /* motion/leave: tag hover preview */
 	};
 	XClassHint ch = {"dwm", "dwm"};
 	for (m = mons; m; m = m->next) {

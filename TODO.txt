@@ -1,0 +1,49 @@
+Rice bug list and requests (written 2026-11-16)
+
+Account popup (rice-power)
+1. The restart icon looks wrong.
+2. Clicking the avatar again to close the popup leaves 2 transparent leftover windows (probably the ghost popups from Card.show_all / quit_anim).
+
+Volume (rice-volume, bar volume icon)
+3. Scrolling the mouse wheel on the speaker icon does not change the volume.
+4. No mic is detected even though a mic is connected (PipeWire lists only monitors; the HyperX mic may need another profile).
+5. Dragging the slider and moving the mouse off the slider, then releasing the left button, leaves the slider still following the mouse. Release must end the drag (needs a pointer grab or a release check outside the slider).
+6. The bar icon sometimes does not match the real volume level.
+7. The card is cut off on the right side.
+8. The headset scroll wheel is not detected (XF86Audio* keys via dwm / dwm-volume).
+
+Bar (dwm.c)
+9. Shift the workspace dots and the item after them further in. When tag 1 is selected, the indicator sits too close to the left edge.
+10. Make the outline switch (border move between windows) animated too.
+
+Konsole
+11. The petke@gentoo prompt in a new terminal sits too close to the top left. Add padding.
+12. Remove the white scrollbar on the right side of konsole (konsole profile / hooks.py).
+
+Canvas mode (Mod+Shift+g)
+13. Dragging the background too far down sends windows to the top monitor. Make panning per monitor, so windows stay on their own monitor.
+
+Rice mode (rice-scene)
+14. Use something other than cmatrix.
+
+Recorder (rice-record)
+15. Add a countdown option so there is time to set up before recording starts.
+
+Not part of this list: the user is testing SDDM, reboot and logout (rice-setup-root, rice-session).
+
+Lock / logout (rice-lock, rice-session)
+16. Lockout is buggy and looks weird.
+17. The password entry does not work.
+18. Log out is slow.
+19. SDDM auto theme does not work (does not update on theme apply).
+20. Logout and all buttons in the account card (rice-power) are buggy and slow. Each button needs several clicks, plus several clicks on the "sure" confirm, before it acts.
+
+Status 2026-11-16: items 1-20 fixed in code. dwm.c changes need sudo make install. Item 8 (headset wheel): dwm binds XF86Audio* and dwm-volume works from the shell; no wheel events were seen yet, still to confirm with evtest /dev/input/event5.
+
+Session 2 (2026-11-16) - done, verify live
+- rice-media card rewrite, synced lyrics, rice-lyrics terminal tool
+- Wallhaven source + `s` source switch, infinite feed, neutral palette fix
+- Auto terminal opacity/blur from wallpaper (themes.look, hooks.konsole/picom)
+- rice-scene double spawn fix, scene terminals follow the theme
+- dwm: systray follows monitor, avatar redraw (needs sudo make install)
+Open: confirm picom reloads blur on SIGUSR1; faint fringe at avatar bottom edge.

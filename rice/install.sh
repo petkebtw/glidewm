@@ -3,6 +3,13 @@
 # Usage: ./install.sh        (run from the rice/ directory)
 set -e
 R="$(cd "$(dirname "$0")" && pwd)"
+# the C helpers (lean/: nothp and the resident daemons clip-daemon, polkit-agent, rice-toplevels) first: bin/ and
+# shell/ours link to them
+if command -v cc >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
+  make -s -C "$R/lean" || echo "warn   lean/ did not build (needs libX11, libXfixes, polkit-agent-1 headers)"
+else
+  echo "warn   no C compiler: lean/ (clip-daemon, polkit-agent, rice-toplevels, nothp) is not built"
+fi
 link() { # src dst
   mkdir -p "$(dirname "$2")"
   if [ -e "$2" ] || [ -L "$2" ]; then echo "skip   $2 (exists)"; else ln -s "$1" "$2"; echo "link   $2"; fi

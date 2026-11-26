@@ -89,6 +89,8 @@ The screenshots show glidewm with a full desktop shell on top. It lives in [`ric
 
 **🧩 Shell (Quickshell QML)**
 - Bar, dock, control centre (`Mod+n`) and dynamic island. Based on [DarkShadow's Shell](https://github.com/shadowww-dev/DarkShadowShell), ported to X11.
+- Dock: slides in from the bottom edge, a dot under every open app, a click on an open app slides to its tag.
+- Hover a tag on the bar: a card lists the apps on that tag.
 - Desktop widgets: clock, visualiser, weather, battery, lyrics. `Mod+e` edits them.
 - Game bar (`Mod+g`), hot corner, welcome screen, wallpaper picker.
 - Menus grow out of the bar as glass shapes.

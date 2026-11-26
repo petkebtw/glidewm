@@ -22,6 +22,16 @@ sed -i '/^import Quickshell.Hyprland/d' rice-desktop/Wm.qml
 # so nothing of ~/.local/bin (rice-settings, rice-lock, rice-power ... are different programs there) is shadowed
 rm -rf "$D/bin"; cp -rL "$D/bin-src" "$D/bin"
 find "$D/bin" "$QB" -type f \( -path "$D/bin/*" -o -name '*.qml' -o -name '*.sh' -o -name '*.js' \) -print0 | xargs -0 perl -pi -e 's#\.local/bin(?!\w)#.local/share/dss/bin#g'
+# desktop-set clock style only took the old names (digital|line|cookie|pixel): Settings > Desktop > Clock style
+# Stacked, Shape and Analog were refused, so the clock fell back to Expressive (upstream bug, still in V6.10)
+python3 - "$D/bin/desktop-set" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = '"style": ["digital", "line", "cookie", "pixel"]'
+if a in s:
+    s = s.replace(a, '"style": STYLES["clock"]', 1)
+    open(p, "w").write(s)
+PY
 # our tools take over some shell actions (ours/rice-hotcorner: screenshot and record -> rice-shot, rice-record;
 # ours/rice-lock: lock now -> our X11 lock). The shell's script stays as NAME.dss for everything else.
 # wallpaper lists of the shell (Settings > Wallpaper, the picker, slideshow, random at login): only real wallpapers,
@@ -46,6 +56,11 @@ for n in rice-hotcorner rice-lock rice-wm; do
   [ -f "$D/bin/$n" ] && [ -f "$D/ours/$n" ] && mv "$D/bin/$n" "$D/bin/$n.dss"
 done
 find -L "$D/ours/" -maxdepth 1 -type f -exec cp -t "$D/bin/" {} +
+# rice-cava, rice-busy, rice-wm-watch, rice-widget-fade and rice-toplevels are C programs (rice/lean, linked in ours/)
+# since 2026-11-26: they end with the Quickshell that started it (PR_SET_PDEATHSIG) and replace the shell's scripts.
+# rice-ws-watch listens to Hyprland or niri only; on X11 it waited for a socket forever (~6 MB of Python, 2026-11-26)
+perl -0pi -e 's/(\ndef main\(\):\n)/$1    if not (os.environ.get("NIRI_SOCKET") or os.environ.get("WAYLAND_DISPLAY")):\n        sys.exit(0)  # X11 (glidewm): no compositor events to listen to\n/' "$D/bin/rice-ws-watch"
+grep -q 'X11 (glidewm): no compositor events' "$D/bin/rice-ws-watch" || echo "port.sh: the rice-ws-watch X11 exit did not apply" >&2
 # apps started from dwm keys have no QML_IMPORT_PATH: call qs through our wrapper (ours/qs)
 for f in rice-settings rice-app rice-desktop rice-wallpaper rice-hotcorner; do
   [ -f "$D/bin/$f" ] && perl -pi -e 's#(?<![\w/.-])qs (-n|-p)#\$HOME/.local/share/dss/bin/qs $1#g' "$D/bin/$f"
@@ -209,7 +224,12 @@ def sub(a, b):
 sub('readonly property string wmLabel: niri ? "niri" : "Hyprland"', 'readonly property string wmLabel: "glidewm"')
 sub('pages: niri ? [29, 12, 25, 36, 4, 11] : [29, 33, 12, 25, 36, 4, 11]', 'pages: [4, 29, 12, 25]')
 sub('pages: [2, 3, 6, 7]', 'pages: [7]')
-sub('pages: [38, 30, 31, 28, 5, 23, 15]', 'pages: [38, 31, 15]')
+# the other groups (System gained 41 Care in V6.00 ...): drop the gone pages from whatever list upstream has now
+def keep(m):
+    ids = [i for i in re.findall(r"\d+", m.group(1)) if int(i) not in {2, 3, 5, 6, 11, 23, 28, 30, 33, 36}]
+    return "pages: [" + ", ".join(ids) + "]"
+s, k = re.subn(r'(?m)(?<=sym: "settings", )pages: \[([\d, ]+)\]', keep, s)
+assert k == 1, "System group pages"
 sub('onPageChanged: {', 'readonly property var gone: [2, 3, 5, 6, 11, 23, 28, 30, 33, 36]\n    onPageChanged: { if (gone.indexOf(page) >= 0) { page = 4; return }')
 sub('HyprlandPage { anchors.fill: parent; ctl: win }', 'GlidewmPage { anchors.fill: parent; ctl: win }')
 gone = {2, 3, 5, 6, 11, 23, 28, 30, 33, 36}
@@ -236,9 +256,134 @@ grep -q 'GlidewmPage { anchors.fill' "$QB/rice-settings/shell.qml"
 python3 "$D/patches/hide-dead.py" "$QB/rice-settings" >/dev/null
 grep -q 'visible: false' "$QB/rice-settings/HomePage.qml"
 
-# smoother wheel scrolling in Settings: a longer glide (0.09 s -> 0.14 s time constant), so notches blend into one run
-perl -0pi -e 's/frameTime\) \/ 0\.09\)\)/frameTime) \/ 0.14))/' "$QB/rice-settings/WheelScroll.qml"
-grep -q 'frameTime) / 0.14))' "$QB/rice-settings/WheelScroll.qml"
+# the dock's panel: the "tinted" surface (a dark shade of the wallpaper color) instead of the theme's near-black bg;
+# at a low opacity over picom's blur the near-black read as flat grey
+perl -pi -e 's/NPal \{ id: pal; theme: "shell"; alpha: dock\.alpha \}/NPal { id: pal; theme: "tinted"; alpha: dock.alpha }/' "$QB/rice-desktop/Dock.qml"
+grep -q 'NPal { id: pal; theme: "tinted"; alpha: dock.alpha }' "$QB/rice-desktop/Dock.qml"
+
+# the dock slides in without a map: its window stays mapped and, while hidden, takes no input (an empty mask; the 3 px
+# strip below brings it back). Mapped on every reveal, NVIDIA's first frame of the new window ate most of the 260 ms
+# slide, so the dock just popped up.
+python3 - "$QB/rice-desktop/Dock.qml" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+def sub(a, b):
+    global s
+    assert s.count(a) == 1, a
+    s = s.replace(a, b)
+sub("visible: dock.on && (dock.reveal || dock.t > 0.01)", "visible: dock.on")
+sub("mask: dock.mag > 0 ? magRegion : null\n        Region { id: magRegion; item: panel }",
+    "mask: !dock.reveal && dock.t < 0.01 ? noInput : (dock.mag > 0 ? magRegion : null)\n"
+    "        Region { id: magRegion; item: panel }\n"
+    "        Region { id: noInput }")
+# the Grid's add transition (opacity 0 -> 1, scale 0.3 -> 1) left every part at opacity 0 on X11: the dock showed as
+# an empty bar. Without it the parts are simply there (seen in Xvfb: empty with it, icons and song without it)
+i = s.find("                add: Transition {")
+j = s.find("                Repeater {", i)
+assert i > 0 and j > i and s[i:j].count("Transition") == 1, "dock add transition"
+s = s[:i] + s[j:]
+# the song's picture: a player that sends no art (Mullvad Browser / SoundCloud: no mpris:artUrl) left an empty grey
+# square; a music note in the theme colour stands there now
+sub("""                        source: dock.player && dock.player.trackArtUrl ? dock.player.trackArtUrl : ""
+                    }""", """                        source: dock.player && dock.player.trackArtUrl ? dock.player.trackArtUrl : ""
+                        Rectangle { anchors.fill: parent; radius: Look.sq ? 0 : 12; color: pal.container
+                            visible: !(dock.player && dock.player.trackArtUrl)
+                            MIcon { anchors.centerIn: parent; size: 20; name: "music_note"; glyph: String.fromCodePoint(0xF075A); color: pal.inkContainer } }
+                    }""")
+open(p, "w").write(s)
+PY
+
+# hover a tag on dwm's bar: a card under it lists the apps on that tag (patches/TagPeek.qml; dwm writes _RICE_HOVER,
+# rice-toplevels passes it to ToplevelManager.hover)
+cp "$D/patches/TagPeek.qml" "$QB/rice-desktop/TagPeek.qml"
+python3 - "$QB/rice-desktop/shell.qml" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = "    Dock { id: dockObj;"
+assert s.count(a) == 1, "shell.qml Dock line"
+s = s.replace(a, "    TagPeek { }\n" + a)
+open(p, "w").write(s)
+PY
+
+# fewer shell windows (2026-11-26): every mapped Quickshell window has its own render thread and GL context (~6 MB
+# on NVIDIA). WallLum (wallpaper brightness, a 2 x 2 window) and VibeCover (the song cover's colours) exist only while
+# they measure: Look.lumGrid / Vibe.tint* keep the result. The dock's 3 px reveal strip is no window of its own: while
+# the dock is away, the dock window (always mapped) takes input only on that strip.
+python3 - "$QB/rice-desktop" <<'PY'
+import sys
+q = sys.argv[1]
+def sub(f, a, b):
+    p = q + "/" + f; s = open(p).read()
+    assert s.count(a) == 1, (f, a)
+    open(p, "w").write(s.replace(a, b))
+sub("shell.qml", "    WallLum { path: root.wallpaper; sw: root.sw; sh: root.sh }\n",
+    "    // made only while it measures a new wallpaper (or screen size); Look.lumGrid keeps the result\n"
+    "    property string lumKey: \"\"\n"
+    "    LazyLoader {\n"
+    "        active: Look.adapt && root.wallpaper !== \"\" && root.lumKey !== root.wallpaper + \"|\" + root.sw + \"x\" + root.sh\n"
+    "        WallLum { path: root.wallpaper; sw: root.sw; sh: root.sh; onMeasured: root.lumKey = path + \"|\" + sw + \"x\" + sh }\n"
+    "    }\n")
+sub("shell.qml", "    VibeCover { }\n",
+    "    // made only while it reads a new cover; Vibe.tint, tint2 and tintOf keep the result\n"
+    "    LazyLoader { active: Vibe.cover && Player.art !== \"\" && Vibe.tintOf !== Player.art; VibeCover { } }\n")
+# WallLum says when it is done: painted with the picture's real shape (the probe has its size, or failed)
+sub("WallLum.qml", "    property real ratio: 16 / 9      // width / height of the wallpaper picture\n",
+    "    property real ratio: 16 / 9      // width / height of the wallpaper picture\n"
+    "    signal measured()\n"
+    "    readonly property bool probed: probe.status === Image.Ready || probe.status === Image.Error\n")
+sub("WallLum.qml", "        onStatusChanged: if (status === Image.Ready && implicitHeight > 0) { wl.ratio = implicitWidth / implicitHeight; cv.requestPaint() }",
+    "        onStatusChanged: { if (status === Image.Ready && implicitHeight > 0) { wl.ratio = implicitWidth / implicitHeight; cv.requestPaint() }\n"
+    "                           else if (status === Image.Error) cv.requestPaint() }")
+sub("WallLum.qml", "            Look.lumGrid = g\n", "            Look.lumGrid = g\n            if (wl.probed) wl.measured()\n")
+# the dock: the strip window goes, the dock window takes its place
+p = q + "/Dock.qml"; s = open(p).read()
+i = s.find("    // ---------------- the strip that brings the dock back ----------------\n")
+j = s.find("    // ---------------- the dock ----------------\n")
+assert i > 0 and j > i and s[i:j].count("PanelWindow") == 1, "dock strip window"
+s = s[:i] + s[j:]
+open(p, "w").write(s)
+sub("Dock.qml", "        mask: !dock.reveal && dock.t < 0.01 ? noInput : (dock.mag > 0 ? magRegion : null)\n",
+    "        mask: !dock.reveal && dock.t < 0.01 ? (dock.autoHide ? edgeRegion : noInput) : (dock.mag > 0 ? magRegion : null)\n"
+    "        Region { id: edgeRegion; item: edgeStrip }\n")
+sub("Dock.qml", "        MouseArea {\n            id: dockMouse\n",
+    "        // the strip along the edge that brings the dock back (its own 3 px window before: one render thread and\n"
+    "        // GL context less); while the dock is away it is the only part of this window that takes input\n"
+    "        MouseArea {\n"
+    "            id: edgeStrip\n"
+    "            z: 10\n"
+    "            enabled: dock.on && dock.autoHide && !dock.reveal && dock.t < 0.05\n"
+    "            hoverEnabled: true\n"
+    "            width: dock.vert ? 3 : Math.min(parent.width, Math.max(200, panel.width))\n"
+    "            height: dock.vert ? Math.min(parent.height, Math.max(200, panel.height)) : 3\n"
+    "            x: dock.edge === \"left\" ? 0 : (dock.edge === \"right\" ? parent.width - width : (parent.width - width) / 2)\n"
+    "            y: dock.vert ? (parent.height - height) / 2 : parent.height - height\n"
+    "            onEntered: { hideTimer.stop(); dock.hovering = true }\n"
+    "        }\n"
+    "        MouseArea {\n            id: dockMouse\n")
+PY
+grep -q 'id: edgeStrip' "$QB/rice-desktop/Dock.qml"
+grep -q 'onMeasured: root.lumKey' "$QB/rice-desktop/shell.qml"
+
+# smooth wheel scrolling in Settings: patches/WheelScroll.qml glides on a critically damped spring (no kick and
+# sudden stop on every notch), and the boxes that scrolled with Qt's plain wheel jumps get it too: the side menu,
+# the search results and What's new; over the fastfetch output on Look & Feel the page scrolls
+cp "$D/patches/WheelScroll.qml" "$QB/rice-settings/WheelScroll.qml"
+python3 - "$QB/rice-settings" <<'PY2'
+import sys
+q = sys.argv[1]
+def sub(f, a, b):
+    p = q + "/" + f; s = open(p).read()
+    assert s.count(a) == 1, (f, a)
+    open(p, "w").write(s.replace(a, b))
+sub("PageScroll.qml", "property alias body: flick", "property alias body: flick\n    property alias wheel: flickWheel")
+sub("LookFeelPage.qml", "    PageScroll {\n        anchors.fill: parent", "    PageScroll {\n        id: pageScroll\n        anchors.fill: parent")
+# the fastfetch output box claims more height than its text (it would scroll into blank space): the page scrolls there
+sub("LookFeelPage.qml", "id: out\n", "id: out\n                        WheelHandler { acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad; onWheel: function(e) { pageScroll.wheel.take(e) } }\n")
+sub("shell.qml", "id: navFlick\n", "id: navFlick\n            WheelScroll { flick: navFlick }\n")
+sub("shell.qml", "id: resultList\n", "id: resultList\n            WheelScroll { flick: resultList }\n")
+sub("WhatsNew.qml", "id: list\n", "id: list\n            WheelScroll { flick: list }\n")
+PY2
+grep -q 'critically damped' "$QB/rice-settings/WheelScroll.qml"
 
 # wallpapers picked in the shell (Wallpaper page, themes, presets, the picker) go through the glidewm theme pipeline
 # (feh, colours for dwm, rofi, terminals and the shell): awww and matugen do not exist here, nothing changed before
